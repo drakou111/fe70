@@ -1,0 +1,8 @@
+# /etc/cloudflared/config.yml - only the web API goes through the tunnel; never add SSH here.
+tunnel: REPLACE_WITH_TUNNEL_ID
+credentials-file: /etc/cloudflared/REPLACE_WITH_TUNNEL_ID.json
+
+ingress:
+  - hostname: tiling.REPLACE_WITH_YOUR_DOMAIN
+    service: http://127.0.0.1:8000
+  - service: http_status:404
