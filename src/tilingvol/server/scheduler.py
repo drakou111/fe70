@@ -32,6 +32,9 @@ RAM_PER_CELL_THREAD_MB = 0.035
 RAM_FILL = 0.7  # use at most this share of the volunteer's cap; the client's CP-SAT soft limit sits at 0.75
 MEMORY_RETRY_FACTOR = 1.5
 MIN_TREND_ROWS = 8
+RAM_FACTOR_MIN, RAM_FACTOR_MAX = 0.6, 3.0
+LONG_RUN_S = 3600.0
+MIN_LONG_RUNS = 20
 
 
 class NoAssignment(Exception):
@@ -60,6 +63,11 @@ class SizeSummary:
     timed_out: bool = False
     flagged: bool = False
     flagged_by: set = field(default_factory=set)
+
+
+def percentile95(values: list[float]) -> float:
+    ordered = sorted(values)
+    return ordered[int(0.95 * (len(ordered) - 1))]
 
 
 def fit_trend(rows: list[tuple[int, float]]) -> tuple[float, float, float] | None:
@@ -216,14 +224,22 @@ class Scheduler:
 
     # RAM
     def ram_factor(self, results: list[ResultRow]) -> float:
-        ratios = sorted(
-            r.peak_ram_mb / r.est_ram_mb
+        """Scale for the RAM formula, learned from volunteers' reported peaks. Up as soon as peaks run high;
+        down (to RAM_FACTOR_MIN) only from long runs, since memory keeps growing during a search."""
+        reported = [
+            (r.peak_ram_mb / r.est_ram_mb, r.duration_s)
             for r in results
             if r.source == "volunteer" and r.peak_ram_mb and r.est_ram_mb
-        )
-        if len(ratios) < MIN_TREND_ROWS:
+        ]
+        if len(reported) < MIN_TREND_ROWS:
             return 1.0
-        return max(1.0, ratios[int(0.95 * (len(ratios) - 1))])
+        high = percentile95([ratio for ratio, _ in reported])
+        if high > 1.0:
+            return min(high, RAM_FACTOR_MAX)
+        long_runs = [ratio for ratio, seconds in reported if seconds >= LONG_RUN_S]
+        if len(long_runs) < MIN_LONG_RUNS:
+            return 1.0
+        return max(RAM_FACTOR_MIN, percentile95(long_runs))
 
     def estimate_ram_mb(
         self, width: int, height: int, threads: int, factor: float

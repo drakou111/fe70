@@ -376,3 +376,39 @@ def test_no_time_limit_jobs(client):
     job = client.post("/api/jobs/request", json=body).json()
     assert all(s["time_limit_s"] == 7 * 24 * 3600 for s in job["stages"])
     assert all(s["time_limit_s"] < 7 * 24 * 3600 for s in request_job(client)["stages"])
+
+
+def test_ram_factor_learns_both_ways(sib_config):
+    from tilingvol.server.db import ResultRow
+    from tilingvol.server.scheduler import Scheduler
+
+    scheduler = Scheduler(None, sib_config)
+
+    def rows(ratio, seconds, n):
+        return [
+            ResultRow(
+                20,
+                21,
+                "impossible",
+                "frame3L",
+                seconds,
+                "v",
+                None,
+                4,
+                int(1000 * ratio),
+                1000,
+                0.0,
+                False,
+                False,
+                "volunteer",
+            )
+        ] * n
+
+    assert scheduler.ram_factor(rows(0.4, 60, 30)) == 1.0  # short runs never lower it
+    assert (
+        scheduler.ram_factor(rows(0.4, 7200, 30)) == 0.6
+    )  # long runs may, down to the floor
+    assert scheduler.ram_factor(rows(0.8, 7200, 30)) == 0.8
+    assert (
+        scheduler.ram_factor(rows(0.8, 7200, 30) + rows(1.5, 60, 10)) == 1.5
+    )  # any high peak raises it

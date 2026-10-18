@@ -437,6 +437,12 @@ class Controller:
             f"Got {job.width} x {job.height} ({job.lane} lane), {job.threads} threads, about "
             f"{job.est_ram_mb / 1024:.1f} GB. Stages: {stages}."
         )
+        if job.threads < settings.max_threads:
+            self._log(
+                f"Using {job.threads} of {settings.max_threads} threads, to stay within this search's "
+                f"{settings.max_ram_mb / 1024:.1f} GB RAM share (bigger sizes need more memory per "
+                f"thread). Raise Max RAM to allow more threads."
+            )
 
     def _start_runner(self) -> None:
         available = memory_guard.available_ram_mb()
