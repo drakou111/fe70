@@ -62,7 +62,12 @@ def main() -> None:
     run(["scp", *files, f"{remote}:{folder}/"])
     run(["scp", str(RELEASE_DIR / "latest.json"), f"{remote}:{folder}/latest.json.tmp"])
     run(["ssh", remote, f"mv {folder}/latest.json.tmp {folder}/latest.json"])
-    with urllib.request.urlopen(server + "/api/update", timeout=30) as response:
+    # Cloudflare's browser integrity check rejects the default Python-urllib user agent
+    request = urllib.request.Request(
+        server + "/api/update",
+        headers={"User-Agent": f"tilingvol-publish/{manifest['version']}"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
         live = json.loads(response.read())
     if live.get("version") != manifest["version"]:
         raise SystemExit(
