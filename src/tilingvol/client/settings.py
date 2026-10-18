@@ -1,7 +1,8 @@
-"""User settings and results waiting to be sent, stored under ~/.tiling-volunteer."""
+"""User settings and results waiting to be sent, stored under ~/.fe70."""
 
 import json
 import os
+import threading
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -22,11 +23,19 @@ def default_server_url() -> str:
 
 DEFAULT_RAM_FRACTION = 0.5
 MAX_NAME_LENGTH = 40
+MIN_SLOT_RAM_MB = 1024
+_PENDING_LOCK = threading.RLock()  # parallel searches share one pending file
 
 
 def app_dir() -> Path:
     override = os.environ.get("TILINGVOL_HOME")
-    path = Path(override) if override else Path.home() / ".tiling-volunteer"
+    if override:
+        path = Path(override)
+    else:
+        path = Path.home() / ".fe70"
+        legacy = Path.home() / ".tiling-volunteer"  # the folder used by version 0.2
+        if legacy.is_dir() and not path.exists():
+            legacy.rename(path)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -54,6 +63,9 @@ class Settings:
     max_ram_mb: int = 0
     max_threads: int = 0
     server_url: str = field(default_factory=default_server_url)
+    parallel: int = (
+        1  # sizes searched at once; each gets 1/parallel of the threads and RAM
+    )
 
     @staticmethod
     def defaults() -> "Settings":
@@ -72,8 +84,26 @@ class Settings:
         cores = os.cpu_count() or 1
         if not 1 <= self.max_threads <= cores:
             raise ValueError(f"CPU threads must be between 1 and {cores}")
+        if not 1 <= self.parallel <= self.max_threads:
+            raise ValueError(
+                "parallel sizes must be between 1 and the number of CPU threads"
+            )
+        if self.max_ram_mb // self.parallel < MIN_SLOT_RAM_MB:
+            raise ValueError(
+                f"each parallel size needs at least {MIN_SLOT_RAM_MB // 1024} GB; raise Max RAM or "
+                f"lower Parallel sizes"
+            )
         return replace(
             self, name=validate_name(self.name), server_url=self.server_url.strip()
+        )
+
+    def slot_settings(self) -> "Settings":
+        """What one of the parallel searches may use."""
+        return replace(
+            self,
+            max_ram_mb=self.max_ram_mb // self.parallel,
+            max_threads=self.max_threads // self.parallel,
+            parallel=1,
         )
 
 
@@ -92,9 +122,8 @@ class SettingsStore:
     def save(self, settings: Settings) -> None:
         data = asdict(settings)
         if data["server_url"] == default_server_url():
-            del data[
-                "server_url"
-            ]  # follow the default, so a new build can move the server
+            # follow the default, so a new build can move the server
+            del data["server_url"]
         atomic_write_text(self.path, json.dumps(data, indent=2))
 
 
@@ -103,17 +132,21 @@ class PendingResults:
 
     def __init__(self, directory: Path) -> None:
         self.path = directory / "pending_results.json"
+        self.lock = _PENDING_LOCK
 
     def load(self) -> list[dict]:
-        if not self.path.exists():
-            return []
-        return json.loads(self.path.read_text(encoding="utf-8"))
+        with self.lock:
+            if not self.path.exists():
+                return []
+            return json.loads(self.path.read_text(encoding="utf-8"))
 
     def add(self, submission: dict) -> None:
-        self._save(self.load() + [submission])
+        with self.lock:
+            self._save(self.load() + [submission])
 
     def remove(self, salt: str) -> None:
-        self._save([s for s in self.load() if s["salt"] != salt])
+        with self.lock:
+            self._save([s for s in self.load() if s["salt"] != salt])
 
     def _save(self, items: list[dict]) -> None:
         atomic_write_text(self.path, json.dumps(items))

@@ -396,7 +396,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>fe70 Tiling Search</title><style>{STYLE}</style></head><body><main>
+<title>fe70: does it tile a rectangle?</title><style>{STYLE}</style></head><body><main>
 <header>{piece_svg(piece.cells)}<div><h1>Does fe70 tile a rectangle?</h1>
 <p class="lead">fe70 is the 10-cell polyomino B(1.2^3.1^3) shown here, the last open case of Dahlke's gun
 theorem. This is a volunteer search for a rectangle it tiles; each square on the map is one rectangle size,

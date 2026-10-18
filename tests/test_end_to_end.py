@@ -167,3 +167,20 @@ def test_memory_guard_kills_the_solver():
     runner.kill()
     assert killed_by_watchdog or killed_by_os
     assert runner.peak_mb < 300
+
+
+def test_pause_and_resume_work_between_sizes(live_server, controller):
+    """Pausing right as a size finishes must not leave the app stuck in Paused."""
+    c, recorder = controller
+    c.start(settings(live_server.url))
+    wait_for(lambda: results(live_server), 60)
+    c.pause()
+    wait_for(lambda: recorder.last_status().state == State.PAUSED, 10)
+    paused_at = len(results(live_server))
+    time.sleep(3)
+    assert (
+        len(results(live_server)) <= paused_at + 1
+    )  # at most the size that was already finishing
+    c.resume()
+    wait_for(lambda: len(results(live_server)) >= paused_at + 2, 60)
+    c.stop()

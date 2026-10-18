@@ -94,3 +94,26 @@ def test_token_round_trip_and_tamper():
     )
     assert not token.check(key, tampered, signature)
     assert not token.check(b"x" * 32, payload, signature)
+
+
+def test_parallel_settings_split_threads_and_ram(monkeypatch):
+    import os
+
+    from tilingvol.client import settings as settings_module
+    from tilingvol.client.settings import Settings
+
+    monkeypatch.setattr(settings_module, "installed_ram_mb", lambda: 65536)
+    monkeypatch.setattr(os, "cpu_count", lambda: 24)
+    base = Settings(
+        name="x", max_ram_mb=32768, max_threads=20, server_url="http://h", parallel=2
+    )
+    slot = base.validated().slot_settings()
+    assert (slot.max_ram_mb, slot.max_threads, slot.parallel) == (16384, 10, 1)
+    with pytest.raises(ValueError):
+        Settings(
+            name="x", max_ram_mb=32768, max_threads=4, server_url="http://h", parallel=5
+        ).validated()
+    with pytest.raises(ValueError):
+        Settings(
+            name="x", max_ram_mb=1536, max_threads=8, server_url="http://h", parallel=2
+        ).validated()

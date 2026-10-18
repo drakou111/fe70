@@ -21,7 +21,7 @@ def server(sib_config, make_live_server, tmp_path):
 def app(tmp_path, monkeypatch, submit_key, server):
     release_key = Ed25519PrivateKey.generate()
     publish(tmp_path / "downloads", release_key, b"new app version")
-    installed = tmp_path / "app" / "GunTilingSearch.exe"
+    installed = tmp_path / "app" / "fe70.exe"
     installed.parent.mkdir()
     installed.write_bytes(b"old app version")
     monkeypatch.setenv("TILINGVOL_HOME", str(tmp_path))
@@ -60,7 +60,7 @@ def test_full_button_cycle(app, server):
     pump_until(app, lambda: "is ready" in app.update_var.get(), 30)
     assert app.update_button.winfo_ismapped()
     assert (
-        app._install_path.parent / "GunTilingSearch-9.9.9-windows.exe.download"
+        app._install_path.parent / "fe70-9.9.9-windows.exe.download"
     ).read_bytes() == b"new app version"
     app.name_var.set("  ")
     app.start_clicked()
@@ -76,8 +76,7 @@ def test_full_button_cycle(app, server):
     pump_until(
         app,
         lambda: (
-            app.state == State.RUNNING
-            and app.status_vars["Size"].get().startswith("35 x 35")
+            app.state == State.RUNNING and app.slot_rows()[0][0].startswith("35 x 35")
         ),
         60,
     )
@@ -104,12 +103,28 @@ def test_full_button_cycle(app, server):
     assert not live_server.db.active_jobs()
     app.width_var.set("")
     app.height_var.set("")
+    app.threads_var.set("4")
+    app.parallel_var.set("2")
+    assert app.share_var.get() == "each: 2 threads, 1.0 GB"
+    app.ram_var.set("4")
     app.start_clicked()
-    pump_until(app, lambda: "IMPOSSIBLE" in app.log.get("1.0", "end"), 120)
-    # the window shows the verdict just before the upload completes
+    assert len(app.slots) == 2
+    # two searches at once, on different sizes, both reporting results
     pump_until(
-        app, lambda: any(r.source == "volunteer" for r in live_server.db.results()), 30
+        app,
+        lambda: len({(j.width, j.height) for j in live_server.db.active_jobs()}) == 2,
+        60,
     )
+    assert all(j.threads <= 2 for j in live_server.db.active_jobs())
+    pump_until(
+        app,
+        lambda: (
+            len([r for r in live_server.db.results() if r.source == "volunteer"]) >= 4
+        ),
+        120,
+    )
+    log_text = app.log.get("1.0", "end")
+    assert "[1] " in log_text and "[2] " in log_text
     app.close()
     assert not live_server.db.active_jobs()
     assert app.store.load().name == "gui tester"

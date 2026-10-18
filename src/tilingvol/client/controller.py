@@ -233,9 +233,14 @@ class SolverRunner:
 
 class Controller:
     def __init__(
-        self, directory: Path, key: bytes, on_event: Callable[[Event], None]
+        self,
+        directory: Path,
+        key: bytes,
+        on_event: Callable[[Event], None],
+        label: str = "",
     ) -> None:
         self._directory = directory
+        self._prefix = f"[{label}] " if label else ""
         attach_log_file(directory)
         self._key = key
         self._on_event = on_event
@@ -292,7 +297,7 @@ class Controller:
 
     # worker thread
     def _run(self) -> None:
-        self._log(f"Tiling volunteer {__version__} ready.")
+        self._log(f"fe70 {__version__} ready.")
         while True:
             try:
                 command = self._commands.get(timeout=LOOP_S)
@@ -341,14 +346,17 @@ class Controller:
                 if self._job is None
                 else "Restarting the current size from the beginning."
             )
-        elif name == "pause" and self._state == State.RUNNING and self._runner:
-            self._runner.suspend()
+        elif name == "pause" and self._state == State.RUNNING:
+            # also valid between sizes or just as a search finishes: no new size is fetched while paused
+            if self._runner:
+                self._runner.suspend()
             self._state = State.PAUSED
             self._log(
                 "Paused. The search is frozen in memory; Resume continues where it left off."
             )
-        elif name == "resume" and self._state == State.PAUSED and self._runner:
-            self._runner.resume()
+        elif name == "resume" and self._state == State.PAUSED:
+            if self._runner:
+                self._runner.resume()
             self._state = State.RUNNING
             self._log("Resumed.")
         elif name == "stop" and self._state in (State.RUNNING, State.PAUSED):
@@ -540,7 +548,7 @@ class Controller:
         else:
             text = f"{job.width} x {job.height} timed out at {stage.describe()}"
         self._finished += 1
-        message = f"{text}, after {format_duration(duration)}."
+        message = f"{self._prefix}{text}, after {format_duration(duration)}."
         log.info(message)
         self._on_event(Event("result", message))
         self._job = None
@@ -607,20 +615,21 @@ class Controller:
         self._next_pending_at = time.monotonic() + PENDING_RETRY_S
         if self._api is None:
             return
-        for item in self._pending.load():
-            try:
-                reply = self._api.submit(ResultSubmission.from_dict(item))
-            except ServerError as error:
-                if error.status == 0:
-                    self._log(f"Result kept locally, will retry: {error}")
-                    return
-                self._log(f"The server rejected a result: {error}")
+        # parallel searches share the file; holding the lock keeps two of them from sending the same result
+        with self._pending.lock:
+            for item in self._pending.load():
+                try:
+                    reply = self._api.submit(ResultSubmission.from_dict(item))
+                except ServerError as error:
+                    if error.status in RETRYABLE_STATUSES:
+                        self._log(f"Result kept locally, will retry: {error}")
+                        return
+                    self._log(f"The server rejected a result: {error}")
+                    self._pending.remove(item["salt"])
+                    continue
                 self._pending.remove(item["salt"])
-                continue
-            self._pending.remove(item["salt"])
-            self._log(
-                f"Result accepted by the server. {reply.get('message', '')}".strip()
-            )
+                message = reply.get("message", "")
+                self._log(f"Result accepted by the server. {message}".strip())
 
     def _close(self) -> None:
         if self._job is not None:
@@ -637,8 +646,8 @@ class Controller:
             time.sleep(WATCHDOG_S)
 
     def _log(self, message: str) -> None:
-        log.info(message)
-        self._on_event(Event("log", message))
+        log.info(self._prefix + message)
+        self._on_event(Event("log", self._prefix + message))
 
     def _emit_status(self, force: bool = False) -> None:
         now = time.monotonic()

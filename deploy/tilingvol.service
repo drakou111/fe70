@@ -1,5 +1,5 @@
 [Unit]
-Description=Gun tiling volunteer coordination server
+Description=fe70 coordination server
 After=network-online.target
 Wants=network-online.target
 

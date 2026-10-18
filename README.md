@@ -1,4 +1,4 @@
-# tiling-volunteer
+# fe70
 
 A volunteer search for a rectangle tiled by the gun polyomino B(1.2^3.1^3). A small server (meant for a
 Raspberry Pi behind a Cloudflare Tunnel) hands out rectangle sizes. A desktop app runs the CP-SAT

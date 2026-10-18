@@ -2,7 +2,7 @@
 
 Reads TILINGVOL_SUBMIT_KEY (hex, the same value as on the server) and TILINGVOL_SERVER_URL from the
 environment or from .env, writes them into the git-ignored module src/tilingvol/client/_k.py with the key
-lightly scrambled, then builds dist/GunTilingSearch(.exe). Run: uv run python scripts/build_client.py"""
+lightly scrambled, then builds dist/fe70(.exe). Run: uv run python scripts/build_client.py"""
 
 import ast
 import os
@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 GENERATED = ROOT / "src" / "tilingvol" / "client" / "_k.py"
 ENTRY = ROOT / "scripts" / "entry.py"
-APP_NAME = "GunTilingSearch"
+APP_NAME = "fe70"
 SCRAMBLE_STEP = 73
 RUNTIME_DLLS = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "concrt140.dll")
 # the server needs none of these, and the client never imports them

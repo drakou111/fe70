@@ -113,9 +113,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     limiter = RateLimiter(config.max_requests_per_minute)
     pick_lock = threading.Lock()
     page_cache = {"at": 0.0, "html": ""}
-    app = FastAPI(
-        title="Tiling volunteer", docs_url=None, redoc_url=None, openapi_url=None
-    )
+    app = FastAPI(title="fe70", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.db = db
 
     @app.middleware("http")

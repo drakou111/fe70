@@ -2,7 +2,7 @@
 release/latest.json. Upload the contents of release/ to the Pi's download folder afterwards.
 
 Builds for other systems (from the GitHub workflow) can be dropped into release/ under their names
-(GunTilingSearch-<version>-linux, GunTilingSearch-<version>-macos.zip) and are signed in the same run;
+(fe70-<version>-linux, fe70-<version>-macos.zip) and are signed in the same run;
 set TILINGVOL_SKIP_BUILD=1 to only sign. Run: uv run python scripts/release.py"""
 
 import hashlib
@@ -23,7 +23,7 @@ from tilingvol.client.update import current_platform, release_message
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_DIR = ROOT / "release"
-APP_NAME = "GunTilingSearch"
+APP_NAME = "fe70"
 SUFFIXES = {"windows": ".exe", "linux": "", "macos": ".zip"}
 DEFAULT_KEY_PATH = Path.home() / ".tiling-volunteer-release" / "release_signing_key.pem"
 

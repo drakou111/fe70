@@ -37,7 +37,7 @@ def publish(
     platform: str = "windows",
 ) -> dict:
     folder.mkdir(parents=True, exist_ok=True)
-    name = f"GunTilingSearch-{version}-{platform}.exe"
+    name = f"fe70-{version}-{platform}.exe"
     (folder / name).write_bytes(payload)
     digest = hashlib.sha256(payload).hexdigest()
     signature = key.sign(
@@ -65,7 +65,7 @@ def release_key() -> Ed25519PrivateKey:
 
 @pytest.fixture
 def installed(tmp_path) -> Path:
-    app = tmp_path / "app" / "GunTilingSearch.exe"
+    app = tmp_path / "app" / "fe70.exe"
     app.parent.mkdir()
     app.write_bytes(b"old version")
     return app
@@ -167,6 +167,4 @@ def test_no_release_and_page_links(
     publish(tmp_path / "downloads", release_key, b"app")
     with_downloads = make_live_server(sib_config, download_dir=tmp_path / "downloads")
     html = urllib.request.urlopen(with_downloads.url + "/").read().decode()
-    assert (
-        f"version {NEW_VERSION}" in html and "GunTilingSearch-9.9.9-windows.exe" in html
-    )
+    assert f"version {NEW_VERSION}" in html and "fe70-9.9.9-windows.exe" in html

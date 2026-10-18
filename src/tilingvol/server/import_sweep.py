@@ -1,6 +1,6 @@
 """Seed the database with the research sweep's results (output/rect_sweep.txt of the tiling repo).
-Run once: TILINGVOL_IMPORT_FILE=rect_sweep.txt uv run python -m tilingvol.server.import_sweep
-Refuses to run twice, so existing rows are never duplicated or overwritten."""
+Run: TILINGVOL_IMPORT_FILE=rect_sweep.txt uv run python -m tilingvol.server.import_sweep
+Safe to run again on a longer file: only lines not imported before are added; nothing is overwritten."""
 
 import os
 import re
@@ -65,9 +65,24 @@ def main() -> None:
     path = Path(os.environ.get("TILINGVOL_IMPORT_FILE", "rect_sweep.txt"))
     config = ServerConfig.from_env()
     db = Database(config.db_path)
-    if any(r.source == "import" for r in db.results()):
-        raise SystemExit("this database already has imported rows; not importing again")
-    rows = parse(path)
+    # every result is one line; one already in the database (same size, verdict, stage, time) is skipped
+    seen = {
+        (r.width, r.height, r.verdict, r.stage_tag, round(r.duration_s))
+        for r in db.results()
+        if r.source == "import"
+    }
+    rows = [
+        row
+        for row in parse(path)
+        if (
+            row["width"],
+            row["height"],
+            row["verdict"],
+            row["stage_tag"],
+            round(row["duration_s"]),
+        )
+        not in seen
+    ]
     for row in rows:
         db.add_result(
             job_id=None,
@@ -82,7 +97,7 @@ def main() -> None:
             solution=None,
             **row,
         )
-    print(f"imported {len(rows)} results from {path}")
+    print(f"imported {len(rows)} new results from {path}")
 
 
 if __name__ == "__main__":
