@@ -22,6 +22,9 @@ from tilingvol.shared.protocol import (
 LANE_AREA = "area"
 LANE_BATTLE = "battle"
 LANE_REQUESTED = "requested"
+LANE_RETRY = (
+    "retry"  # a size that timed out before, for a volunteer without a time limit
+)
 
 # peak RAM ~ BASE + cells * (PER_CELL + PER_CELL_THREAD * threads) MB. Measured: the model alone is about
 # 2 GB at 150 x 170; per-thread memory grows over hours (the research sweep peaked at 14 GB with 10 threads
@@ -292,6 +295,7 @@ class Scheduler:
         max_ram_mb: int,
         max_threads: int,
         requested: tuple[int, int] | None,
+        no_time_limit: bool = False,
     ) -> Assignment:
         self.expire_leases()
         results = self.db.results()
@@ -319,6 +323,20 @@ class Scheduler:
             if s.flagged and (name in s.flagged_by or ip in s.flagged_by):
                 return False  # a flagged result is re-checked by somebody else
             return not s.timed_out or self.config.retry_timed_out
+
+        if no_time_limit:
+            # sizes that timed out before go to volunteers without a time limit first, smallest first
+            for key in self.sizes:
+                s = summaries.get(key)
+                if s is None or not s.timed_out or s.decided or key in leased:
+                    continue
+                fit = self.fit_threads(
+                    *key, max_ram_mb, max_threads, factor, failures.get(key, 0)
+                )
+                if fit is not None:
+                    return Assignment(
+                        key[0], key[1], LANE_RETRY, *fit, self.stages_for(key, results)
+                    )
 
         lane = self._lane(active)
         order = self.sizes

@@ -181,7 +181,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         with pick_lock:
             try:
                 assignment = scheduler.pick(
-                    name, ip, body.max_ram_mb, body.max_threads, requested
+                    name,
+                    ip,
+                    body.max_ram_mb,
+                    body.max_threads,
+                    requested,
+                    no_time_limit=body.no_time_limit,
                 )
             except NoAssignment as error:
                 raise HTTPException(404, str(error)) from error

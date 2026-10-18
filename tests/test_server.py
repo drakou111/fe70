@@ -412,3 +412,24 @@ def test_ram_factor_learns_both_ways(sib_config):
     assert (
         scheduler.ram_factor(rows(0.8, 7200, 30) + rows(1.5, 60, 10)) == 1.5
     )  # any high peak raises it
+
+
+def test_timed_out_sizes_go_to_volunteers_without_a_time_limit(client, submit_key):
+    first = request_job(client)
+    key = (first["width"], first["height"])
+    post_result(
+        client, submission(submit_key, first, "timed_out", 0, 60.0)
+    )  # sib stage 0 limit is 60 s
+    normal = request_job(client)
+    assert (normal["width"], normal["height"]) != key
+    body = {
+        "name": "patient",
+        "max_ram_mb": 8192,
+        "max_threads": 4,
+        "client_version": "0.6.1",
+        "no_time_limit": True,
+    }
+    retry = client.post("/api/jobs/request", json=body).json()
+    assert (retry["width"], retry["height"], retry["lane"]) == (*key, "retry")
+    other = client.post("/api/jobs/request", json=body).json()
+    assert other["lane"] != "retry"  # one volunteer at a time per timed-out size
