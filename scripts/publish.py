@@ -74,7 +74,7 @@ def main() -> None:
             f"uploaded, but {server} still announces {live.get('version')!r}"
         )
     print(
-        f"published version {manifest['version']}; running apps pick it up within 6 hours"
+        f"published version {manifest['version']}; running apps pick it up within 15 minutes"
     )
 
 

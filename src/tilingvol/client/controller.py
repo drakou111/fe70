@@ -85,9 +85,11 @@ class Status:
 
 @dataclass(frozen=True)
 class Event:
-    kind: str  # "log", "status" or "result"
+    kind: str  # "log", "status", "result" or "picture"
     message: str = ""
     status: Status | None = None
+    # for "picture": (piece, width, height, border or 0 for a tiling, placements)
+    picture: tuple[str, int, int, int, list] | None = None
 
 
 class ActiveClock:
@@ -128,6 +130,9 @@ class SolverRunner:
     peak_mb: int = 0
     used_mb: int = 0
     progress: tuple[int, int] | None = None
+    frame: tuple[int, list] | None = (
+        None  # deepest border filled so far: (depth, placements)
+    )
     kill_reason: str = ""  # "timeout" or "memory: ..."
     finished: bool = False
     _process: multiprocessing.Process | None = None
@@ -459,9 +464,23 @@ class Controller:
                     f"(limit {format_duration(stage.time_limit_s)})."
                 )
             elif kind == MSG_FRAME_FEASIBLE:
+                stage = self._job.stages[message[1]]
+                runner.frame = (stage.border, message[2])
                 self._log(
-                    f"A {self._job.stages[message[1]].describe()} can be filled, so it proves nothing; "
-                    f"going deeper."
+                    f"A {stage.describe()} can be filled, so it proves nothing; going deeper."
+                )
+                job = self._job
+                self._on_event(
+                    Event(
+                        "picture",
+                        picture=(
+                            job.piece,
+                            job.width,
+                            job.height,
+                            stage.border,
+                            message[2],
+                        ),
+                    )
                 )
             elif kind == MSG_IMPOSSIBLE:
                 self._finish(VERDICT_IMPOSSIBLE, message[1], None)
@@ -534,6 +553,7 @@ class Controller:
             salt,
             solution,
         )
+        frame = runner.frame
         submission = ResultSubmission(
             job.job_id,
             job.nonce,
@@ -546,7 +566,15 @@ class Controller:
             token.sign(self._key, payload),
             __version__,
             solution,
+            frame_border=frame[0] if frame else None,
+            frame_placements=frame[1] if frame else None,
         )
+        if solution is not None:
+            self._on_event(
+                Event(
+                    "picture", picture=(job.piece, job.width, job.height, 0, solution)
+                )
+            )
         self._pending.add(submission.to_dict())
         stage = job.stages[stage_index]
         if verdict == VERDICT_IMPOSSIBLE:

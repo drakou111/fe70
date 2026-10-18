@@ -123,6 +123,11 @@ def test_full_button_cycle(app, server):
         ),
         120,
     )
+    pump_until(app, lambda: app.picture_frame.winfo_ismapped(), 60)
+    assert list((app.directory / "pictures").glob("*.png"))
+    app.help_var.set("")
+    app.stop_button.event_generate("<Enter>")
+    pump_until(app, lambda: app.help_var.get().startswith("Stop & free RAM"), 5)
     log_text = app.log.get("1.0", "end")
     assert "[1] " in log_text and "[2] " in log_text
     app.close()

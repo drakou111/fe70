@@ -14,7 +14,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from tilingvol.server import page
@@ -22,6 +22,7 @@ from tilingvol.server.config import ServerConfig
 from tilingvol.server.db import Database
 from tilingvol.server.scheduler import NoAssignment, RequestRefused, Scheduler
 from tilingvol.shared import token
+from tilingvol.shared.picture import render_png
 from tilingvol.shared.protocol import (
     RELEASE_REASONS,
     VERDICT_IMPOSSIBLE,
@@ -30,11 +31,12 @@ from tilingvol.shared.protocol import (
     VERDICTS,
     Stage,
 )
-from tilingvol.shared.verify import TilingError, verify_tiling
+from tilingvol.shared.verify import TilingError, verify_border, verify_tiling
 
 log = logging.getLogger("tilingvol.server")
 
 MAX_BODY_BYTES = 4 << 20
+PICTURE_CACHE_SIZE = 64
 TOKEN_HEADER = "x-access-token"
 DURATION_SLACK_S = 120.0
 IMPOSSIBLE_SLACK_S = 600.0
@@ -80,6 +82,8 @@ class Submission(BaseModel):
     token: str = Field(max_length=64)
     client_version: str = Field(max_length=20)
     solution: list[list[int]] | None = Field(default=None, max_length=200_000)
+    frame_border: int | None = Field(default=None, ge=1, le=1000)
+    frame_placements: list[list[int]] | None = Field(default=None, max_length=100_000)
 
 
 def version_tuple(version: str) -> tuple[int, ...]:
@@ -114,6 +118,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     limiter = RateLimiter(config.max_requests_per_minute)
     pick_lock = threading.Lock()
     page_cache = {"at": 0.0, "html": ""}
+    picture_cache: dict[int, bytes] = {}
     app = FastAPI(title="fe70", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.db = db
 
@@ -318,7 +323,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         flagged = body.verdict == VERDICT_IMPOSSIBLE and scheduler.is_suspiciously_fast(
             job.width, job.height, tag, body.duration_s
         )
+        picture_border, picture = picture_of(job, body)
         db.add_result(
+            picture_border=picture_border,
+            picture=picture,
             job_id=job_id,
             width=job.width,
             height=job.height,
@@ -357,6 +365,40 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             else "Recorded; it was unusually fast, so someone will double-check it."
         )
         return {"ok": True, "message": message}
+
+    def picture_of(job, body: Submission) -> tuple[int | None, list | None]:
+        """The tiling itself, or the deepest border filling if it is genuine (display only)."""
+        if body.verdict == VERDICT_POSSIBLE:
+            return 0, body.solution
+        if body.frame_border is None or body.frame_placements is None:
+            return None, None
+        try:
+            verify_border(
+                config.piece,
+                job.width,
+                job.height,
+                body.frame_border,
+                body.frame_placements,
+            )
+        except TilingError as error:
+            log.warning("job %s: border picture rejected: %s", job.job_id, error)
+            return None, None
+        return body.frame_border, body.frame_placements
+
+    @app.get("/picture/{result_id}.png")
+    def picture_png(result_id: int) -> Response:
+        if result_id not in picture_cache:
+            found = db.picture(result_id)
+            if found is None:
+                raise HTTPException(404, "no picture")
+            if len(picture_cache) >= PICTURE_CACHE_SIZE:
+                picture_cache.pop(next(iter(picture_cache)))
+            picture_cache[result_id] = render_png(config.piece, *found)
+        return Response(
+            picture_cache[result_id],
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     @app.get("/api/results")
     def results() -> list[dict]:

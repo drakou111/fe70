@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -30,16 +31,31 @@ from tilingvol.client.update import (
     installed_executable,
     remove_previous_version,
 )
+from tilingvol.shared.picture import render_png
+from tilingvol.shared.pieces import piece_by_name
 
 APP_TITLE = "fe70"
 PUMP_MS = 200
 log = logging.getLogger("tilingvol.client")
 MAX_LOG_LINES = 2000
 AUTOSTART_DELAY_MS = 1500
-UPDATE_CHECK_S = 6 * 3600
+UPDATE_CHECK_S = 15 * 60
 FIRST_UPDATE_CHECK_S = 5.0
 APP_EVENT = -1  # events that belong to the window, not to one search
 SHUTDOWN_TIMEOUT_S = 20.0
+PICTURE_MAX_PX = 240
+BUTTON_HELP_DEFAULT = "Point at a button to see what it does."
+BUTTON_HELP = {
+    "start": "Start: get a size from the server and search it, then the next one, until you stop.",
+    "start_again": "Start again: search your reserved size again from the beginning.",
+    "pause": "Pause: freeze the search instantly (CPU drops to zero, its RAM stays in use). "
+    "Resume continues exactly where it was.",
+    "resume": "Resume: continue the frozen search exactly where it was.",
+    "stop": "Stop & free RAM: end the search and free its memory. The size stays reserved for you; "
+    "Start again redoes it from the beginning.",
+    "give_up": "Give back size: end the search and return the size to the server, so someone else "
+    "can take it.",
+}
 
 
 def combined_state(states: list[State]) -> State:
@@ -193,18 +209,26 @@ class App:
             self.buttons, text="Pause", command=self.pause_clicked
         )
         self.stop_button = ttk.Button(
-            self.buttons, text="Stop", command=lambda: self._each("stop")
+            self.buttons, text="Stop & free RAM", command=lambda: self._each("stop")
         )
         self.give_up_button = ttk.Button(
-            self.buttons, text="Give Up", command=lambda: self._each("give_up")
+            self.buttons, text="Give back size", command=lambda: self._each("give_up")
         )
-        for button in (
-            self.start_button,
-            self.pause_button,
-            self.stop_button,
-            self.give_up_button,
+        self.help_var = tk.StringVar(value=BUTTON_HELP_DEFAULT)
+        for button, key in (
+            (self.start_button, "start"),
+            (self.pause_button, "pause"),
+            (self.stop_button, "stop"),
+            (self.give_up_button, "give_up"),
         ):
             button.pack(side="left", padx=(0, 6))
+            button.bind(
+                "<Enter>", lambda _e, k=key: self.help_var.set(self._button_help(k))
+            )
+            button.bind("<Leave>", lambda _e: self.help_var.set(BUTTON_HELP_DEFAULT))
+        ttk.Label(
+            main, textvariable=self.help_var, foreground="#66706b", wraplength=560
+        ).pack(anchor="w")
         self.error_var = tk.StringVar()
         ttk.Label(
             main, textvariable=self.error_var, foreground="#c92a2a", wraplength=540
@@ -227,9 +251,28 @@ class App:
             self.table.column(column, width=width, anchor="w", stretch=True)
         self.table.pack(fill="x", pady=(6, 0))
 
+        self.picture_frame = ttk.LabelFrame(main, text="Latest picture", padding=8)
+        self.picture_label = ttk.Label(self.picture_frame)
+        self.picture_label.pack(side="left")
+        side = ttk.Frame(self.picture_frame)
+        side.pack(side="left", fill="y", padx=(12, 0))
+        self.picture_var = tk.StringVar()
+        ttk.Label(side, textvariable=self.picture_var, wraplength=260).pack(anchor="w")
+        ttk.Button(side, text="Open pictures folder", command=self.open_pictures).pack(
+            anchor="w", pady=(8, 0)
+        )
+        self._picture_image: tk.PhotoImage | None = None
+
         self.log = ScrolledText(main, height=10, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, pady=(8, 0))
         self._apply_state(State.IDLE)
+
+    def _button_help(self, key: str) -> str:
+        if key == "pause" and self.state == State.PAUSED:
+            return BUTTON_HELP["resume"]
+        if key == "start" and self.state == State.STOPPED:
+            return BUTTON_HELP["start_again"]
+        return BUTTON_HELP[key]
 
     def _toggle_advanced(self) -> None:
         if self.advanced_shown.get():
@@ -386,11 +429,69 @@ class App:
                     status_changed = True
             elif event.kind == "update":
                 self._show_update(event.message)
+            elif event.kind == "picture" and event.picture:
+                threading.Thread(
+                    target=self._save_picture, args=(event.picture,), daemon=True
+                ).start()
+            elif event.kind == "picture_ready":
+                self._show_picture(Path(event.message))
             else:
                 self._append_log(event.message)
         if status_changed:
             self._show_status()
         self.root.after(PUMP_MS, self._pump)
+
+    def pictures_dir(self) -> Path:
+        folder = self.directory / "pictures"
+        folder.mkdir(exist_ok=True)
+        return folder
+
+    def _save_picture(self, picture: tuple[str, int, int, int, list]) -> None:
+        """Background thread: render and save the PNG, then hand the file to the window."""
+        piece, width, height, border, placements = picture
+        name = (
+            f"{width}x{height}-tiling.png"
+            if border == 0
+            else f"{width}x{height}-border{border}.png"
+        )
+        path = self.pictures_dir() / name
+        try:
+            path.write_bytes(
+                render_png(piece_by_name(piece), width, height, placements)
+            )
+        except (ValueError, IndexError, OSError) as error:
+            log.exception("could not save the picture %s", name)
+            self.events.put(
+                (APP_EVENT, Event("log", f"Could not save the picture {name}: {error}"))
+            )
+            return
+        self.events.put((APP_EVENT, Event("picture_ready", str(path))))
+
+    def _show_picture(self, path: Path) -> None:
+        image = tk.PhotoImage(file=str(path))
+        factor = max(1, -(-max(image.width(), image.height()) // PICTURE_MAX_PX))
+        self._picture_image = image.subsample(factor) if factor > 1 else image
+        self.picture_label.configure(image=self._picture_image)
+        size, _, kind = path.stem.partition("-")
+        what = (
+            "A COMPLETE TILING!"
+            if kind == "tiling"
+            else f"{kind.replace('border', 'border depth ')} filled"
+        )
+        self.picture_var.set(
+            f"{size.replace('x', ' x ')}: {what}\nSaved as {path.name}"
+        )
+        if not self.picture_frame.winfo_ismapped():
+            self.picture_frame.pack(fill="x", pady=(8, 0), before=self.log)
+
+    def open_pictures(self) -> None:
+        folder = str(self.pictures_dir())
+        if sys.platform == "win32":
+            os.startfile(folder)
+        else:
+            subprocess.Popen(
+                ["open" if sys.platform == "darwin" else "xdg-open", folder]
+            )
 
     def _show_update(self, message: str) -> None:
         self.update_var.set(message)

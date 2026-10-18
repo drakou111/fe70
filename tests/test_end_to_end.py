@@ -199,3 +199,23 @@ def test_access_token_is_sent_with_every_message(
     c.start(dc_replace(settings(server.url), access_token=token))
     wait_for(lambda: len(results(server)) >= 2, 60)
     c.stop()
+
+
+def test_border_pictures_reach_the_window_and_the_site(live_server, controller):
+    import urllib.request
+
+    c, recorder = controller
+    c.start(settings(live_server.url))
+    wait_for(lambda: live_server.db.recent_pictures(1), 120)
+    c.stop()
+    pictures = [e.picture for e in recorder.events if e.kind == "picture"]
+    assert pictures and all(len(p) == 5 and p[0] == "sib" for p in pictures)
+    picture = live_server.db.recent_pictures(1)[0]
+    png = urllib.request.urlopen(
+        f"{live_server.url}/picture/{picture.result_id}.png"
+    ).read()
+    assert png.startswith(b"\x89PNG")
+    assert (
+        "Latest pictures"
+        in urllib.request.urlopen(live_server.url + "/").read().decode()
+    )

@@ -163,7 +163,7 @@ For every release:
 To update the server code itself (after pulling new commits): `uv run python scripts/deploy_server.py`
 (asks for the Pi's sudo password once).
 
-The public page then offers the new version, and running apps download it within 6 hours, verify the
+The public page then offers the new version, and running apps download it within 15 minutes, verify the
 signature and checksum, and show "Restart now". Linux and macOS builds must be made on those systems
 (`.github/workflows/build-client.yml`); put them into `release/` and run `release.py` again with
 `TILINGVOL_SKIP_BUILD=1` so they are signed too.

@@ -336,3 +336,30 @@ def test_access_tokens(sib_config):
             == 401
         )
         assert c.get("/").status_code == 200  # the public page stays public
+
+
+def test_border_pictures_are_checked_before_display(client, submit_key):
+    tiling = solve_sibling(19, 28)
+    border = [
+        p for p in tiling if any(min(x, y, 18 - x, 27 - y) < 3 for x, y in cells_of(p))
+    ]
+    job = request_job(client, size=(19, 28))
+    body = submission(submit_key, job, "impossible", 1, 1.0)
+    post_result(client, {**body, "frame_border": 3, "frame_placements": border})
+    rows = client.app.state.db.recent_pictures(5)
+    assert [(r.width, r.height, r.border) for r in rows] == [(19, 28, 3)]
+    assert client.get(f"/picture/{rows[0].result_id}.png").content.startswith(
+        b"\x89PNG"
+    )
+    job = request_job(client)
+    body = submission(submit_key, job, "impossible", 1, 1.0)
+    bogus = [
+        [0, 0, 0]
+    ]  # does not fill the border: the result counts, the picture is dropped
+    post_result(client, {**body, "frame_border": 3, "frame_placements": bogus})
+    assert len(client.app.state.db.recent_pictures(5)) == 1
+
+
+def cells_of(placement):
+    orientation, x0, y0 = placement
+    return [(x0 + dx, y0 + dy) for dx, dy in SIBLING.orientations[orientation]]

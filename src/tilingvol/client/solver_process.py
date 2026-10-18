@@ -96,15 +96,16 @@ def _run_stages(task: SolverTask, queue) -> None:
         if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
             queue.put((MSG_STOPPED, index))
             return
+        placements = [
+            list(built.placement_of[cells])
+            for cells, v in built.variables.items()
+            if solver.Value(v)
+        ]
         if stage.border == 0:
-            placements = [
-                list(built.placement_of[cells])
-                for cells, v in built.variables.items()
-                if solver.Value(v)
-            ]
             queue.put((MSG_POSSIBLE, index, placements))
             return
-        queue.put((MSG_FRAME_FEASIBLE, index))
+        # the filled border goes along: the app shows it, and the server's gallery too
+        queue.put((MSG_FRAME_FEASIBLE, index, placements))
     queue.put(
         (
             MSG_ERROR,

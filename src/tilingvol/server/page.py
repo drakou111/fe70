@@ -3,6 +3,7 @@ Every user-supplied string is HTML-escaped."""
 
 import json
 import math
+import re
 import time
 from dataclasses import dataclass
 from html import escape
@@ -20,6 +21,7 @@ from tilingvol.shared.protocol import (
 MANIFEST_NAME = "latest.json"
 MAX_MANIFEST_BYTES = 64 * 1024
 RECENT = 15
+GALLERY = 6
 PITCH = 8  # map grid pitch in px; tiles are slightly smaller so they read as separate squares
 TILE = 6.5
 MAP_LEFT, MAP_TOP, MAP_BOTTOM = 36, 8, 28
@@ -84,6 +86,11 @@ td { padding: 7px 8px; border-top: 1px solid var(--line); }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 @media (max-width: 720px) { .two { grid-template-columns: 1fr; } header { flex-direction: column; align-items: flex-start; } }
 footer { color: var(--muted); font-size: 0.82rem; margin-top: 24px; }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
+.gallery figure { margin: 0; }
+.gallery img { display: block; width: 100%; height: auto; border-radius: 6px; background: #222624; }
+.gallery figcaption { color: var(--muted); font-size: 0.8rem; margin-top: 6px; line-height: 1.35; }
+.gallery b { color: var(--fg); font-weight: 600; }
 """
 
 TOOLTIP_JS = """
@@ -185,6 +192,17 @@ def map_note(piece) -> str:
         f"{exact} are ruled out by exact strip computations; sizes failing {coloring} cannot be tiled and are "
         f"not drawn."
     )
+
+
+def picture_caption(p) -> str:
+    if p.border == 0:
+        return "a complete tiling!"
+    match = re.match(r"frame(\d+)", p.stage_tag)
+    deeper = f"border {match[1]}" if match else "the full search"
+    outcome = {VERDICT_IMPOSSIBLE: "impossible", VERDICT_TIMED_OUT: "timed out"}.get(
+        p.verdict, p.verdict
+    )
+    return f"border {p.border} filled; {deeper} {outcome}"
 
 
 def deciding_rows(results: list[ResultRow]) -> dict[tuple[int, int], ResultRow]:
@@ -379,6 +397,21 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         else '<p class="empty">No results yet.</p>'
     )
 
+    pictures = db.recent_pictures(GALLERY)
+    figures = "".join(
+        f'<figure><a href="/picture/{p.result_id}.png"><img src="/picture/{p.result_id}.png" loading="lazy" '
+        f'alt="{p.width} x {p.height}"></a><figcaption><b>{p.width} x {p.height}</b><br>'
+        f"{escape(picture_caption(p))}<br>by {escape(p.name)}</figcaption></figure>"
+        for p in pictures
+    )
+    gallery_html = (
+        '<section class="card"><h2>Latest pictures</h2><p class="note" style="margin:0 0 12px">'
+        "When a border can be filled, the search goes deeper; these are the deepest fillings volunteers "
+        f'found, colored by piece orientation.</p><div class="gallery">{figures}</div></section>'
+        if pictures
+        else ""
+    )
+
     recent = [r for r in results if r.source == "volunteer"][-RECENT:][::-1]
     recent_rows = "".join(
         f'<tr><td>{r.width} x {r.height}</td><td><span class="pill {escape(r.verdict)}">'
@@ -409,6 +442,7 @@ checked by a complete computer search.</p>
 <ul class="legend">{legend}</ul>
 <div class="map">{"".join(parts)}<div class="tip" hidden></div></div>
 <p class="note">{map_note(piece)}</p></section>
+{gallery_html}
 <div class="two">
 <section class="card"><h2>Running now</h2>{running_html}</section>
 <section class="card"><h2>Leaderboard</h2>{leader_html}</section>

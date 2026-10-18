@@ -76,6 +76,17 @@ class JobRow:
 
 
 @dataclass(frozen=True)
+class PictureRow:
+    result_id: int
+    width: int
+    height: int
+    verdict: str
+    stage_tag: str
+    name: str
+    border: int  # 0 = a full tiling
+
+
+@dataclass(frozen=True)
 class ResultRow:
     width: int
     height: int
@@ -102,6 +113,10 @@ class Database:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        columns = {r[1] for r in self._conn.execute("PRAGMA table_info(results)")}
+        for column, kind in (("picture_border", "INTEGER"), ("picture", "TEXT")):
+            if column not in columns:  # databases created before pictures existed
+                self._conn.execute(f"ALTER TABLE results ADD COLUMN {column} {kind}")
 
     def close(self) -> None:
         with self._lock:
@@ -212,12 +227,14 @@ class Database:
         source: str,
         solution: list | None,
         submitted: float | None = None,
+        picture_border: int | None = None,
+        picture: list | None = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO results (job_id, width, height, verdict, stage_tag, duration_s, name, ip, threads,"
-                " peak_ram_mb, est_ram_mb, client_version, submitted, flagged, flag_reason, hard, source, solution)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " peak_ram_mb, est_ram_mb, client_version, submitted, flagged, flag_reason, hard, source, solution,"
+                " picture_border, picture) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
                     width,
@@ -237,8 +254,27 @@ class Database:
                     int(hard),
                     source,
                     json.dumps(solution) if solution is not None else None,
+                    picture_border,
+                    json.dumps(picture) if picture is not None else None,
                 ),
             )
+
+    def recent_pictures(self, limit: int) -> list[PictureRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, width, height, verdict, stage_tag, name, picture_border FROM results"
+                " WHERE picture IS NOT NULL AND flagged = 0 ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [PictureRow(*r) for r in rows]
+
+    def picture(self, result_id: int) -> tuple[int, int, list] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT width, height, picture FROM results WHERE id = ? AND picture IS NOT NULL",
+                (result_id,),
+            ).fetchone()
+        return (row[0], row[1], json.loads(row[2])) if row else None
 
     def results(self) -> list[ResultRow]:
         with self._lock:

@@ -79,6 +79,9 @@ class ResultSubmission:
     token: str
     client_version: str
     solution: list[list[int]] | None = None
+    # the deepest border filling found on the way (display only; not part of the signature)
+    frame_border: int | None = None
+    frame_placements: list[list[int]] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -100,4 +103,6 @@ class ResultSubmission:
             solution=[[int(v) for v in p] for p in solution]
             if solution is not None
             else None,
+            frame_border=data.get("frame_border"),
+            frame_placements=data.get("frame_placements"),
         )
