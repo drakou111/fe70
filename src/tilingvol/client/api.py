@@ -122,6 +122,12 @@ class ApiClient:
     def submit(self, submission: ResultSubmission) -> dict:
         return self._post(f"/api/jobs/{submission.job_id}/result", submission.to_dict())
 
+    def get_json(self, path: str) -> dict:
+        request = urllib.request.Request(
+            self.base_url + path, headers={"User-Agent": f"tilingvol/{__version__}"}
+        )
+        return self._send(request)
+
     def _post(self, path: str, body: dict) -> dict:
         data = json.dumps(body).encode()
         request = urllib.request.Request(
@@ -133,6 +139,9 @@ class ApiClient:
                 "User-Agent": f"tilingvol/{__version__}",
             },
         )
+        return self._send(request)
+
+    def _send(self, request: urllib.request.Request) -> dict:
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)

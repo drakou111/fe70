@@ -386,6 +386,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             page_cache["at"] = time.monotonic()
         return page_cache["html"]
 
+    @app.get("/api/update")
+    def update_manifest() -> dict:
+        """latest.json from the download folder, written and signed by scripts/release.py on the maintainer's
+        PC; the server cannot forge it (clients check the signatures)."""
+        manifest = page.load_manifest(config.download_dir)
+        if manifest is None:
+            raise HTTPException(404, "no release published")
+        return manifest
+
     @app.get("/download/{filename}")
     def download(filename: str):
         folder = config.download_dir

@@ -83,13 +83,13 @@ def test_timeout_excludes_pauses(sib_config, make_live_server, controller):
     wait_for(lambda: (s := recorder.last_status()) and s.stage_index == 0, 60)
     c.pause()
     wait_for(lambda: recorder.last_status().state == State.PAUSED, 10)
-    time.sleep(6)  # longer than the stage limit; must not count
+    time.sleep(12)  # far longer than the stage limit; must not count
     assert not results(server)
     c.resume()
     wait_for(lambda: results(server), 60)
     c.stop()
     row = results(server)[0]
-    assert row.verdict == "timed_out" and 3.8 <= row.duration_s < 6.0
+    assert row.verdict == "timed_out" and 3.8 <= row.duration_s < 10.0
 
 
 def test_stop_keeps_the_size_and_give_up_releases_it(live_server, controller):

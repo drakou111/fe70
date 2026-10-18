@@ -1,12 +1,17 @@
 """The volunteer window: enter a name, press Start."""
 
+import logging
 import os
 import queue
+import subprocess
+import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
 from tilingvol import __version__
+from tilingvol.client.api import ServerError
 from tilingvol.client.controller import (
     Controller,
     Event,
@@ -16,15 +21,31 @@ from tilingvol.client.controller import (
 )
 from tilingvol.client.key import load_submit_key
 from tilingvol.client.memory_guard import installed_ram_mb
+from tilingvol.client.release_key import RELEASE_PUBLIC_KEY_HEX
 from tilingvol.client.settings import Settings, SettingsStore, app_dir
+from tilingvol.client.update import (
+    UpdateError,
+    Updater,
+    installed_executable,
+    remove_previous_version,
+)
 
 PUMP_MS = 200
+log = logging.getLogger("tilingvol.client")
 MAX_LOG_LINES = 2000
 AUTOSTART_DELAY_MS = 1500
+UPDATE_CHECK_S = 6 * 3600
+FIRST_UPDATE_CHECK_S = 5.0
 
 
 class App:
-    def __init__(self, root: tk.Tk, controller_factory=Controller) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        controller_factory=Controller,
+        update_key_hex: str = RELEASE_PUBLIC_KEY_HEX,
+        install_path: Path | None = None,
+    ) -> None:
         self.root = root
         self.directory = app_dir()
         self.store = SettingsStore(self.directory)
@@ -34,8 +55,18 @@ class App:
         self.controller = controller_factory(
             self.directory, load_submit_key(), self.events.put
         )
+        self._server_url = settings.server_url
+        self._closing = threading.Event()
+        self._ready_update: tuple[Updater, Path, str] | None = None
+        self._update_key = bytes.fromhex(update_key_hex) if update_key_hex else b""
+        self._install_path = install_path or installed_executable()
         self._build(settings)
         self.controller.launch()
+        if self._update_key:
+            remove_previous_version(self._install_path)
+            threading.Thread(
+                target=self._update_loop, name="updates", daemon=True
+            ).start()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(PUMP_MS, self._pump)
 
@@ -46,7 +77,16 @@ class App:
         main = ttk.Frame(root, padding=12)
         main.pack(fill="both", expand=True)
 
-        form = ttk.Frame(main)
+        self.update_bar = ttk.Frame(main)
+        self.update_var = tk.StringVar()
+        ttk.Label(self.update_bar, textvariable=self.update_var, wraplength=400).pack(
+            side="left"
+        )
+        self.update_button = ttk.Button(
+            self.update_bar, text="Restart now", command=self.restart_clicked
+        )
+
+        form = self.form = ttk.Frame(main)
         form.pack(fill="x")
         self.name_var = tk.StringVar(value=settings.name)
         self.ram_var = tk.StringVar(value=f"{settings.max_ram_mb / 1024:.1f}")
@@ -172,6 +212,7 @@ class App:
             self.error_var.set(str(error))
             return
         self.store.save(settings)
+        self._server_url = settings.server_url
         self.controller.start(settings, requested)
 
     def pause_clicked(self) -> None:
@@ -189,10 +230,69 @@ class App:
         return int(w), int(h)
 
     def close(self) -> None:
+        self._closing.set()
         self.status_vars["State"].set("closing, handing the current size back...")
         self.root.update_idletasks()
         self.controller.shutdown()
         self.root.destroy()
+
+    def restart_clicked(self) -> None:
+        """Swap in the downloaded version and start it; the current size goes back to the server."""
+        if self._ready_update is None:
+            return
+        updater, downloaded, version = self._ready_update
+        try:
+            new_app = updater.install(downloaded)
+        except (UpdateError, OSError) as error:
+            self.update_var.set(f"Could not install version {version}: {error}")
+            self.update_button.pack_forget()
+            return
+        self.close()
+        # a fresh, independent instance (not a child sharing this one's unpacked files)
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+        subprocess.Popen([str(new_app)], env=env, close_fds=True)
+
+    # updates (background thread; talks to the window only through the event queue)
+    def _update_loop(self) -> None:
+        if self._closing.wait(FIRST_UPDATE_CHECK_S):
+            return
+        while True:
+            try:
+                self._check_for_update()
+            except (UpdateError, ServerError, OSError, ValueError) as error:
+                self._update_log(f"Update check failed: {error}")
+            if self._closing.wait(UPDATE_CHECK_S):
+                return
+
+    def _update_log(self, message: str) -> None:
+        log.info(message)
+        self.events.put(Event("log", message))
+
+    def _check_for_update(self) -> None:
+        updater = Updater(self._server_url, self._update_key, self._install_path)
+        release = updater.check()
+        if release is None or (
+            self._ready_update and self._ready_update[2] == release.version
+        ):
+            return
+        if not updater.can_self_replace:
+            self.events.put(
+                Event(
+                    "update",
+                    f"Version {release.version} is available: {updater.download_url(release)}",
+                )
+            )
+            return
+        self._update_log(f"Downloading version {release.version} in the background...")
+        downloaded = updater.download(release)
+        self._ready_update = (updater, downloaded, release.version)
+        self._update_log(f"Version {release.version} downloaded and verified.")
+        self.events.put(
+            Event(
+                "update",
+                f"Version {release.version} is ready. Restarting hands the current size back.",
+            )
+        )
 
     # events
     def _pump(self) -> None:
@@ -203,9 +303,17 @@ class App:
                 break
             if event.kind == "status":
                 self._show_status(event.status)
+            elif event.kind == "update":
+                self._show_update(event.message)
             else:
                 self._append_log(event.message)
         self.root.after(PUMP_MS, self._pump)
+
+    def _show_update(self, message: str) -> None:
+        self.update_var.set(message)
+        self.update_bar.pack(fill="x", pady=(0, 8), before=self.form)
+        if self._ready_update is not None:
+            self.update_button.pack(side="right")
 
     def _append_log(self, message: str) -> None:
         self.log.configure(state="normal")

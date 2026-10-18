@@ -1,25 +1,42 @@
-"""Drives the real window: fields, Start, Pause/Resume, Stop, Give Up, close."""
+"""Drives the real window: fields, Start, Pause/Resume, Stop, Give Up, the update banner, close."""
 
 import tkinter as tk
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from tests.conftest import wait_for
+from tests.test_update import public_bytes, publish
+from tilingvol.client import gui
 from tilingvol.client.controller import State
 from tilingvol.client.gui import App
 
 
 @pytest.fixture
-def app(tmp_path, monkeypatch, submit_key):
+def server(sib_config, make_live_server, tmp_path):
+    return make_live_server(sib_config, download_dir=tmp_path / "downloads")
+
+
+@pytest.fixture
+def app(tmp_path, monkeypatch, submit_key, server):
+    release_key = Ed25519PrivateKey.generate()
+    publish(tmp_path / "downloads", release_key, b"new app version")
+    installed = tmp_path / "app" / "GunTilingSearch.exe"
+    installed.parent.mkdir()
+    installed.write_bytes(b"old app version")
     monkeypatch.setenv("TILINGVOL_HOME", str(tmp_path))
     monkeypatch.setenv("TILINGVOL_SUBMIT_KEY", submit_key.hex())
+    monkeypatch.setenv("TILINGVOL_SERVER_URL", server.url)
+    monkeypatch.setattr(gui, "FIRST_UPDATE_CHECK_S", 0.2)
     try:
         root = tk.Tk()
     except tk.TclError as error:
         if "display" not in str(error):
             raise
         pytest.skip("no display")
-    window = App(root)
+    window = App(
+        root, update_key_hex=public_bytes(release_key).hex(), install_path=installed
+    )
     yield window
     try:
         alive = bool(root.winfo_exists())
@@ -38,7 +55,13 @@ def pump_until(app: App, predicate, timeout_s: float):
 
 
 # one test only: the bundled Tcl cannot create a second Tk root in the same process
-def test_full_button_cycle(app, live_server):
+def test_full_button_cycle(app, server):
+    live_server = server
+    pump_until(app, lambda: "is ready" in app.update_var.get(), 30)
+    assert app.update_button.winfo_ismapped()
+    assert (
+        app._install_path.parent / "GunTilingSearch-9.9.9-windows.exe.download"
+    ).read_bytes() == b"new app version"
     app.name_var.set("  ")
     app.start_clicked()
     assert "name" in app.error_var.get()
@@ -83,7 +106,10 @@ def test_full_button_cycle(app, live_server):
     app.height_var.set("")
     app.start_clicked()
     pump_until(app, lambda: "IMPOSSIBLE" in app.log.get("1.0", "end"), 120)
-    assert any(r.source == "volunteer" for r in live_server.db.results())
+    # the window shows the verdict just before the upload completes
+    pump_until(
+        app, lambda: any(r.source == "volunteer" for r in live_server.db.results()), 30
+    )
     app.close()
     assert not live_server.db.active_jobs()
     assert app.store.load().name == "gui tester"

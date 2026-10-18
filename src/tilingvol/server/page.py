@@ -1,8 +1,10 @@
 """The public page: size map, leaderboard, recent results. Every user-supplied string is HTML-escaped."""
 
+import json
 import math
 import time
 from html import escape
+from pathlib import Path
 
 from tilingvol.server.config import ServerConfig
 from tilingvol.server.db import Database
@@ -19,6 +21,8 @@ MAP_BELOW_MIN = 10
 FAST_S, SLOW_S = 300.0, 10800.0
 LIGHT, DARK = (178, 242, 187), (8, 82, 28)
 RECENT = 20
+MANIFEST_NAME = "latest.json"
+MAX_MANIFEST_BYTES = 64 * 1024
 
 CATEGORIES = {
     "coloring": ("#d4d4d4", "Impossible by coloring"),
@@ -43,6 +47,27 @@ table { border-collapse: collapse; width: 100%; } td, th { padding: 4px 8px; bor
 .wrap { overflow-x: auto; } .found { background: #ffd43b; color: #1d2420; padding: 8px 12px; border-radius: 6px; }
 .chip { display: inline-block; width: 12px; height: 12px; border: 1px solid #889; vertical-align: middle; }
 """
+
+
+def load_manifest(folder: Path | None) -> dict | None:
+    if folder is None:
+        return None
+    path = folder / MANIFEST_NAME
+    if not path.is_file() or path.stat().st_size > MAX_MANIFEST_BYTES:
+        return None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    platforms = manifest.get("platforms") if isinstance(manifest, dict) else None
+    if not isinstance(platforms, dict) or not isinstance(manifest.get("version"), str):
+        return None
+    if not all(
+        isinstance(e, dict) and isinstance(e.get("filename"), str)
+        for e in platforms.values()
+    ):
+        return None
+    return manifest
 
 
 def time_shade(seconds: float) -> str:
@@ -185,14 +210,17 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
     )
 
     download_html = ""
-    if config.download_dir is not None and config.download_dir.is_dir():
+    manifest = load_manifest(config.download_dir)
+    if manifest is not None:
+        names = {"windows": "Windows", "linux": "Linux", "macos": "macOS"}
         links = ", ".join(
-            f'<a href="/download/{escape(p.name)}">{escape(p.name)}</a>'
-            for p in sorted(config.download_dir.iterdir())
-            if p.is_file()
+            f'<a href="/download/{escape(entry["filename"])}">{names.get(key, escape(key))}</a>'
+            for key, entry in sorted(manifest["platforms"].items())
         )
-        if links:
-            download_html = f"<h2>Join the search</h2><p>Download the app, enter a name and press Start: {links}</p>"
+        download_html = (
+            f"<h2>Join the search</h2><p>Download version {escape(manifest['version'])} for {links}, "
+            f"enter a name and press Start.</p>"
+        )
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">

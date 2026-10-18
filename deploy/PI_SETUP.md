@@ -134,12 +134,29 @@ On your PC, in the project folder, `.env` holds:
 
 ```
 TILINGVOL_SUBMIT_KEY=<same key as on the Pi>
-TILINGVOL_SERVER_URL=https://tiling.<your-domain>
+TILINGVOL_SERVER_URL=https://fe70.org
 ```
 
-Then `uv run python scripts/build_client.py` builds `dist/GunTilingSearch.exe`. Copy it to the Pi's
-`/var/lib/tilingvol/downloads/` and the public page offers it. Linux and macOS builds must be made on
-those systems (see `.github/workflows/build-client.yml`).
+The release-signing key was created once with `uv run python scripts/make_release_key.py`. It is at
+`%USERPROFILE%\.tiling-volunteer-releaseelease_signing_key.pem`. Keep a backup somewhere safe and never
+copy it to the Pi: without it, installed apps cannot be updated; anyone who has it can push updates.
+
+For every release:
+
+1. Raise `__version__` in `src/tilingvol/__init__.py` (and `version` in `pyproject.toml`).
+2. `uv run python scripts/release.py`. It builds the app, signs it and writes `release/latest.json`.
+3. Copy the two files to the Pi and into the download folder:
+
+```sh
+scp release/GunTilingSearch-<version>-windows.exe release/latest.json you@raspberrypi.local:
+# on the Pi:
+sudo install -o tilingvol -m 644 ~/GunTilingSearch-<version>-windows.exe ~/latest.json /var/lib/tilingvol/downloads/
+```
+
+The public page then offers the new version, and running apps download it within 6 hours, verify the
+signature and checksum, and show "Restart now". Linux and macOS builds must be made on those systems
+(`.github/workflows/build-client.yml`); put them into `release/` and run `release.py` again with
+`TILINGVOL_SKIP_BUILD=1` so they are signed too.
 
 ## Updating
 
