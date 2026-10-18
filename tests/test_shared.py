@@ -117,3 +117,21 @@ def test_parallel_settings_split_threads_and_ram(monkeypatch):
         Settings(
             name="x", max_ram_mb=1536, max_threads=8, server_url="http://h", parallel=2
         ).validated()
+
+
+def test_tree_progress_lines_are_parsed_and_throttled():
+    from tilingvol.client.solver_process import MSG_PROGRESS, TreeProgress
+
+    sent = []
+
+    class Sink:
+        def put(self, item):
+            sent.append(item)
+
+    progress = TreeProgress(1, Sink())
+    progress.on_line("#Tree   22.28s closed:1/3 unassigned:0 restarts:5")
+    progress.on_line(
+        "#Tree   22.36s closed:1/13 unassigned:6 restarts:6"
+    )  # within 5 s: dropped
+    progress.on_line("#Bound  23.00s best:inf next:[0,0]")
+    assert sent == [(MSG_PROGRESS, 1, 1, 3)]

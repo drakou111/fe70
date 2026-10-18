@@ -5,6 +5,7 @@ Two lanes, as in the research sweep: "area" (smallest area first, raises the are
 Timed-out sizes do not steer the battle lane, so it cannot chase its own timeouts."""
 
 import math
+import re
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from tilingvol.shared.protocol import (
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
+    Stage,
 )
 
 LANE_AREA = "area"
@@ -47,6 +49,7 @@ class Assignment:
     lane: str
     threads: int
     est_ram_mb: int
+    stages: tuple[Stage, ...] = ()
 
 
 @dataclass
@@ -76,6 +79,21 @@ def fit_trend(rows: list[tuple[int, float]]) -> tuple[float, float, float] | Non
 def trend_seconds(trend: tuple[float, float, float], area: int) -> float:
     mean_x, mean_y, slope = trend
     return math.exp(mean_y + slope * (math.log(area) - mean_x))
+
+
+FRAME_TAG = re.compile(r"frame(\d+)")
+
+
+def settling_depths(results: list[ResultRow]) -> dict[tuple[int, int], int]:
+    """Border depth that proved each size impossible (sizes settled by a border search only)."""
+    depths: dict[tuple[int, int], int] = {}
+    for r in results:
+        match = FRAME_TAG.match(r.stage_tag)
+        if r.verdict != VERDICT_IMPOSSIBLE or r.flagged or not match:
+            continue
+        key = (min(r.width, r.height), max(r.width, r.height))
+        depths[key] = min(depths.get(key, 10**9), int(match[1]))
+    return depths
 
 
 class Scheduler:
@@ -161,6 +179,39 @@ class Scheduler:
             return False
         return duration_s < self.config.fast_flag_factor * trend_seconds(
             trend, width * height
+        )
+
+    # stages
+    def stages_for(
+        self, key: tuple[int, int], results: list[ResultRow]
+    ) -> tuple[Stage, ...]:
+        """Adaptive: start at the depth that settled the nearest decided size (|dW| + |dH|, then the more
+        similar area), go border_increments steps of border_step deeper, then the full model."""
+        config = self.config
+        if not config.adaptive_borders:
+            return config.stages
+        depths = settling_depths(results)
+        start = config.default_border
+        if depths:
+            nearest = min(
+                depths,
+                key=lambda k: (
+                    abs(k[0] - key[0]) + abs(k[1] - key[1]),
+                    abs(k[0] * k[1] - key[0] * key[1]),
+                    k,
+                ),
+            )
+            start = depths[nearest]
+        limit = config.stage_time_limit_s
+        deepest = min(key) // 2
+        borders = sorted(
+            {
+                min(start + i * config.border_step, deepest)
+                for i in range(config.border_increments + 1)
+            }
+        )
+        return tuple(Stage(b, True, limit) for b in borders if b > 0) + (
+            Stage(0, False, limit),
         )
 
     # RAM
@@ -275,7 +326,7 @@ class Scheduler:
             )
             if fit is None:
                 continue
-            return Assignment(key[0], key[1], lane, *fit)
+            return Assignment(key[0], key[1], lane, *fit, self.stages_for(key, results))
         smallest = min(
             (key for key in self.sizes if available(key)),
             key=lambda k: k[0] * k[1],
@@ -326,4 +377,10 @@ class Scheduler:
             raise RequestRefused(
                 f"{width} x {height} needs more RAM than {max_ram_mb} MB"
             )
-        return Assignment(key[0], key[1], LANE_REQUESTED, *fit)
+        return Assignment(
+            key[0],
+            key[1],
+            LANE_REQUESTED,
+            *fit,
+            self.stages_for(key, self.db.results()),
+        )

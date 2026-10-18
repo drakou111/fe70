@@ -257,6 +257,16 @@ class Database:
             ).fetchone()
         return json.loads(row[0]) if row and row[0] else None
 
+    def retag_import(
+        self, width: int, height: int, verdict: str, duration_s: int, stage_tag: str
+    ) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "UPDATE results SET stage_tag = ? WHERE source = 'import' AND stage_tag = 'external'"
+                " AND width = ? AND height = ? AND verdict = ? AND CAST(ROUND(duration_s) AS INTEGER) = ?",
+                (stage_tag, width, height, verdict, duration_s),
+            ).rowcount
+
     def use_salt(self, salt: str) -> bool:
         """Record a salt; False if it was used before."""
         with self._lock:

@@ -58,12 +58,13 @@ def validate_job(job: Job, max_threads: int) -> Job:
 
 
 class ApiClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, access_token: str = "") -> None:
         if not base_url.startswith(("http://", "https://")):
             raise ValueError(
                 f"server URL must start with http:// or https://, got {base_url!r}"
             )
         self.base_url = base_url.rstrip("/")
+        self.access_token = access_token
 
     def request_job(
         self,
@@ -137,6 +138,7 @@ class ApiClient:
             headers={
                 "Content-Type": "application/json",
                 "User-Agent": f"tilingvol/{__version__}",
+                **({"X-Access-Token": self.access_token} if self.access_token else {}),
             },
         )
         return self._send(request)

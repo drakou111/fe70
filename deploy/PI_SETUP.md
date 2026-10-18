@@ -168,6 +168,16 @@ signature and checksum, and show "Restart now". Linux and macOS builds must be m
 (`.github/workflows/build-client.yml`); put them into `release/` and run `release.py` again with
 `TILINGVOL_SKIP_BUILD=1` so they are signed too.
 
+## Settings worth knowing
+
+Edit `/etc/tilingvol/tilingvol.env`, then `sudo systemctl restart tilingvol`:
+
+- **Access tokens** (`TILINGVOL_ACCESS_TOKENS`): to let only people you invite run sizes, put one token per
+  person there (comma-separated) and give each person theirs; removing a token locks that person out.
+- **Border stages**: by default adaptive (start at the depth that settled the nearest decided size, then
+  +2, +4, then full). The step, number of steps and time limit are in the same file.
+- `TILINGVOL_RETRY_TIMED_OUT=1` also hands out sizes that timed out before.
+
 ## Updating
 
 Repeat step 3's `git archive` / `scp` / `tar` (extract over the old code), run `uv sync` again, then

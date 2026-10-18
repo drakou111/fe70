@@ -63,9 +63,10 @@ class Settings:
     max_ram_mb: int = 0
     max_threads: int = 0
     server_url: str = field(default_factory=default_server_url)
-    parallel: int = (
-        1  # sizes searched at once; each gets 1/parallel of the threads and RAM
-    )
+    # sizes searched at once; each gets 1/parallel of the threads and RAM
+    parallel: int = 1
+    # only for servers that require one
+    access_token: str = ""
 
     @staticmethod
     def defaults() -> "Settings":
@@ -93,8 +94,14 @@ class Settings:
                 f"each parallel size needs at least {MIN_SLOT_RAM_MB // 1024} GB; raise Max RAM or "
                 f"lower Parallel sizes"
             )
+        token = self.access_token.strip()
+        if token and not token.isprintable():
+            raise ValueError("the access token contains unprintable characters")
         return replace(
-            self, name=validate_name(self.name), server_url=self.server_url.strip()
+            self,
+            name=validate_name(self.name),
+            server_url=self.server_url.strip(),
+            access_token=token,
         )
 
     def slot_settings(self) -> "Settings":

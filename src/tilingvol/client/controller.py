@@ -27,6 +27,7 @@ from tilingvol.client.solver_process import (
     MSG_FRAME_FEASIBLE,
     MSG_IMPOSSIBLE,
     MSG_POSSIBLE,
+    MSG_PROGRESS,
     MSG_STAGE_START,
     MSG_STOPPED,
     SolverTask,
@@ -77,6 +78,7 @@ class Status:
     total_active_s: float = 0.0
     ram_used_mb: int = 0
     ram_cap_mb: int = 0
+    progress: tuple[int, int] | None = None  # CP-SAT tree: closed, total
     finished: int = 0
     waiting_until: float = 0.0
 
@@ -125,6 +127,7 @@ class SolverRunner:
     stage_started_at: float = 0.0
     peak_mb: int = 0
     used_mb: int = 0
+    progress: tuple[int, int] | None = None
     kill_reason: str = ""  # "timeout" or "memory: ..."
     finished: bool = False
     _process: multiprocessing.Process | None = None
@@ -336,7 +339,7 @@ class Controller:
             _, settings, requested = command
             if self._state == State.IDLE:
                 self._settings, self._requested = settings, requested
-                self._api = ApiClient(settings.server_url)
+                self._api = ApiClient(settings.server_url, settings.access_token)
                 self._next_request_at = 0.0
                 self._memory_failures = 0
                 self._crashes = 0
@@ -441,8 +444,13 @@ class Controller:
         runner = self._runner
         for message in runner.drain():
             kind = message[0]
+            if kind == MSG_PROGRESS:
+                if message[1] == runner.stage_index:
+                    runner.progress = (message[2], message[3])
+                continue
             if kind == MSG_STAGE_START:
                 with runner.lock:
+                    runner.progress = None
                     runner.stage_index = message[1]
                     runner.stage_started_at = runner.clock.elapsed()
                 stage = self._job.stages[message[1]]
@@ -666,6 +674,7 @@ class Controller:
                     total_active_s=runner.clock.elapsed() if runner else 0.0,
                     ram_used_mb=runner.used_mb if runner else 0,
                     ram_cap_mb=self._settings.max_ram_mb if self._settings else 0,
+                    progress=runner.progress if runner else None,
                     finished=self._finished,
                     waiting_until=self._next_request_at if self._job is None else 0.0,
                 ),

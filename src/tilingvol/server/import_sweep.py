@@ -17,6 +17,9 @@ from tilingvol.shared.protocol import (
 SWEEP_NAME = "Drakou111"
 EXTERNAL_NAME = "mathmasterzach"
 LINE = re.compile(r"^(\d+)x(\d+) (SAT|UNSAT|UNKNOWN) (\d+)s ?(.*)$")
+EXTERNAL_DEPTH = re.compile(
+    r"frame (\d+)"
+)  # the collaborator's border depth (with extendability)
 VERDICT = {
     "SAT": VERDICT_POSSIBLE,
     "UNSAT": VERDICT_IMPOSSIBLE,
@@ -42,11 +45,11 @@ def parse(path: Path) -> list[dict]:
                 f"the sweep file claims a tiling ({line!r}); add it by hand with its solution"
             )
         external = "external" in rest
-        tag = (
-            rest.split()[0]
-            if rest and not external
-            else ("external" if external else "full")
-        )
+        if external:
+            depth = EXTERNAL_DEPTH.search(rest)
+            tag = f"frame{depth[1]}L" if depth else "external"
+        else:
+            tag = rest.split()[0] if rest else "full"
         rows.append(
             {
                 "width": min(w, h),
@@ -66,23 +69,20 @@ def main() -> None:
     config = ServerConfig.from_env()
     db = Database(config.db_path)
     # every result is one line; one already in the database (same size, verdict, stage, time) is skipped
-    seen = {
-        (r.width, r.height, r.verdict, r.stage_tag, round(r.duration_s))
+    # a result is one line; one already imported (same size, verdict and time) is skipped, except that a
+    # collaborator row first imported without its border depth gets the depth now
+    imported = {
+        (r.width, r.height, r.verdict, round(r.duration_s)): r.stage_tag
         for r in db.results()
         if r.source == "import"
     }
-    rows = [
-        row
-        for row in parse(path)
-        if (
-            row["width"],
-            row["height"],
-            row["verdict"],
-            row["stage_tag"],
-            round(row["duration_s"]),
-        )
-        not in seen
-    ]
+    rows, retagged = [], 0
+    for row in parse(path):
+        key = (row["width"], row["height"], row["verdict"], round(row["duration_s"]))
+        if key not in imported:
+            rows.append(row)
+        elif imported[key] == "external" and row["stage_tag"] != "external":
+            retagged += db.retag_import(*key, row["stage_tag"])
     for row in rows:
         db.add_result(
             job_id=None,
@@ -97,7 +97,9 @@ def main() -> None:
             solution=None,
             **row,
         )
-    print(f"imported {len(rows)} new results from {path}")
+    print(
+        f"imported {len(rows)} new results from {path}; added border depths to {retagged} older rows"
+    )
 
 
 if __name__ == "__main__":

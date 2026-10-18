@@ -2,6 +2,7 @@
 the parent owns the clock (stage time limits exclude pauses), so CP-SAT itself has no time limit here."""
 
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -14,6 +15,11 @@ MSG_IMPOSSIBLE = "impossible"
 MSG_POSSIBLE = "possible"
 MSG_STOPPED = "stopped"  # CP-SAT gave up on its own: its memory limit was reached
 MSG_ERROR = "error"
+MSG_PROGRESS = (
+    "progress"  # CP-SAT's shared-tree "closed X/Y" (only with about 16+ workers)
+)
+TREE_LINE = re.compile(r"#Tree\s+[\d.]+s closed:(\d+)/(\d+)")
+PROGRESS_EVERY_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,24 @@ def run_task(task: SolverTask, queue) -> None:
         raise
 
 
+class TreeProgress:
+    """Forwards CP-SAT's tree progress lines, at most every PROGRESS_EVERY_S seconds."""
+
+    def __init__(self, stage_index: int, queue) -> None:
+        self.stage_index = stage_index
+        self.queue = queue
+        self.last_sent = 0.0
+
+    def on_line(self, line: str) -> None:
+        match = TREE_LINE.match(line)
+        now = time.monotonic()
+        if match and now - self.last_sent >= PROGRESS_EVERY_S:
+            self.last_sent = now
+            self.queue.put(
+                (MSG_PROGRESS, self.stage_index, int(match[1]), int(match[2]))
+            )
+
+
 def _run_stages(task: SolverTask, queue) -> None:
     from ortools.sat.python import cp_model
 
@@ -62,6 +86,9 @@ def _run_stages(task: SolverTask, queue) -> None:
         solver = cp_model.CpSolver()
         solver.parameters.num_workers = task.threads
         solver.parameters.max_memory_in_mb = task.memory_limit_mb
+        solver.parameters.log_search_progress = True
+        solver.parameters.log_to_stdout = False
+        solver.log_callback = TreeProgress(index, queue).on_line
         status = solver.Solve(built.model)
         if status == cp_model.INFEASIBLE:
             queue.put((MSG_IMPOSSIBLE, index))

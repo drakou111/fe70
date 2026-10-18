@@ -184,3 +184,18 @@ def test_pause_and_resume_work_between_sizes(live_server, controller):
     c.resume()
     wait_for(lambda: len(results(live_server)) >= paused_at + 2, 60)
     c.stop()
+
+
+def test_access_token_is_sent_with_every_message(
+    sib_config, make_live_server, controller
+):
+    from dataclasses import replace as dc_replace
+
+    token = "secret-volunteer-token"
+    server = make_live_server(sib_config, access_tokens=frozenset({token}))
+    c, recorder = controller
+    c.start(settings(server.url))
+    wait_for(lambda: recorder.has("needs a valid access token"), 30)
+    c.start(dc_replace(settings(server.url), access_token=token))
+    wait_for(lambda: len(results(server)) >= 2, 60)
+    c.stop()

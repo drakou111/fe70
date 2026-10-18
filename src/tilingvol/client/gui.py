@@ -105,6 +105,7 @@ class App:
         self.threads_var = tk.StringVar(value=str(settings.max_threads))
         self.parallel_var = tk.StringVar(value=str(settings.parallel))
         self.url_var = tk.StringVar(value=settings.server_url)
+        self.token_var = tk.StringVar(value=settings.access_token)
         self.width_var = tk.StringVar()
         self.height_var = tk.StringVar()
         total_gb = installed_ram_mb() / 1024
@@ -163,6 +164,13 @@ class App:
         )
         self.url_entry = ttk.Entry(self.advanced, textvariable=self.url_var, width=40)
         self.url_entry.grid(row=0, column=1, columnspan=3, sticky="we", pady=2)
+        ttk.Label(self.advanced, text="Access token").grid(
+            row=2, column=0, sticky="w", pady=2
+        )
+        self.token_entry = ttk.Entry(
+            self.advanced, textvariable=self.token_var, width=40, show="*"
+        )
+        self.token_entry.grid(row=2, column=1, columnspan=3, sticky="we", pady=2)
         ttk.Label(self.advanced, text="Request a size (optional)").grid(
             row=1, column=0, sticky="w", pady=2
         )
@@ -206,13 +214,14 @@ class App:
         status.pack(fill="x")
         self.summary_var = tk.StringVar(value="Idle. Finished sizes: 0")
         ttk.Label(status, textvariable=self.summary_var).pack(anchor="w")
-        columns = ("size", "stage", "time", "ram")
+        columns = ("size", "stage", "time", "progress", "ram")
         self.table = ttk.Treeview(status, columns=columns, show="headings", height=3)
         for column, title, width in (
             ("size", "Size", 190),
             ("stage", "Stage", 150),
-            ("time", "Stage time", 140),
-            ("ram", "RAM", 110),
+            ("time", "Stage time", 130),
+            ("progress", "Progress", 90),
+            ("ram", "RAM", 100),
         ):
             self.table.heading(column, text=title, anchor="w")
             self.table.column(column, width=width, anchor="w", stretch=True)
@@ -248,6 +257,7 @@ class App:
                 max_threads=int(self.threads_var.get()),
                 server_url=self.url_var.get(),
                 parallel=int(self.parallel_var.get()),
+                access_token=self.token_var.get(),
             ).validated()
             requested = self._requested_size()
         except ValueError as error:
@@ -397,14 +407,14 @@ class App:
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    def slot_rows(self) -> list[tuple[str, str, str, str]]:
+    def slot_rows(self) -> list[tuple[str, str, str, str, str]]:
         rows = []
         for index in range(len(self.slots)):
             status = self.slot_status.get(index)
             job = status.job if status else None
             if job is None:
                 waiting = status.state.value if status else "starting"
-                rows.append(("-", waiting, "-", "-"))
+                rows.append(("-", waiting, "-", "-", "-"))
                 continue
             size = f"{job.width} x {job.height} ({job.threads} threads)"
             if status.stage_index >= 0:
@@ -423,7 +433,10 @@ class App:
                 if status.ram_cap_mb
                 else "-"
             )
-            rows.append((size, stage_text, time_text, ram))
+            progress = (
+                f"{status.progress[0]}/{status.progress[1]}" if status.progress else "-"
+            )
+            rows.append((size, stage_text, time_text, progress, ram))
         return rows
 
     def _show_status(self) -> None:
@@ -460,6 +473,7 @@ class App:
             self.threads_entry,
             self.parallel_entry,
             self.url_entry,
+            self.token_entry,
             self.width_entry,
             self.height_entry,
         ):

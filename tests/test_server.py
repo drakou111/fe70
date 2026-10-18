@@ -1,4 +1,5 @@
 import time
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -250,3 +251,88 @@ def test_page_escapes_names(client, submit_key):
     post_result(client, submission(submit_key, job, "impossible", 0, 0.5, name=evil))
     html = client.get("/").text
     assert "<script>alert" not in html and "&lt;script&gt;" in html
+
+
+def add_import(app, width, height, stage_tag, duration=100.0):
+    app.state.db.add_result(
+        job_id=None,
+        width=width,
+        height=height,
+        verdict="impossible",
+        stage_tag=stage_tag,
+        duration_s=duration,
+        name="seed",
+        ip=None,
+        threads=None,
+        peak_ram_mb=None,
+        est_ram_mb=None,
+        client_version=None,
+        flagged=False,
+        flag_reason="",
+        hard=False,
+        source="import",
+        solution=None,
+    )
+
+
+def test_adaptive_borders_follow_the_nearest_settled_size(sib_config):
+    config = replace(
+        sib_config,
+        adaptive_borders=True,
+        default_border=3,
+        border_step=2,
+        border_increments=2,
+    )
+    with TestClient(create_app(config)) as c:
+        job = request_job(c, size=(20, 21))
+        assert [s["border"] for s in job["stages"]] == [
+            3,
+            5,
+            7,
+            0,
+        ]  # nothing settled yet
+        add_import(c.app, 14, 15, "frame4L")
+        add_import(c.app, 28, 30, "frame6L")
+        job = request_job(c, size=(14, 21))
+        assert [s["border"] for s in job["stages"]] == [
+            4,
+            6,
+            7,
+            0,
+        ]  # nearest is 14 x 15; capped at 14 // 2
+        job = request_job(c, size=(28, 28))
+        assert [s["border"] for s in job["stages"]] == [6, 8, 10, 0]
+        assert job["stages"][-1]["lookahead"] is False
+
+
+def test_access_tokens(sib_config):
+    token = "t" * 20
+    with TestClient(
+        create_app(replace(sib_config, access_tokens=frozenset({token})))
+    ) as c:
+        body = {
+            "name": "x",
+            "max_ram_mb": 4096,
+            "max_threads": 2,
+            "client_version": "0.3.0",
+        }
+        assert c.post("/api/jobs/request", json=body).status_code == 401
+        assert (
+            c.post(
+                "/api/jobs/request", json=body, headers={"X-Access-Token": "wrong" * 4}
+            ).status_code
+            == 401
+        )
+        job = c.post("/api/jobs/request", json=body, headers={"X-Access-Token": token})
+        assert job.status_code == 200
+        beat = {
+            "nonce": job.json()["nonce"],
+            "state": "running",
+            "stage_index": 0,
+            "active_s": 1,
+        }
+        assert (
+            c.post(f"/api/jobs/{job.json()['job_id']}/heartbeat", json=beat).status_code
+            == 401
+        )
+        assert c.get("/").status_code == 200  # the public page stays public

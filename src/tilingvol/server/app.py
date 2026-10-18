@@ -35,6 +35,7 @@ from tilingvol.shared.verify import TilingError, verify_tiling
 log = logging.getLogger("tilingvol.server")
 
 MAX_BODY_BYTES = 4 << 20
+TOKEN_HEADER = "x-access-token"
 DURATION_SLACK_S = 120.0
 IMPOSSIBLE_SLACK_S = 600.0
 TIMEOUT_MIN_FRACTION = 0.95
@@ -126,6 +127,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 )
             if not length.isdigit() or int(length) > MAX_BODY_BYTES:
                 return JSONResponse({"detail": "request too large"}, status_code=413)
+            if config.access_tokens and request.url.path.startswith("/api/jobs/"):
+                given = request.headers.get(TOKEN_HEADER, "")
+                if not any(hmac.compare_digest(given, t) for t in config.access_tokens):
+                    return JSONResponse(
+                        {
+                            "detail": "this server needs a valid access token (Advanced > Access token)"
+                        },
+                        status_code=401,
+                    )
         return await call_next(request)
 
     def client_ip(request: Request) -> str:
@@ -177,7 +187,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "lookahead": s.lookahead,
                     "time_limit_s": s.time_limit_s,
                 }
-                for s in config.stages
+                for s in assignment.stages
             ]
             db.add_job(
                 job_id,

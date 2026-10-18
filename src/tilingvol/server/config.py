@@ -8,6 +8,7 @@ from pathlib import Path
 from tilingvol.shared.pieces import PieceSpec, piece_by_name
 from tilingvol.shared.protocol import Stage
 
+MIN_TOKEN_LENGTH = 16
 DEFAULT_STAGES = (
     Stage(20, True, 10800.0),
     Stage(26, True, 10800.0),
@@ -50,6 +51,15 @@ class ServerConfig:
     download_dir: Path | None = None
     # cloudflared on the same host sets CF-Connecting-IP
     trust_proxy_header: bool = True
+    # adaptive borders: start at the depth that settled the nearest decided size, then go
+    # border_increments steps of border_step deeper, then the full model; otherwise use `stages`
+    adaptive_borders: bool = False
+    default_border: int = 20
+    border_step: int = 2
+    border_increments: int = 2
+    stage_time_limit_s: float = 10800.0
+    # if not empty, every job request/heartbeat/release/result must carry one of these tokens
+    access_tokens: frozenset[str] = frozenset()
 
     @staticmethod
     def from_env() -> "ServerConfig":
@@ -63,7 +73,8 @@ class ServerConfig:
                 "TILINGVOL_SUBMIT_KEY must be at least 16 bytes (32 hex digits)"
             )
         stages = DEFAULT_STAGES
-        if os.environ.get("TILINGVOL_STAGES"):
+        explicit_stages = bool(os.environ.get("TILINGVOL_STAGES"))
+        if explicit_stages:
             stages = tuple(
                 Stage(int(s["border"]), bool(s["lookahead"]), float(s["time_limit_s"]))
                 for s in json.loads(os.environ["TILINGVOL_STAGES"])
@@ -71,6 +82,21 @@ class ServerConfig:
         if not stages or stages[-1].border != 0:
             raise RuntimeError("the last stage must be the full model (border 0)")
         download = os.environ.get("TILINGVOL_DOWNLOAD_DIR")
+        tokens = frozenset(
+            t.strip()
+            for t in os.environ.get("TILINGVOL_ACCESS_TOKENS", "").split(",")
+            if t.strip()
+        )
+        if any(len(t) < MIN_TOKEN_LENGTH for t in tokens):
+            raise RuntimeError(
+                f"access tokens must be at least {MIN_TOKEN_LENGTH} characters"
+            )
+        adaptive = (
+            os.environ.get(
+                "TILINGVOL_ADAPTIVE_BORDERS", "0" if explicit_stages else "1"
+            )
+            == "1"
+        )
         return ServerConfig(
             db_path=Path(os.environ.get("TILINGVOL_DB", "tilingvol.sqlite3")),
             submit_key=submit_key,
@@ -79,4 +105,12 @@ class ServerConfig:
             battle_share=float(os.environ.get("TILINGVOL_BATTLE_SHARE", "0.5")),
             retry_timed_out=os.environ.get("TILINGVOL_RETRY_TIMED_OUT", "0") == "1",
             download_dir=Path(download) if download else None,
+            adaptive_borders=adaptive,
+            default_border=int(os.environ.get("TILINGVOL_DEFAULT_BORDER", "20")),
+            border_step=int(os.environ.get("TILINGVOL_BORDER_STEP", "2")),
+            border_increments=int(os.environ.get("TILINGVOL_BORDER_INCREMENTS", "2")),
+            stage_time_limit_s=float(
+                os.environ.get("TILINGVOL_STAGE_TIME_LIMIT_S", "10800")
+            ),
+            access_tokens=tokens,
         )
