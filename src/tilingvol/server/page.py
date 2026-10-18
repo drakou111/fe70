@@ -197,6 +197,8 @@ def map_note(piece) -> str:
 def picture_caption(p) -> str:
     if p.border == 0:
         return "a complete tiling!"
+    if p.verdict is None:
+        return f"border {p.border} filled; searching deeper"
     match = re.match(r"frame(\d+)", p.stage_tag)
     deeper = f"border {match[1]}" if match else "the full search"
     outcome = {VERDICT_IMPOSSIBLE: "impossible", VERDICT_TIMED_OUT: "timed out"}.get(
@@ -399,7 +401,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
 
     pictures = db.recent_pictures(GALLERY)
     figures = "".join(
-        f'<figure><a href="/picture/{p.result_id}.png"><img src="/picture/{p.result_id}.png" loading="lazy" '
+        f'<figure><a href="{p.url}"><img src="{p.url}" loading="lazy" '
         f'alt="{p.width} x {p.height}"></a><figcaption><b>{p.width} x {p.height}</b><br>'
         f"{escape(picture_caption(p))}<br>by {escape(p.name)}</figcaption></figure>"
         for p in pictures

@@ -53,6 +53,17 @@ CREATE TABLE IF NOT EXISTS results (
 );
 CREATE INDEX IF NOT EXISTS results_size ON results(width, height);
 CREATE TABLE IF NOT EXISTS used_salts (salt TEXT PRIMARY KEY, used REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS frames (          -- border fillings, saved the moment they are found
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL UNIQUE,              -- only the deepest one per job is kept
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    border INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    submitted REAL NOT NULL,
+    placements TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS frames_size ON frames(width, height);
 """
 
 
@@ -77,11 +88,11 @@ class JobRow:
 
 @dataclass(frozen=True)
 class PictureRow:
-    result_id: int
+    url: str
     width: int
     height: int
-    verdict: str
-    stage_tag: str
+    verdict: str | None  # None: the search that found it has not ended yet
+    stage_tag: str | None
     name: str
     border: int  # 0 = a full tiling
 
@@ -260,13 +271,20 @@ class Database:
             )
 
     def recent_pictures(self, limit: int) -> list[PictureRow]:
+        """Newest first: tilings and old apps' borders (sent with the result), and borders saved on the way
+        (with the outcome of their search, once it ended)."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, width, height, verdict, stage_tag, name, picture_border FROM results"
-                " WHERE picture IS NOT NULL AND flagged = 0 ORDER BY id DESC LIMIT ?",
+                "SELECT * FROM ("
+                " SELECT 'picture', id, submitted, width, height, verdict, stage_tag, name, picture_border"
+                " FROM results WHERE picture IS NOT NULL AND flagged = 0"
+                " UNION ALL"
+                " SELECT 'frame', f.id, f.submitted, f.width, f.height, r.verdict, r.stage_tag, f.name, f.border"
+                " FROM frames f LEFT JOIN results r ON r.job_id = f.job_id AND r.flagged = 0"
+                ") ORDER BY 3 DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [PictureRow(*r) for r in rows]
+        return [PictureRow(f"/{r[0]}/{r[1]}.png", *r[3:]) for r in rows]
 
     def picture(self, result_id: int) -> tuple[int, int, list] | None:
         with self._lock:
@@ -275,6 +293,58 @@ class Database:
                 (result_id,),
             ).fetchone()
         return (row[0], row[1], json.loads(row[2])) if row else None
+
+    def add_frame(
+        self,
+        job_id: str,
+        width: int,
+        height: int,
+        border: int,
+        name: str,
+        placements: list,
+    ) -> bool:
+        """Keep the border filling unless the job already saved one at least as deep; True if kept."""
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "INSERT INTO frames (job_id, width, height, border, name, submitted, placements)"
+                    " VALUES (?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET border = excluded.border,"
+                    " submitted = excluded.submitted, placements = excluded.placements"
+                    " WHERE excluded.border > frames.border",
+                    (
+                        job_id,
+                        width,
+                        height,
+                        border,
+                        name,
+                        time.time(),
+                        json.dumps(placements),
+                    ),
+                ).rowcount
+                > 0
+            )
+
+    def frame(self, frame_id: int) -> tuple[int, int, int, list] | None:
+        """(border, width, height, placements)"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT border, width, height, placements FROM frames WHERE id = ?",
+                (frame_id,),
+            ).fetchone()
+        return (row[0], row[1], row[2], json.loads(row[3])) if row else None
+
+    def filled_border(self, width: int, height: int) -> int:
+        """Deepest border anyone has filled for this size (either orientation), 0 if none."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(b) FROM ("
+                " SELECT border AS b FROM frames WHERE (width = ? AND height = ?) OR (width = ? AND height = ?)"
+                " UNION ALL"
+                " SELECT picture_border FROM results WHERE picture_border > 0 AND flagged = 0"
+                " AND ((width = ? AND height = ?) OR (width = ? AND height = ?)))",
+                (width, height, height, width) * 2,
+            ).fetchone()
+        return row[0] or 0
 
     def results(self) -> list[ResultRow]:
         with self._lock:

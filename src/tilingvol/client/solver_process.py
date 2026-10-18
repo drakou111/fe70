@@ -34,6 +34,7 @@ class SolverTask:
     tree_workers: int = (
         0  # > 0: force CP-SAT's shared-tree search, which reports "closed X/Y" progress
     )
+    first_stage: int = 0  # the stages before it were already filled (after Stop & free RAM, then Start)
 
 
 def _exit_when_parent_dies(parent_pid: int) -> None:
@@ -81,7 +82,8 @@ def _run_stages(task: SolverTask, queue) -> None:
     from tilingvol.shared.pieces import piece_by_name
 
     piece = piece_by_name(task.piece)
-    for index, stage in enumerate(task.stages):
+    for index in range(task.first_stage, len(task.stages)):
+        stage = task.stages[index]
         queue.put((MSG_STAGE_START, index))
         built = build_model(
             piece, task.width, task.height, stage.border, stage.lookahead

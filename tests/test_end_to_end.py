@@ -211,9 +211,8 @@ def test_border_pictures_reach_the_window_and_the_site(live_server, controller):
     pictures = [e.picture for e in recorder.events if e.kind == "picture"]
     assert pictures and all(len(p) == 5 and p[0] == "sib" for p in pictures)
     picture = live_server.db.recent_pictures(1)[0]
-    png = urllib.request.urlopen(
-        f"{live_server.url}/picture/{picture.result_id}.png"
-    ).read()
+    assert picture.url.startswith("/frame/")  # saved the moment it was found
+    png = urllib.request.urlopen(live_server.url + picture.url).read()
     assert png.startswith(b"\x89PNG")
     assert (
         "Latest pictures"
@@ -253,3 +252,27 @@ def test_unlimited_stage_is_never_cut_off_by_the_clock():
     runner.guard()
     assert runner.kill_reason == ""
     runner.kill()
+
+
+def test_solver_can_start_after_an_already_filled_stage():
+    import os
+    import queue
+
+    from tilingvol.client.solver_process import (
+        MSG_STAGE_START,
+        SolverTask,
+        run_task,
+    )
+
+    stages = (Stage(3, True, 60.0), Stage(0, False, 120.0))
+    messages = queue.Queue()
+    run_task(
+        SolverTask("sib", 19, 28, stages, 2, 1024, os.getpid(), first_stage=1),
+        messages,
+    )
+    starts = []
+    while not messages.empty():
+        message = messages.get()
+        if message[0] == MSG_STAGE_START:
+            starts.append(message[1])
+    assert starts == [1]  # the border stage is not searched again

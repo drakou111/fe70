@@ -132,9 +132,7 @@ class SolverRunner:
     peak_mb: int = 0
     used_mb: int = 0
     progress: tuple[int, int] | None = None
-    frame: tuple[int, list] | None = (
-        None  # deepest border filled so far: (depth, placements)
-    )
+    first_stage: int = 0
     kill_reason: str = ""  # "timeout" or "memory: ..."
     finished: bool = False
     _process: multiprocessing.Process | None = None
@@ -154,6 +152,7 @@ class SolverRunner:
             memory_guard.solver_soft_limit_mb(self.cap_mb),
             os.getpid(),
             tree_workers_for(self.job.threads) if self.tree_progress else 0,
+            self.first_stage,
         )
         self._process = context.Process(
             target=run_task, args=(task, self._queue), daemon=True
@@ -264,6 +263,12 @@ class Controller:
         self._requested: tuple[int, int] | None = None
         self._api: ApiClient | None = None
         self._job: Job | None = None
+        self._filled_stage = (
+            -1
+        )  # deepest stage of the current job whose border was filled
+        self._unsent_frame: tuple[int, list] | None = (
+            None  # (stage index, placements) not yet saved
+        )
         self._runner: SolverRunner | None = None
         self._runner_lock = threading.Lock()
         self._finished = 0
@@ -432,9 +437,16 @@ class Controller:
             self._requested = None
             return
         self._requested = None
+        self._filled_stage = -1
+        self._unsent_frame = None
         job = self._job
         self._next_heartbeat_at = time.monotonic() + job.heartbeat_interval_s
         stages = ", ".join(s.describe() for s in job.stages)
+        if job.filled_border:
+            self._log(
+                f"An earlier search of {job.width} x {job.height} already filled border depth "
+                f"{job.filled_border}, so this one starts deeper."
+            )
         self._log(
             f"Got {job.width} x {job.height} ({job.lane} lane), {job.threads} threads, about "
             f"{job.est_ram_mb / 1024:.1f} GB. Stages: {stages}."
@@ -456,7 +468,17 @@ class Controller:
             )
             self._state = State.STOPPED
             return
-        runner = SolverRunner(self._job, cap, self._settings.tree_progress)
+        runner = SolverRunner(
+            self._job,
+            cap,
+            self._settings.tree_progress,
+            first_stage=self._filled_stage + 1,
+        )
+        if self._filled_stage >= 0:
+            self._log(
+                f"Continuing after {self._job.stages[self._filled_stage].describe()}, which was "
+                f"already filled."
+            )
         runner.start()
         with self._runner_lock:
             self._runner = runner
@@ -480,12 +502,14 @@ class Controller:
                     f"(limit: {stage.describe_limit()})."
                 )
             elif kind == MSG_FRAME_FEASIBLE:
-                stage = self._job.stages[message[1]]
-                runner.frame = (stage.border, message[2])
+                job = self._job
+                stage = job.stages[message[1]]
+                self._filled_stage = message[1]
+                self._unsent_frame = (message[1], message[2])
                 self._log(
                     f"A {stage.describe()} can be filled, so it proves nothing; going deeper."
                 )
-                job = self._job
+                self._send_frame(job)
                 self._on_event(
                     Event(
                         "picture",
@@ -569,7 +593,9 @@ class Controller:
             salt,
             solution,
         )
-        frame = runner.frame
+        # a border filling already saved on the server need not travel again
+        frame = self._unsent_frame
+        self._unsent_frame = None
         submission = ResultSubmission(
             job.job_id,
             job.nonce,
@@ -582,7 +608,7 @@ class Controller:
             token.sign(self._key, payload),
             __version__,
             solution,
-            frame_border=frame[0] if frame else None,
+            frame_border=job.stages[frame[0]].border if frame else None,
             frame_placements=frame[1] if frame else None,
         )
         if solution is not None:
@@ -626,10 +652,29 @@ class Controller:
             runner.finished = True
             runner.kill()
 
+    def _send_frame(self, job: Job) -> None:
+        """Save the latest border filling on the server now, so a later search of this size can skip it
+        even if this one is stopped. Kept and retried with the heartbeats while the server is away."""
+        if self._unsent_frame is None:
+            return
+        stage_index, placements = self._unsent_frame
+        try:
+            self._api.send_frame(job, stage_index, placements)
+        except ServerError as error:
+            if error.status in RETRYABLE_STATUSES:
+                self._log(
+                    f"Could not save the border filling yet ({error}); will retry."
+                )
+                return
+            self._log(f"The server did not take the border filling: {error}")
+        self._unsent_frame = None
+
     def _release(self, reason: str, detail: str, peak: int = 0) -> None:
         job, self._job = self._job, None
         if job is None:
             return
+        self._send_frame(job)
+        self._unsent_frame = None
         try:
             self._api.release(job, reason, peak, detail[:200])
         except ServerError as error:
@@ -639,6 +684,7 @@ class Controller:
 
     def _heartbeat(self) -> None:
         job = self._job
+        self._send_frame(job)
         self._next_heartbeat_at = time.monotonic() + job.heartbeat_interval_s
         runner = self._runner
         try:

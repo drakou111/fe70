@@ -12,6 +12,7 @@ from tilingvol.shared.pieces import SIBLING
 from tilingvol.shared.verify import verify_tiling
 
 NAME = "tester"
+PNG_MAGIC = bytes([0x89]) + b"PNG"
 
 
 @pytest.fixture
@@ -348,9 +349,7 @@ def test_border_pictures_are_checked_before_display(client, submit_key):
     post_result(client, {**body, "frame_border": 3, "frame_placements": border})
     rows = client.app.state.db.recent_pictures(5)
     assert [(r.width, r.height, r.border) for r in rows] == [(19, 28, 3)]
-    assert client.get(f"/picture/{rows[0].result_id}.png").content.startswith(
-        b"\x89PNG"
-    )
+    assert client.get(rows[0].url).content.startswith(b"\x89PNG")
     job = request_job(client)
     body = submission(submit_key, job, "impossible", 1, 1.0)
     bogus = [
@@ -358,6 +357,48 @@ def test_border_pictures_are_checked_before_display(client, submit_key):
     ]  # does not fill the border: the result counts, the picture is dropped
     post_result(client, {**body, "frame_border": 3, "frame_placements": bogus})
     assert len(client.app.state.db.recent_pictures(5)) == 1
+
+
+def test_filled_borders_are_saved_at_once_and_skipped_later(sib_config, submit_key):
+    config = replace(
+        sib_config,
+        adaptive_borders=True,
+        default_border=3,
+        border_step=2,
+        border_increments=2,
+    )
+    tiling = solve_sibling(19, 28)
+    border = [
+        p for p in tiling if any(min(x, y, 18 - x, 27 - y) < 3 for x, y in cells_of(p))
+    ]
+    with TestClient(create_app(config)) as c:
+        job = request_job(c, size=(19, 28))
+        assert [s["border"] for s in job["stages"]] == [3, 5, 7, 0]
+        assert job["filled_border"] == 0
+        url = f"/api/jobs/{job['job_id']}/frame"
+        frame = {"nonce": job["nonce"], "stage_index": 0, "placements": border}
+        assert c.post(url, json={**frame, "placements": [[0, 0, 0]]}).status_code == 422
+        assert c.post(url, json={**frame, "stage_index": 3}).status_code == 422
+        assert c.post(url, json={**frame, "nonce": "0" * 32}).status_code == 404
+        assert c.post(url, json=frame).status_code == 200
+        rows = c.app.state.db.recent_pictures(5)
+        assert [(r.border, r.verdict) for r in rows] == [(3, None)]
+        assert c.get(rows[0].url).content.startswith(PNG_MAGIC)
+        assert "searching deeper" in c.get("/").text
+        # the volunteer quits during border 5: the next search of the size starts there
+        release = {"nonce": job["nonce"], "reason": "closed"}
+        assert (
+            c.post(f"/api/jobs/{job['job_id']}/release", json=release).status_code
+            == 200
+        )
+        again = request_job(c, size=(28, 19))
+        assert [s["border"] for s in again["stages"]] == [5, 7, 0]
+        assert again["filled_border"] == 3
+        # the result of a search whose border was saved already adds no second picture
+        body = submission(submit_key, again, "impossible", 0, 1.0)
+        post_result(c, {**body, "frame_border": 3, "frame_placements": border})
+        assert len(c.app.state.db.recent_pictures(5)) == 1
+        assert c.post(url, json=frame).status_code == 410  # that job has ended
 
 
 def cells_of(placement):

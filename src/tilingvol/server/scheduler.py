@@ -197,7 +197,18 @@ class Scheduler:
         self, key: tuple[int, int], results: list[ResultRow]
     ) -> tuple[Stage, ...]:
         """Adaptive: start at the depth that settled the nearest decided size (|dW| + |dH|, then the more
-        similar area), go border_increments steps of border_step deeper, then the full model."""
+        similar area), go border_increments steps of border_step deeper, then the full model. Either way,
+        border depths someone already filled for this size are skipped: a filled border proves nothing."""
+        filled = self.db.filled_border(*key)
+        return tuple(
+            s
+            for s in self._planned_stages(key, results)
+            if s.border == 0 or s.border > filled
+        )
+
+    def _planned_stages(
+        self, key: tuple[int, int], results: list[ResultRow]
+    ) -> tuple[Stage, ...]:
         config = self.config
         if not config.adaptive_borders:
             return config.stages

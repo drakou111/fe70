@@ -50,6 +50,8 @@ def validate_job(job: Job, max_threads: int) -> Job:
             problems.append("bad stage")
     if not (TOKEN_PATTERN.fullmatch(job.job_id) and TOKEN_PATTERN.fullmatch(job.nonce)):
         problems.append("bad job id")
+    if not 0 <= job.filled_border <= min(job.width, job.height) // 2:
+        problems.append("bad filled border")
     if not 0 < job.heartbeat_interval_s <= 3600:
         problems.append("bad heartbeat interval")
     if problems:
@@ -120,6 +122,12 @@ class ApiClient:
                 "peak_ram_mb": peak_ram_mb,
                 "detail": detail,
             },
+        )
+
+    def send_frame(self, job: Job, stage_index: int, placements: list) -> None:
+        self._post(
+            f"/api/jobs/{job.job_id}/frame",
+            {"nonce": job.nonce, "stage_index": stage_index, "placements": placements},
         )
 
     def submit(self, submission: ResultSubmission) -> dict:

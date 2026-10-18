@@ -74,6 +74,12 @@ class Release(BaseModel):
     detail: str = Field(default="", max_length=200)
 
 
+class Frame(BaseModel):
+    nonce: str = Field(max_length=64)
+    stage_index: int = Field(ge=0, le=64)
+    placements: list[list[int]] = Field(max_length=100_000)
+
+
 class Submission(BaseModel):
     job_id: str = Field(max_length=64)
     nonce: str = Field(max_length=64)
@@ -122,7 +128,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     limiter = RateLimiter(config.max_requests_per_minute)
     pick_lock = threading.Lock()
     page_cache = {"at": 0.0, "html": ""}
-    picture_cache: dict[int, bytes] = {}
+    picture_cache: dict[tuple, bytes] = {}
     app = FastAPI(title="fe70", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.db = db
 
@@ -243,6 +249,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "est_ram_mb": assignment.est_ram_mb,
             "lane": assignment.lane,
             "heartbeat_interval_s": config.heartbeat_interval_s,
+            "filled_border": db.filled_border(assignment.width, assignment.height),
         }
 
     @app.post("/api/jobs/{job_id}/heartbeat")
@@ -272,6 +279,36 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             return {"ok": True}
         db.end_job(job_id, "released", body.reason, body.peak_ram_mb or None)
         log.info("job %s released: %s %s", job_id, body.reason, body.detail)
+        return {"ok": True}
+
+    @app.post("/api/jobs/{job_id}/frame")
+    def frame(job_id: str, body: Frame) -> dict:
+        """A border filling, saved as soon as it is found: the size's next search skips that depth even if
+        this one is stopped. Checked cell by cell, so it cannot be faked; a filling proves nothing about the
+        rectangle, so the worst a bad one could do is skip a stage that would have been feasible anyway."""
+        job = owned_job(job_id, body.nonce)
+        if job.state != "active":
+            raise HTTPException(410, f"this job is {job.state}")
+        if (
+            body.stage_index >= len(job.stages)
+            or not job.stages[body.stage_index]["border"]
+        ):
+            raise HTTPException(422, "not a border stage of this job")
+        border = job.stages[body.stage_index]["border"]
+        try:
+            verify_border(config.piece, job.width, job.height, border, body.placements)
+        except TilingError as error:
+            log.warning("job %s: border filling rejected: %s", job_id, error)
+            raise HTTPException(
+                422, f"the border filling is not valid: {error}"
+            ) from error
+        if db.add_frame(
+            job_id, job.width, job.height, border, job.name, body.placements
+        ):
+            page_cache["at"] = 0.0
+            log.info(
+                "job %s: %dx%d border %d filled", job_id, job.width, job.height, border
+            )
         return {"ok": True}
 
     @app.post("/api/jobs/{job_id}/result")
@@ -390,6 +427,13 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             return 0, body.solution
         if body.frame_border is None or body.frame_placements is None:
             return None, None
+        if body.frame_border not in [s["border"] for s in job.stages]:
+            return None, None
+        if body.frame_border <= db.filled_border(job.width, job.height):
+            return (
+                None,
+                None,
+            )  # already saved on the way, by this search or an earlier one
         try:
             verify_border(
                 config.piece,
@@ -403,20 +447,34 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             return None, None
         return body.frame_border, body.frame_placements
 
-    @app.get("/picture/{result_id}.png")
-    def picture_png(result_id: int) -> Response:
-        if result_id not in picture_cache:
-            found = db.picture(result_id)
+    def png(key: tuple, found: tuple[int, int, list] | None) -> Response:
+        if key not in picture_cache:
             if found is None:
                 raise HTTPException(404, "no picture")
             if len(picture_cache) >= PICTURE_CACHE_SIZE:
                 picture_cache.pop(next(iter(picture_cache)))
-            picture_cache[result_id] = render_png(config.piece, *found)
+            picture_cache[key] = render_png(config.piece, *found)
         return Response(
-            picture_cache[result_id],
+            picture_cache[key],
             media_type="image/png",
             headers={"Cache-Control": "public, max-age=86400"},
         )
+
+    @app.get("/picture/{result_id}.png")
+    def picture_png(result_id: int) -> Response:
+        key = ("picture", result_id)
+        return png(key, None if key in picture_cache else db.picture(result_id))
+
+    @app.get("/frame/{frame_id}.png")
+    def frame_png(frame_id: int) -> Response:
+        found = db.frame(frame_id)
+        if found is None:
+            raise HTTPException(404, "no picture")
+        border, *picture = found
+        # a deeper filling from the same search replaces this one, hence the depth in the key
+        response = png(("frame", frame_id, border), tuple(picture))
+        response.headers["Cache-Control"] = "public, max-age=300"
+        return response
 
     @app.get("/api/results")
     def results() -> list[dict]:

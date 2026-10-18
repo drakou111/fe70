@@ -55,6 +55,7 @@ class Job:
     est_ram_mb: int
     lane: str
     heartbeat_interval_s: float
+    filled_border: int = 0  # deepest border an earlier search of this size filled; the stages start deeper
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -76,6 +77,7 @@ class Job:
             est_ram_mb=int(data["est_ram_mb"]),
             lane=str(data["lane"]),
             heartbeat_interval_s=float(data["heartbeat_interval_s"]),
+            filled_border=int(data.get("filled_border", 0)),
         )
 
 
