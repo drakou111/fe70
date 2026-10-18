@@ -17,9 +17,9 @@ from cryptography.hazmat.primitives import serialization
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tilingvol import __version__  # noqa: E402
-from tilingvol.client.release_key import RELEASE_PUBLIC_KEY_HEX  # noqa: E402
-from tilingvol.client.update import current_platform, release_message  # noqa: E402
+from tilingvol import __version__
+from tilingvol.client.release_key import RELEASE_PUBLIC_KEY_HEX
+from tilingvol.client.update import current_platform, release_message
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_DIR = ROOT / "release"
@@ -35,22 +35,38 @@ def release_name(platform: str) -> str:
 def load_private_key():
     path = Path(os.environ.get("TILINGVOL_RELEASE_KEY", str(DEFAULT_KEY_PATH)))
     if not path.exists():
-        raise SystemExit(f"no signing key at {path}; run scripts/make_release_key.py first")
+        raise SystemExit(
+            f"no signing key at {path}; run scripts/make_release_key.py first"
+        )
     key = serialization.load_pem_private_key(path.read_bytes(), password=None)
-    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    public = (
+        key.public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
     if public != RELEASE_PUBLIC_KEY_HEX:
-        raise SystemExit("the signing key does not match release_key.py; apps would reject this release")
+        raise SystemExit(
+            "the signing key does not match release_key.py; apps would reject this release"
+        )
     return key
 
 
 def build_this_platform() -> None:
-    subprocess.run([sys.executable, str(ROOT / "scripts" / "build_client.py")], cwd=ROOT, check=True)
+    subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "build_client.py")],
+        cwd=ROOT,
+        check=True,
+    )
     platform = current_platform()
     built = ROOT / "dist" / (APP_NAME + (".exe" if platform == "windows" else ""))
     if platform == "macos":
         app = ROOT / "dist" / f"{APP_NAME}.app"
-        shutil.make_archive(str(RELEASE_DIR / release_name(platform).removesuffix(".zip")), "zip", app.parent,
-                            app.name)
+        shutil.make_archive(
+            str(RELEASE_DIR / release_name(platform).removesuffix(".zip")),
+            "zip",
+            app.parent,
+            app.name,
+        )
         return
     shutil.copy2(built, RELEASE_DIR / release_name(platform))
 
@@ -74,16 +90,24 @@ def main() -> None:
         if not path.exists():
             continue
         digest, size = sha256_of(path), path.stat().st_size
-        signature = key.sign(release_message(__version__, platform, path.name, digest, size)).hex()
-        platforms[platform] = {"filename": path.name, "sha256": digest, "size": size, "signature": signature}
+        signature = key.sign(
+            release_message(__version__, platform, path.name, digest, size)
+        ).hex()
+        platforms[platform] = {
+            "filename": path.name,
+            "sha256": digest,
+            "size": size,
+            "signature": signature,
+        }
     if not platforms:
         raise SystemExit(f"no app files for version {__version__} in {RELEASE_DIR}")
     manifest = {"version": __version__, "platforms": platforms}
-    (RELEASE_DIR / "latest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (RELEASE_DIR / "latest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
     files = " ".join(f"release/{e['filename']}" for e in platforms.values())
     print(f"signed {', '.join(platforms)} for version {__version__}")
-    print(f"upload: scp {files} release/latest.json <user>@<pi>:  then on the Pi:")
-    print("  sudo install -o tilingvol -m 644 <files> /var/lib/tilingvol/downloads/")
+    print(f"files: {files} release/latest.json (scripts/publish.py uploads them)")
 
 
 if __name__ == "__main__":

@@ -142,17 +142,26 @@ The release-signing key was created once with `uv run python scripts/make_releas
 elease_signing_key.pem`. Keep a backup somewhere safe and never
 copy it to the Pi: without it, installed apps cannot be updated; anyone who has it can push updates.
 
+One-time setup so releases upload without sudo. The download folder belongs to your Pi user; the
+service only reads it (apps check every signature, so this does not weaken anything):
+
+```sh
+sudo mkdir -p /srv/tilingvol-downloads
+sudo chown "$USER:$USER" /srv/tilingvol-downloads && sudo chmod 755 /srv/tilingvol-downloads
+sudo sed -i 's|^TILINGVOL_DOWNLOAD_DIR=.*|TILINGVOL_DOWNLOAD_DIR=/srv/tilingvol-downloads|' /etc/tilingvol/tilingvol.env
+sudo systemctl restart tilingvol
+```
+
+and add `TILINGVOL_PI_SSH=you@raspberrypi.local` to the PC's `.env`.
+
 For every release:
 
 1. Raise `__version__` in `src/tilingvol/__init__.py` (and `version` in `pyproject.toml`).
-2. `uv run python scripts/release.py`. It builds the app, signs it and writes `release/latest.json`.
-3. Copy the two files to the Pi and into the download folder:
+2. `uv run python scripts/publish.py`: builds, signs, uploads to the Pi (manifest last) and checks that
+   `https://fe70.org/api/update` announces the new version.
 
-```sh
-scp release/GunTilingSearch-<version>-windows.exe release/latest.json you@raspberrypi.local:
-# on the Pi:
-sudo install -o tilingvol -m 644 ~/GunTilingSearch-<version>-windows.exe ~/latest.json /var/lib/tilingvol/downloads/
-```
+To update the server code itself (after pulling new commits): `uv run python scripts/deploy_server.py`
+(asks for the Pi's sudo password once).
 
 The public page then offers the new version, and running apps download it within 6 hours, verify the
 signature and checksum, and show "Restart now". Linux and macOS builds must be made on those systems

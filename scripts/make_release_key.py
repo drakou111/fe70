@@ -24,15 +24,26 @@ def main() -> None:
         raise SystemExit(f"{path} already exists; refusing to overwrite a signing key")
     key = Ed25519PrivateKey.generate()
     path.parent.mkdir(parents=True, exist_ok=True)
-    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                            serialization.NoEncryption())
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
     path.write_bytes(pem)
     if os.name != "nt":
         path.chmod(0o600)
-    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    public = (
+        key.public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
     text = PUBLIC_MODULE.read_text(encoding="utf-8")
-    PUBLIC_MODULE.write_text(text.replace('RELEASE_PUBLIC_KEY_HEX = ""', f'RELEASE_PUBLIC_KEY_HEX = "{public}"'),
-                             encoding="utf-8")
+    PUBLIC_MODULE.write_text(
+        text.replace(
+            'RELEASE_PUBLIC_KEY_HEX = ""', f'RELEASE_PUBLIC_KEY_HEX = "{public}"'
+        ),
+        encoding="utf-8",
+    )
     print(f"private key: {path}  (back it up somewhere safe)")
     print(f"public key written to {PUBLIC_MODULE}")
 
