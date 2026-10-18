@@ -15,7 +15,7 @@ from tilingvol.shared.protocol import (
 )
 
 SWEEP_NAME = "Drakou111"
-EXTERNAL_NAME = "mathmasterzach"
+EXTERNAL_NAME = "zach"
 LINE = re.compile(r"^(\d+)x(\d+) (SAT|UNSAT|UNKNOWN) (\d+)s ?(.*)$")
 EXTERNAL_DEPTH = re.compile(
     r"frame (\d+)"
