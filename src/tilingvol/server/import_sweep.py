@@ -14,7 +14,7 @@ from tilingvol.shared.protocol import (
     VERDICT_TIMED_OUT,
 )
 
-SWEEP_NAME = "original sweep"
+SWEEP_NAME = "Drakou111"
 EXTERNAL_NAME = "collaborator"
 LINE = re.compile(r"^(\d+)x(\d+) (SAT|UNSAT|UNKNOWN) (\d+)s ?(.*)$")
 VERDICT = {
