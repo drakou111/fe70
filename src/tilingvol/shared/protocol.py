@@ -14,11 +14,24 @@ RELEASE_ERROR = "error"
 RELEASE_REASONS = (RELEASE_GAVE_UP, RELEASE_MEMORY, RELEASE_CLOSED, RELEASE_ERROR)
 
 
+NO_LIMIT = 0.0  # a stage time limit of 0 means: search until the stage is decided
+
+
 @dataclass(frozen=True)
 class Stage:
     border: int  # 0 = the full rectangle model
     lookahead: bool
-    time_limit_s: float
+    time_limit_s: float  # NO_LIMIT = unlimited
+
+    @property
+    def unlimited(self) -> bool:
+        return self.time_limit_s == NO_LIMIT
+
+    def describe_limit(self) -> str:
+        if self.unlimited:
+            return "no limit"
+        seconds = int(self.time_limit_s)
+        return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
     @property
     def tag(self) -> str:

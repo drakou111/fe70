@@ -365,7 +365,7 @@ def cells_of(placement):
     return [(x0 + dx, y0 + dy) for dx, dy in SIBLING.orientations[orientation]]
 
 
-def test_no_time_limit_jobs(client):
+def test_no_time_limit_jobs(client, submit_key):
     body = {
         "name": NAME,
         "max_ram_mb": 8192,
@@ -374,7 +374,19 @@ def test_no_time_limit_jobs(client):
         "no_time_limit": True,
     }
     job = client.post("/api/jobs/request", json=body).json()
-    assert all(s["time_limit_s"] == 7 * 24 * 3600 for s in job["stages"])
+    assert all(
+        s["time_limit_s"] == 7 * 24 * 3600 for s in job["stages"]
+    )  # 0.6 apps: the most they accept
+    current = client.post(
+        "/api/jobs/request", json={**body, "client_version": "0.7.0"}
+    ).json()
+    assert all(
+        s["time_limit_s"] == 0 for s in current["stages"]
+    )  # 0.7+: no limit at all
+    post_result(
+        client, submission(submit_key, current, "timed_out", 0, 99.0), expect=422
+    )
+    post_result(client, submission(submit_key, current, "impossible", 1, 50.0))
     assert all(s["time_limit_s"] < 7 * 24 * 3600 for s in request_job(client)["stages"])
 
 

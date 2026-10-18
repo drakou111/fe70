@@ -24,6 +24,7 @@ from tilingvol.server.scheduler import NoAssignment, RequestRefused, Scheduler
 from tilingvol.shared import token
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.protocol import (
+    NO_LIMIT,
     RELEASE_REASONS,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
@@ -37,7 +38,8 @@ log = logging.getLogger("tilingvol.server")
 
 MAX_BODY_BYTES = 4 << 20
 PICTURE_CACHE_SIZE = 64
-UNLIMITED_STAGE_S = 7 * 24 * 3600.0  # the longest stage the app accepts
+LEGACY_UNLIMITED_STAGE_S = 7 * 24 * 3600.0  # the longest stage apps before 0.7.0 accept
+NO_LIMIT_SINCE = "0.7.0"
 TOKEN_HEADER = "x-access-token"
 DURATION_SLACK_S = 120.0
 IMPOSSIBLE_SLACK_S = 600.0
@@ -158,6 +160,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(404, "unknown job")
         return job
 
+    def stage_limit(stage: Stage, body: JobRequest) -> float:
+        if not body.no_time_limit:
+            return stage.time_limit_s
+        # apps before NO_LIMIT_SINCE reject a limit of 0; they get the longest limit they accept
+        if version_tuple(body.client_version) >= version_tuple(NO_LIMIT_SINCE):
+            return NO_LIMIT
+        return LEGACY_UNLIMITED_STAGE_S
+
     @app.post("/api/jobs/request")
     def request_job(body: JobRequest, request: Request) -> dict:
         ip = client_ip(request)
@@ -197,9 +207,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 {
                     "border": s.border,
                     "lookahead": s.lookahead,
-                    "time_limit_s": UNLIMITED_STAGE_S
-                    if body.no_time_limit
-                    else s.time_limit_s,
+                    "time_limit_s": stage_limit(s, body),
                 }
                 for s in assignment.stages
             ]
@@ -310,16 +318,17 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(
                 422, "the reported duration is longer than the job has existed"
             )
-        limits = [s["time_limit_s"] for s in job.stages]
-        if (
-            body.verdict == VERDICT_TIMED_OUT
-            and body.duration_s < TIMEOUT_MIN_FRACTION * limits[body.stage_index]
+        limits = [s["time_limit_s"] for s in job.stages[: body.stage_index + 1]]
+        unlimited = NO_LIMIT in limits
+        if body.verdict == VERDICT_TIMED_OUT and (
+            limits[-1] == NO_LIMIT
+            or body.duration_s < TIMEOUT_MIN_FRACTION * limits[-1]
         ):
             raise HTTPException(422, "a timeout must last the stage's time limit")
         if (
             body.verdict == VERDICT_IMPOSSIBLE
-            and body.duration_s
-            > sum(limits[: body.stage_index + 1]) + IMPOSSIBLE_SLACK_S
+            and not unlimited
+            and body.duration_s > sum(limits) + IMPOSSIBLE_SLACK_S
         ):
             raise HTTPException(422, "the reported duration exceeds the stage limits")
         if body.verdict == VERDICT_POSSIBLE:

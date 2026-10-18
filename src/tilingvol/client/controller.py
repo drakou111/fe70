@@ -212,9 +212,11 @@ class SolverRunner:
             if verdict.kill:
                 self._kill_locked("memory: " + verdict.reason)
                 return
+            stage = self.job.stages[self.stage_index] if self.stage_index >= 0 else None
             if (
-                self.stage_index >= 0
-                and self.stage_time() >= self.job.stages[self.stage_index].time_limit_s
+                stage is not None
+                and not stage.unlimited
+                and self.stage_time() >= stage.time_limit_s
             ):
                 self._kill_locked("timeout")
 
@@ -475,7 +477,7 @@ class Controller:
                 stage = self._job.stages[message[1]]
                 self._log(
                     f"Stage {message[1] + 1}/{len(self._job.stages)}: {stage.describe()} "
-                    f"(limit {format_duration(stage.time_limit_s)})."
+                    f"(limit: {stage.describe_limit()})."
                 )
             elif kind == MSG_FRAME_FEASIBLE:
                 stage = self._job.stages[message[1]]

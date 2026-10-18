@@ -236,4 +236,20 @@ def test_no_time_limit_and_tree_progress_settings(live_server, controller):
         stages = live_server.db._conn.execute(
             "SELECT stages FROM jobs ORDER BY created LIMIT 1"
         ).fetchone()[0]
-    assert '"time_limit_s": 604800.0' in stages
+    assert '"time_limit_s": 0.0' in stages  # no limit at all
+
+
+def test_unlimited_stage_is_never_cut_off_by_the_clock():
+    job = Job(
+        "0" * 32, "1" * 32, "sib", 35, 35, (Stage(0, False, 0.0),), 1, 0, "test", 60.0
+    )
+    runner = SolverRunner(job, cap_mb=4000)
+    runner.start()
+    with runner.lock:
+        runner.stage_index = 0
+        runner.stage_started_at = (
+            runner.clock.elapsed() - 10**7
+        )  # pretend months have passed
+    runner.guard()
+    assert runner.kill_reason == ""
+    runner.kill()

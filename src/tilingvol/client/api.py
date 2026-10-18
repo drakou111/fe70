@@ -45,7 +45,7 @@ def validate_job(job: Job, max_threads: int) -> Job:
     for stage in job.stages:
         if not (
             0 <= stage.border <= min(job.width, job.height) // 2
-            and 1 <= stage.time_limit_s <= MAX_STAGE_SECONDS
+            and (stage.unlimited or 1 <= stage.time_limit_s <= MAX_STAGE_SECONDS)
         ):
             problems.append("bad stage")
     if not (TOKEN_PATTERN.fullmatch(job.job_id) and TOKEN_PATTERN.fullmatch(job.nonce)):

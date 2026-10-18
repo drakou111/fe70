@@ -541,7 +541,7 @@ class App:
                 )
                 time_text = (
                     f"{format_duration(status.stage_active_s)} / "
-                    f"{format_duration(stage.time_limit_s)}"
+                    f"{stage.describe_limit()}"
                 )
             else:
                 stage_text, time_text = status.state.value, "-"
