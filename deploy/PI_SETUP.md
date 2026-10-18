@@ -78,7 +78,7 @@ The code and venv stay owned by root, so the service cannot modify its own code.
 ## 4. Configuration
 
 ```sh
-sudo cp deploy/tilingvol.env.example /etc/tilingvol/tilingvol.env
+sudo cp /opt/tilingvol/app/deploy/tilingvol.env.example /etc/tilingvol/tilingvol.env
 python3 -c "import secrets; print(secrets.token_hex(32))"   # paste as TILINGVOL_SUBMIT_KEY
 sudo nano /etc/tilingvol/tilingvol.env
 sudo chown root:tilingvol /etc/tilingvol/tilingvol.env && sudo chmod 640 /etc/tilingvol/tilingvol.env
@@ -96,7 +96,7 @@ sudo -u tilingvol env TILINGVOL_ENV_FILE=/etc/tilingvol/tilingvol.env TILINGVOL_
 ## 5. Run the service
 
 ```sh
-sudo cp deploy/tilingvol.service /etc/systemd/system/
+sudo cp /opt/tilingvol/app/deploy/tilingvol.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now tilingvol
 systemctl status tilingvol
 curl -s http://127.0.0.1:8000/ | head -5
@@ -117,7 +117,7 @@ cloudflared tunnel create tilingvol            # prints the tunnel ID
 cloudflared tunnel route dns tilingvol tiling.<your-domain>
 sudo mkdir -p /etc/cloudflared
 sudo cp ~/.cloudflared/<tunnel-id>.json /etc/cloudflared/
-sudo cp deploy/cloudflared-config.yml /etc/cloudflared/config.yml   # fill in the ID and domain
+sudo cp /opt/tilingvol/app/deploy/cloudflared-config.yml /etc/cloudflared/config.yml   # fill in the ID and domain
 sudo cloudflared service install
 ```
 
