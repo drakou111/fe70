@@ -15,7 +15,7 @@ from tilingvol.shared.protocol import (
 )
 
 SWEEP_NAME = "Drakou111"
-EXTERNAL_NAME = "collaborator"
+EXTERNAL_NAME = "mathmasterzach"
 LINE = re.compile(r"^(\d+)x(\d+) (SAT|UNSAT|UNKNOWN) (\d+)s ?(.*)$")
 VERDICT = {
     "SAT": VERDICT_POSSIBLE,
