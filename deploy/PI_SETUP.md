@@ -138,7 +138,8 @@ TILINGVOL_SERVER_URL=https://fe70.org
 ```
 
 The release-signing key was created once with `uv run python scripts/make_release_key.py`. It is at
-`%USERPROFILE%\.tiling-volunteer-releaseelease_signing_key.pem`. Keep a backup somewhere safe and never
+`C:/Users/<you>/.tiling-volunteer-release/release_signing_key.pem`. Keep a backup somewhere safe and never
+elease_signing_key.pem`. Keep a backup somewhere safe and never
 copy it to the Pi: without it, installed apps cannot be updated; anyone who has it can push updates.
 
 For every release:
