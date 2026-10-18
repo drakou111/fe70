@@ -122,6 +122,8 @@ class App:
         self.parallel_var = tk.StringVar(value=str(settings.parallel))
         self.url_var = tk.StringVar(value=settings.server_url)
         self.token_var = tk.StringVar(value=settings.access_token)
+        self.no_limit_var = tk.BooleanVar(value=settings.no_time_limit)
+        self.tree_var = tk.BooleanVar(value=settings.tree_progress)
         self.width_var = tk.StringVar()
         self.height_var = tk.StringVar()
         total_gb = installed_ram_mb() / 1024
@@ -187,6 +189,18 @@ class App:
             self.advanced, textvariable=self.token_var, width=40, show="*"
         )
         self.token_entry.grid(row=2, column=1, columnspan=3, sticky="we", pady=2)
+        self.no_limit_check = ttk.Checkbutton(
+            self.advanced,
+            text="No time limit: search each size until it is decided (can take days)",
+            variable=self.no_limit_var,
+        )
+        self.no_limit_check.grid(row=3, column=0, columnspan=4, sticky="w", pady=2)
+        self.tree_check = ttk.Checkbutton(
+            self.advanced,
+            text="Show tree progress (closed X/Y): half the threads use CP-SAT's tree search instead",
+            variable=self.tree_var,
+        )
+        self.tree_check.grid(row=4, column=0, columnspan=4, sticky="w", pady=2)
         ttk.Label(self.advanced, text="Request a size (optional)").grid(
             row=1, column=0, sticky="w", pady=2
         )
@@ -301,6 +315,8 @@ class App:
                 server_url=self.url_var.get(),
                 parallel=int(self.parallel_var.get()),
                 access_token=self.token_var.get(),
+                no_time_limit=self.no_limit_var.get(),
+                tree_progress=self.tree_var.get(),
             ).validated()
             requested = self._requested_size()
         except ValueError as error:
@@ -575,6 +591,8 @@ class App:
             self.parallel_entry,
             self.url_entry,
             self.token_entry,
+            self.no_limit_check,
+            self.tree_check,
             self.width_entry,
             self.height_entry,
         ):

@@ -37,6 +37,7 @@ log = logging.getLogger("tilingvol.server")
 
 MAX_BODY_BYTES = 4 << 20
 PICTURE_CACHE_SIZE = 64
+UNLIMITED_STAGE_S = 7 * 24 * 3600.0  # the longest stage the app accepts
 TOKEN_HEADER = "x-access-token"
 DURATION_SLACK_S = 120.0
 IMPOSSIBLE_SLACK_S = 600.0
@@ -54,6 +55,7 @@ class JobRequest(BaseModel):
     client_version: str = Field(max_length=20)
     width: int | None = Field(default=None, ge=1, le=10_000)
     height: int | None = Field(default=None, ge=1, le=10_000)
+    no_time_limit: bool = False  # the volunteer searches each stage until it is decided
 
 
 class Heartbeat(BaseModel):
@@ -190,7 +192,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 {
                     "border": s.border,
                     "lookahead": s.lookahead,
-                    "time_limit_s": s.time_limit_s,
+                    "time_limit_s": UNLIMITED_STAGE_S
+                    if body.no_time_limit
+                    else s.time_limit_s,
                 }
                 for s in assignment.stages
             ]

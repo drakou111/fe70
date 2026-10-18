@@ -135,3 +135,9 @@ def test_tree_progress_lines_are_parsed_and_throttled():
     )  # within 5 s: dropped
     progress.on_line("#Bound  23.00s best:inf next:[0,0]")
     assert sent == [(MSG_PROGRESS, 1, 1, 3)]
+
+
+def test_tree_workers_need_enough_threads():
+    from tilingvol.client.controller import tree_workers_for
+
+    assert [tree_workers_for(t) for t in (1, 2, 3, 4, 8, 10)] == [0, 0, 0, 2, 4, 5]

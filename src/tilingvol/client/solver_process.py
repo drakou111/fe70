@@ -31,6 +31,9 @@ class SolverTask:
     threads: int
     memory_limit_mb: int
     parent_pid: int
+    tree_workers: int = (
+        0  # > 0: force CP-SAT's shared-tree search, which reports "closed X/Y" progress
+    )
 
 
 def _exit_when_parent_dies(parent_pid: int) -> None:
@@ -86,6 +89,8 @@ def _run_stages(task: SolverTask, queue) -> None:
         solver = cp_model.CpSolver()
         solver.parameters.num_workers = task.threads
         solver.parameters.max_memory_in_mb = task.memory_limit_mb
+        if task.tree_workers:
+            solver.parameters.shared_tree_num_workers = task.tree_workers
         solver.parameters.log_search_progress = True
         solver.parameters.log_to_stdout = False
         solver.log_callback = TreeProgress(index, queue).on_line

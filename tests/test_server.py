@@ -363,3 +363,16 @@ def test_border_pictures_are_checked_before_display(client, submit_key):
 def cells_of(placement):
     orientation, x0, y0 = placement
     return [(x0 + dx, y0 + dy) for dx, dy in SIBLING.orientations[orientation]]
+
+
+def test_no_time_limit_jobs(client):
+    body = {
+        "name": NAME,
+        "max_ram_mb": 8192,
+        "max_threads": 4,
+        "client_version": "0.6.0",
+        "no_time_limit": True,
+    }
+    job = client.post("/api/jobs/request", json=body).json()
+    assert all(s["time_limit_s"] == 7 * 24 * 3600 for s in job["stages"])
+    assert all(s["time_limit_s"] < 7 * 24 * 3600 for s in request_job(client)["stages"])

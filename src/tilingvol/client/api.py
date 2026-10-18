@@ -73,6 +73,7 @@ class ApiClient:
         max_threads: int,
         width: int | None = None,
         height: int | None = None,
+        no_time_limit: bool = False,
     ) -> Job:
         body = {
             "name": name,
@@ -81,6 +82,7 @@ class ApiClient:
             "client_version": __version__,
             "width": width,
             "height": height,
+            "no_time_limit": no_time_limit,
         }
         try:
             data = self._post("/api/jobs/request", body)

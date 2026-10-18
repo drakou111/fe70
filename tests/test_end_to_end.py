@@ -219,3 +219,21 @@ def test_border_pictures_reach_the_window_and_the_site(live_server, controller):
         "Latest pictures"
         in urllib.request.urlopen(live_server.url + "/").read().decode()
     )
+
+
+def test_no_time_limit_and_tree_progress_settings(live_server, controller):
+    from dataclasses import replace as dc_replace
+
+    c, _ = controller
+    c.start(
+        dc_replace(
+            settings(live_server.url, threads=4), no_time_limit=True, tree_progress=True
+        )
+    )
+    wait_for(lambda: results(live_server), 60)
+    c.stop()
+    with live_server.db._lock:
+        stages = live_server.db._conn.execute(
+            "SELECT stages FROM jobs ORDER BY created LIMIT 1"
+        ).fetchone()[0]
+    assert '"time_limit_s": 604800.0' in stages

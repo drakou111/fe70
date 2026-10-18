@@ -58,6 +58,7 @@ MAX_CRASHES = 3
 CRASH_AS_MEMORY_FRACTION = 0.8
 KILL_JOIN_S = 10.0
 LOG_FILE_BYTES = 1 << 20
+MIN_TREE_THREADS = 4
 
 log = logging.getLogger("tilingvol.client")
 
@@ -123,6 +124,7 @@ class SolverRunner:
 
     job: Job
     cap_mb: int
+    tree_progress: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
     clock: ActiveClock = field(default_factory=ActiveClock)
     stage_index: int = -1
@@ -151,6 +153,7 @@ class SolverRunner:
             self.job.threads,
             memory_guard.solver_soft_limit_mb(self.cap_mb),
             os.getpid(),
+            tree_workers_for(self.job.threads) if self.tree_progress else 0,
         )
         self._process = context.Process(
             target=run_task, args=(task, self._queue), daemon=True
@@ -403,7 +406,12 @@ class Controller:
         width, height = self._requested or (None, None)
         try:
             self._job = self._api.request_job(
-                settings.name, settings.max_ram_mb, settings.max_threads, width, height
+                settings.name,
+                settings.max_ram_mb,
+                settings.max_threads,
+                width,
+                height,
+                settings.no_time_limit,
             )
         except NoJobAvailable as error:
             self._log(
@@ -440,7 +448,7 @@ class Controller:
             )
             self._state = State.STOPPED
             return
-        runner = SolverRunner(self._job, cap)
+        runner = SolverRunner(self._job, cap, self._settings.tree_progress)
         runner.start()
         with self._runner_lock:
             self._runner = runner
@@ -708,6 +716,11 @@ class Controller:
                 ),
             )
         )
+
+
+def tree_workers_for(threads: int) -> int:
+    """Half the workers do tree search when progress is wanted; CP-SAT needs at least two of them."""
+    return threads // 2 if threads >= MIN_TREE_THREADS else 0
 
 
 def format_duration(seconds: float) -> str:

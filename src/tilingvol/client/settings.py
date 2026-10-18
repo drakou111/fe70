@@ -67,6 +67,10 @@ class Settings:
     parallel: int = 1
     # only for servers that require one
     access_token: str = ""
+    # search every stage until it is decided instead of the server's time limit
+    no_time_limit: bool = False
+    # let half the threads do CP-SAT's tree search, which reports progress (may change the speed)
+    tree_progress: bool = False
 
     @staticmethod
     def defaults() -> "Settings":
