@@ -1,13 +1,15 @@
-"""The public page: size map, leaderboard, recent results. Every user-supplied string is HTML-escaped."""
+"""The public page: headline numbers, download, size map, running jobs, leaderboard, recent results.
+Every user-supplied string is HTML-escaped."""
 
 import json
 import math
 import time
+from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 
 from tilingvol.server.config import ServerConfig
-from tilingvol.server.db import Database
+from tilingvol.server.db import Database, ResultRow
 from tilingvol.server.scheduler import Scheduler
 from tilingvol.shared.protocol import (
     VERDICT_IMPOSSIBLE,
@@ -15,38 +17,97 @@ from tilingvol.shared.protocol import (
     VERDICT_TIMED_OUT,
 )
 
-CELL = 6
-MARGIN = 32
-MAP_BELOW_MIN = 10
-FAST_S, SLOW_S = 300.0, 10800.0
-LIGHT, DARK = (178, 242, 187), (8, 82, 28)
-RECENT = 20
 MANIFEST_NAME = "latest.json"
 MAX_MANIFEST_BYTES = 64 * 1024
-
-CATEGORIES = {
-    "coloring": ("#d4d4d4", "Impossible by coloring"),
-    "exact": ("#3d6fd1", "Impossible: exact strip results"),
-    "impossible": ("#2f9e44", "Impossible: complete search (shade = time)"),
-    "possible": ("#ffd43b", "TILEABLE: a tiling was found"),
-    "timed_out": ("#f08c00", "Undecided: search timed out"),
-    "flagged": ("#e03131", "Waiting for a second check"),
-    "running": ("#9775fa", "Running now"),
-    "todo": ("#ffffff", "Not searched yet"),
-}
+RECENT = 15
+PITCH = 8  # map grid pitch in px; tiles are slightly smaller so they read as separate squares
+TILE = 6.5
+MAP_LEFT, MAP_TOP, MAP_BOTTOM = 36, 8, 28
+TICK_STEP = 20
+FAST_S, SLOW_S = 300.0, 10800.0
+GREEN_FAST, GREEN_SLOW = (140, 233, 154), (43, 138, 62)
+PLATFORM_NAMES = {"windows": "Windows", "linux": "Linux", "macos": "macOS"}
 
 STYLE = """
-:root { --bg: #fafaf7; --fg: #1d2420; --muted: #5f6b66; --line: #d9ddd9; }
-@media (prefers-color-scheme: dark) { :root { --bg: #161a18; --fg: #e8ece9; --muted: #9aa5a0; --line: #2f3633; } }
-body { background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; margin: 0 auto;
-       max-width: 900px; padding: 16px; }
-h1 { font-size: 1.5rem; margin-bottom: 0; } h2 { font-size: 1.15rem; margin-top: 2rem; }
-p.lead { color: var(--muted); margin-top: .25rem; }
-table { border-collapse: collapse; width: 100%; } td, th { padding: 4px 8px; border-bottom: 1px solid var(--line);
-       text-align: left; } td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-.wrap { overflow-x: auto; } .found { background: #ffd43b; color: #1d2420; padding: 8px 12px; border-radius: 6px; }
-.chip { display: inline-block; width: 12px; height: 12px; border: 1px solid #889; vertical-align: middle; }
+:root {
+  --bg: #f6f7f5; --card: #ffffff; --fg: #1b1f1d; --muted: #66706b; --line: #e3e6e3;
+  --todo: #e4e7e4; --timed: #f59f00; --run: #4263eb; --found: #fab005; --flag: #e8590c; --accent: #2b8a3e;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #121514; --card: #1b1f1d; --fg: #e9ecea; --muted: #98a29d; --line: #2c322f; --todo: #2e3431; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+       font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 960px; margin: 0 auto; padding: 32px 16px 48px; }
+header { display: flex; gap: 20px; align-items: center; margin-bottom: 24px; }
+header svg { flex: none; }
+h1 { font-size: 1.6rem; line-height: 1.2; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 1.05rem; margin: 0 0 12px; }
+.lead { color: var(--muted); margin: 0; max-width: 60ch; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+.stat b { display: block; font-size: 1.5rem; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.stat span { color: var(--muted); font-size: 0.85rem; }
+.join { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; justify-content: space-between; }
+.join p { margin: 0; color: var(--muted); }
+.btn { display: inline-block; background: var(--accent); color: #fff; text-decoration: none; font-weight: 600;
+       padding: 10px 18px; border-radius: 8px; }
+.btn + .btn { margin-left: 8px; }
+.found { background: var(--found); color: #1b1f1d; font-weight: 600; }
+.found a { color: inherit; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 14px; padding: 0; list-style: none;
+          color: var(--muted); font-size: 0.88rem; }
+.legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px;
+            vertical-align: -1px; }
+.legend b { color: var(--fg); font-weight: 600; margin-left: 4px; font-variant-numeric: tabular-nums; }
+.map { position: relative; }
+.map svg { display: block; width: 100%; height: auto; }
+.map text { fill: var(--muted); font: 10px system-ui, sans-serif; }
+.map .grid { stroke: var(--line); stroke-width: 1; }
+.map rect[data-t] { cursor: pointer; }
+.map rect[data-t]:hover { stroke: var(--fg); stroke-width: 1.2; }
+.tip { position: absolute; pointer-events: none; background: var(--fg); color: var(--bg); font-size: 0.82rem;
+       padding: 5px 9px; border-radius: 6px; white-space: nowrap; }
+.note { color: var(--muted); font-size: 0.85rem; margin: 12px 0 0; }
+table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+th { text-align: left; color: var(--muted); font-weight: 500; font-size: 0.82rem; padding: 0 8px 8px; }
+td { padding: 7px 8px; border-top: 1px solid var(--line); }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.scroll { overflow-x: auto; }
+.empty { color: var(--muted); margin: 0; }
+.pill { display: inline-block; font-size: 0.78rem; padding: 1px 8px; border-radius: 99px; background: var(--todo); }
+.pill.impossible { background: rgba(43, 138, 62, 0.15); color: var(--accent); }
+.pill.timed_out { background: rgba(245, 159, 0, 0.18); color: #b35c00; }
+.pill.possible { background: var(--found); color: #1b1f1d; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 720px) { .two { grid-template-columns: 1fr; } header { flex-direction: column; align-items: flex-start; } }
+footer { color: var(--muted); font-size: 0.82rem; margin-top: 24px; }
 """
+
+TOOLTIP_JS = """
+const map = document.querySelector('.map'), tip = document.querySelector('.tip');
+function show(e) {
+  const text = e.target.dataset ? e.target.dataset.t : null;
+  if (!text) { tip.hidden = true; return; }
+  tip.textContent = text; tip.hidden = false;
+  const box = map.getBoundingClientRect();
+  let x = e.clientX - box.left + 14, y = e.clientY - box.top + 14;
+  if (x + tip.offsetWidth > box.width) x = e.clientX - box.left - tip.offsetWidth - 10;
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+}
+map.addEventListener('mousemove', show);
+map.addEventListener('click', show);
+map.addEventListener('mouseleave', () => { tip.hidden = true; });
+"""
+
+
+@dataclass(frozen=True)
+class Tile:
+    status: str  # impossible, possible, timed_out, flagged, running, todo
+    fill: str
+    text: str
 
 
 def load_manifest(folder: Path | None) -> dict | None:
@@ -71,171 +132,287 @@ def load_manifest(folder: Path | None) -> dict | None:
 
 
 def time_shade(seconds: float) -> str:
+    """Light green for quick proofs, deep green for long ones (log scale); readable on light and dark."""
     t = (math.log(max(seconds, FAST_S)) - math.log(FAST_S)) / (
         math.log(SLOW_S) - math.log(FAST_S)
     )
     t = min(1.0, max(0.0, t))
-    r, g, b = (round(lo + (hi - lo) * t) for lo, hi in zip(LIGHT, DARK))
+    r, g, b = (round(lo + (hi - lo) * t) for lo, hi in zip(GREEN_FAST, GREEN_SLOW))
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def hours(seconds: float) -> str:
-    return f"{seconds / 3600:.1f}"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def ago(timestamp: float) -> str:
+    minutes = max(0, int((time.time() - timestamp) / 60))
+    if minutes < 60:
+        return f"{minutes} min ago"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} h ago"
+    return f"{minutes // 1440} days ago"
+
+
+def piece_svg(cells, size: int = 14) -> str:
+    width = (max(x for x, _ in cells) + 1) * size
+    height = (max(y for _, y in cells) + 1) * size
+    squares = "".join(
+        f'<rect x="{x * size}" y="{height - (y + 1) * size}" width="{size - 2}" height="{size - 2}" rx="2" '
+        f'fill="var(--accent)"/>'
+        for x, y in cells
+    )
+    return (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" '
+        f'aria-label="the fe70 piece">{squares}</svg>'
+    )
+
+
+def map_note(piece) -> str:
+    dead = ", ".join(str(v) for v in sorted(piece.dead_sides))
+    exact = f"Sizes with a side below {piece.min_side}" + (
+        f" or equal to {dead}" if dead else ""
+    )
+    coloring = (
+        "the coloring conditions (20 divides W x H, and an odd side needs 8 to divide the other)"
+        if piece.gun_coloring
+        else f"the area condition ({piece.area} divides W x H)"
+    )
+    return (
+        f"Height H goes up, width W across; only W &le; H is shown, and darker green means a longer search. "
+        f"{exact} are ruled out by exact strip computations; sizes failing {coloring} cannot be tiled and are "
+        f"not drawn."
+    )
+
+
+def deciding_rows(results: list[ResultRow]) -> dict[tuple[int, int], ResultRow]:
+    """For each size, the result that settles it (a tiling beats a proof beats a timeout)."""
+    rank = {VERDICT_POSSIBLE: 3, VERDICT_IMPOSSIBLE: 2, VERDICT_TIMED_OUT: 1}
+    best: dict[tuple[int, int], ResultRow] = {}
+    for r in results:
+        if r.flagged:
+            continue
+        key = (min(r.width, r.height), max(r.width, r.height))
+        if key not in best or rank.get(r.verdict, 0) > rank.get(best[key].verdict, 0):
+            best[key] = r
+    return best
 
 
 def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
     piece = config.piece
     results = db.results()
     summaries = scheduler.summaries(results)
-    running = {
-        (min(j.width, j.height), max(j.width, j.height)) for j in db.active_jobs()
-    }
+    decisive = deciding_rows(results)
+    active = db.active_jobs()
+    running = {(min(j.width, j.height), max(j.width, j.height)): j for j in active}
+    sizes = [k for k in scheduler.sizes if k[1] <= piece.max_side]
 
-    def category(w: int, h: int) -> tuple[str, str, str]:
-        key = (min(w, h), max(w, h))
-        if not piece.admissible(*key):
-            return (
-                "coloring",
-                CATEGORIES["coloring"][0],
-                "fails the coloring conditions",
-            )
-        if piece.exact_dead(*key):
-            return (
-                "exact",
-                CATEGORIES["exact"][0],
-                "excluded by the exact strip results",
-            )
-        s = summaries.get(key)
+    def tile(key: tuple[int, int]) -> Tile:
+        w, h = key
+        s, row = summaries.get(key), decisive.get(key)
+        who = f", {row.name}" if row else ""
         if s is not None and s.verdict == VERDICT_POSSIBLE:
-            return "possible", CATEGORIES["possible"][0], "A TILING EXISTS"
+            return Tile("possible", "var(--found)", f"{w} x {h}: A TILING EXISTS{who}")
         if s is not None and s.verdict == VERDICT_IMPOSSIBLE:
-            return (
+            return Tile(
                 "impossible",
                 time_shade(s.duration_s),
-                f"impossible, {hours(s.duration_s)} h of search",
+                f"{w} x {h}: impossible, {hours(s.duration_s)}{who}",
             )
         if key in running:
-            return "running", CATEGORIES["running"][0], "running now"
+            return Tile(
+                "running", "var(--run)", f"{w} x {h}: running now ({running[key].name})"
+            )
         if s is not None and s.flagged:
-            return "flagged", CATEGORIES["flagged"][0], "waiting for a second check"
+            return Tile(
+                "flagged", "var(--flag)", f"{w} x {h}: waiting for a second check"
+            )
         if s is not None and s.timed_out:
-            return (
+            return Tile(
                 "timed_out",
-                CATEGORIES["timed_out"][0],
-                f"timed out after {hours(s.duration_s)} h",
+                "var(--timed)",
+                f"{w} x {h}: timed out after {hours(s.duration_s)}{who}",
             )
-        return "todo", CATEGORIES["todo"][0], "not searched yet"
+        return Tile("todo", "var(--todo)", f"{w} x {h}: not searched yet")
 
-    low, high = piece.min_side - MAP_BELOW_MIN, piece.max_side
-    n = high - low + 1
-    size = MARGIN + n * CELL + 4
-    counts = {k: 0 for k in CATEGORIES}
-    svg_open = (
-        f'<svg viewBox="0 0 {size} {size}" width="{size}" height="{size}" role="img" '
-        f'aria-label="Status of every rectangle size" style="background:#fff;font:9px sans-serif">'
+    tiles = {key: tile(key) for key in sizes}
+    counts: dict[str, int] = {}
+    for t in tiles.values():
+        counts[t.status] = counts.get(t.status, 0) + 1
+
+    # map: W across, H up, only sizes that are still candidates (W <= H, passing the coloring test)
+    low, high = piece.min_side, piece.max_side
+    span = high - low + 1
+    width = MAP_LEFT + span * PITCH + 4
+    height = MAP_TOP + span * PITCH + MAP_BOTTOM
+
+    def px(w: int) -> float:
+        return MAP_LEFT + (w - low) * PITCH
+
+    def py(h: int) -> float:
+        return MAP_TOP + (high - h) * PITCH
+
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Status of every candidate rectangle size">'
+    ]
+    first_tick = math.ceil(low / TICK_STEP) * TICK_STEP
+    for v in range(first_tick, high + 1, TICK_STEP):
+        x, y = px(v) + TILE / 2, py(v) + TILE / 2
+        parts.append(
+            f'<line class="grid" x1="{x}" y1="{MAP_TOP}" x2="{x}" y2="{py(low) + TILE}"/>'
+        )
+        parts.append(
+            f'<line class="grid" x1="{MAP_LEFT}" y1="{y}" x2="{px(high) + TILE}" y2="{y}"/>'
+        )
+        parts.append(
+            f'<text x="{x}" y="{height - MAP_BOTTOM + 16}" text-anchor="middle">{v}</text>'
+        )
+        parts.append(
+            f'<text x="{MAP_LEFT - 6}" y="{y + 3.5}" text-anchor="end">{v}</text>'
+        )
+    parts.append(
+        f'<text x="{MAP_LEFT + span * PITCH / 2}" y="{height - 2}" text-anchor="middle">width W</text>'
     )
-    svg = [svg_open]
-    for i, h in enumerate(range(low, high + 1)):
-        for j, w in enumerate(range(low, high + 1)):
-            cat, fill, why = category(w, h)
-            if w <= h:
-                counts[cat] += 1
-            x, y = MARGIN + j * CELL, MARGIN + (n - 1 - i) * CELL
-            stroke = "#666" if cat == "todo" else "#fff"
-            svg.append(
-                f'<rect x="{x}" y="{y}" width="{CELL - 1}" height="{CELL - 1}" fill="{fill}" '
-                f'stroke="{stroke}" stroke-width="0.4"><title>{w} x {h}: {why}</title></rect>'
-            )
-    for v in range(low, high + 1, 10):
-        k = v - low
-        svg.append(
-            f'<text x="{MARGIN + k * CELL + CELL / 2}" y="{MARGIN - 4}" text-anchor="middle">{v}</text>'
+    for (w, h), t in tiles.items():
+        parts.append(
+            f'<rect x="{px(w)}" y="{py(h)}" width="{TILE}" height="{TILE}" rx="1.6" fill="{t.fill}" '
+            f'data-t="{escape(t.text)}"/>'
         )
-        svg.append(
-            f'<text x="{MARGIN - 4}" y="{MARGIN + (n - 1 - k) * CELL + CELL - 1}" text-anchor="end">{v}</text>'
-        )
-    svg.append("</svg>")
+    parts.append("</svg>")
+
+    legend_items = [
+        ("impossible", "var(--accent)", "Impossible"),
+        ("timed_out", "var(--timed)", "Timed out"),
+        ("running", "var(--run)", "Running now"),
+        ("todo", "var(--todo)", "Not searched yet"),
+        ("flagged", "var(--flag)", "Being re-checked"),
+        ("possible", "var(--found)", "TILED"),
+    ]
     legend = "".join(
-        f'<tr><td><span class="chip" style="background:{c}"></span></td><td>{label}</td>'
-        f'<td class="num">{counts[k]}</td></tr>'
-        for k, (c, label) in CATEGORIES.items()
+        f'<li><i style="background:{color}"></i>{label}<b>{counts.get(status, 0):,}</b></li>'
+        for status, color, label in legend_items
+        if counts.get(status)
+        or status in ("impossible", "timed_out", "running", "todo")
     )
 
-    undecided = sorted(
+    open_sizes = sorted(
         (w * h, w, h)
         for w, h in scheduler.sizes
         if not (summaries.get((w, h)) and summaries[(w, h)].decided)
     )
-    bound_html = ""
-    if undecided:
-        area, w, h = undecided[0]
-        cap = piece.min_side * (piece.max_side + 1)
-        bound = min(area, cap)
-        bound_html = (
-            f"<p>Every rectangle with area below <b>{bound:,}</b> is ruled out. The smallest open size is "
-            f"{w} x {h}.</p>"
+    bound_value, bound_note = "-", "every size is decided"
+    if open_sizes:
+        area, w, h = open_sizes[0]
+        bound_value = f"{min(area, piece.min_side * (piece.max_side + 1)):,}"
+        bound_note = f"smallest open size: {w} x {h}"
+
+    volunteer_names = {r.name for r in results if r.source == "volunteer"} | {
+        j.name for j in active
+    }
+    volunteer_hours = (
+        sum(r.duration_s for r in results if r.source == "volunteer") / 3600
+    )
+    stats = [
+        (bound_value, "Area bound", bound_note),
+        (f"{counts.get('impossible', 0):,}", "Sizes ruled out", "by complete search"),
+        (f"{len(active)}", "Running now", f"{len(volunteer_names)} volunteers"),
+        (f"{volunteer_hours:,.0f}", "Volunteer hours", "of search so far"),
+    ]
+    stats_html = "".join(
+        f'<div class="stat"><span>{label}</span><b>{value}</b><span>{note}</span></div>'
+        for value, label, note in stats
+    )
+
+    found = sorted(k for k, t in tiles.items() if t.status == "possible")
+    found_html = "".join(
+        f'<div class="card found">A tiling of {w} x {h} has been found! '
+        f'<a href="/api/solution/{w}x{h}">Download it</a>.</div>'
+        for w, h in found
+    )
+
+    join_html = ""
+    manifest = load_manifest(config.download_dir)
+    if manifest is not None:
+        buttons = "".join(
+            f'<a class="btn" href="/download/{escape(entry["filename"])}">Download for '
+            f"{PLATFORM_NAMES.get(key, escape(key))}</a>"
+            for key, entry in sorted(manifest["platforms"].items())
+        )
+        join_html = (
+            f'<div class="card join"><div><h2>Join the search</h2><p>Download version '
+            f"{escape(manifest['version'])}, enter a name and press Start. It uses only the RAM and "
+            f"CPU you allow, and can be paused any time.</p></div><div>{buttons}</div></div>"
         )
 
-    found = [(w, h) for (w, h), s in summaries.items() if s.verdict == VERDICT_POSSIBLE]
-    found_html = "".join(
-        f'<p class="found">A tiling of {w} x {h} has been found! '
-        f'<a href="/api/solution/{w}x{h}">Download it</a>.</p>'
-        for w, h in sorted(found)
+    running_rows = "".join(
+        f"<tr><td>{j.width} x {j.height}</td><td>{escape(j.name)}</td><td>{escape(j.lane)}</td>"
+        f'<td class="num">{ago(j.created)}</td></tr>'
+        for j in sorted(active, key=lambda j: j.created)
+    )
+    running_html = (
+        f'<div class="scroll"><table><tr><th>Size</th><th>Volunteer</th><th>Order</th>'
+        f'<th class="num">Started</th></tr>{running_rows}</table></div>'
+        if active
+        else '<p class="empty">Nothing is running right now.</p>'
     )
 
     board: dict[str, list[float]] = {}
     for r in results:
         if r.flagged:
             continue
-        row = board.setdefault(r.name, [0, 0, 0, 0.0])
-        row[0] += r.verdict == VERDICT_IMPOSSIBLE
+        row = board.setdefault(r.name, [0, 0, 0.0])
+        row[0] += r.verdict in (VERDICT_IMPOSSIBLE, VERDICT_POSSIBLE)
         row[1] += r.verdict == VERDICT_TIMED_OUT
-        row[2] += r.verdict == VERDICT_POSSIBLE
-        row[3] += r.duration_s
-    leaders = sorted(
-        board.items(), key=lambda item: (-item[1][2], -item[1][0], -item[1][3])
-    )
+        row[2] += r.duration_s
+    leaders = sorted(board.items(), key=lambda item: (-item[1][0], -item[1][2]))
     leader_rows = "".join(
-        f'<tr><td>{escape(name)}</td><td class="num">{int(v[0])}</td><td class="num">{int(v[1])}'
-        f'</td><td class="num">{int(v[2])}</td><td class="num">{hours(v[3])}</td></tr>'
-        for name, v in leaders
+        f'<tr><td class="num">{rank}</td><td>{escape(name)}</td><td class="num">{int(v[0]):,}</td>'
+        f'<td class="num">{int(v[1])}</td><td class="num">{v[2] / 3600:,.0f}</td></tr>'
+        for rank, (name, v) in enumerate(leaders, 1)
+    )
+    leader_html = (
+        f'<div class="scroll"><table><tr><th class="num">#</th><th>Name</th><th class="num">Settled</th>'
+        f'<th class="num">Timed out</th><th class="num">Hours</th></tr>{leader_rows}</table></div>'
+        if leaders
+        else '<p class="empty">No results yet.</p>'
     )
 
     recent = [r for r in results if r.source == "volunteer"][-RECENT:][::-1]
     recent_rows = "".join(
-        f"<tr><td>{r.width} x {r.height}</td><td>{escape(r.verdict.replace('_', ' '))}"
-        f'{" (flagged)" if r.flagged else ""}</td><td>{escape(r.stage_tag)}</td><td class="num">{hours(r.duration_s)}'
-        f"</td><td>{escape(r.name)}</td><td>{time.strftime('%Y-%m-%d %H:%M', time.gmtime(r.submitted))} UTC</td></tr>"
+        f'<tr><td>{r.width} x {r.height}</td><td><span class="pill {escape(r.verdict)}">'
+        f"{escape(r.verdict.replace('_', ' '))}{' (flagged)' if r.flagged else ''}</span></td>"
+        f'<td>{escape(r.name)}</td><td class="num">{hours(r.duration_s)}</td>'
+        f'<td class="num">{ago(r.submitted)}</td></tr>'
         for r in recent
     )
-
-    download_html = ""
-    manifest = load_manifest(config.download_dir)
-    if manifest is not None:
-        names = {"windows": "Windows", "linux": "Linux", "macos": "macOS"}
-        links = ", ".join(
-            f'<a href="/download/{escape(entry["filename"])}">{names.get(key, escape(key))}</a>'
-            for key, entry in sorted(manifest["platforms"].items())
-        )
-        download_html = (
-            f"<h2>Join the search</h2><p>Download version {escape(manifest['version'])} for {links}, "
-            f"enter a name and press Start.</p>"
-        )
+    recent_html = (
+        f'<div class="scroll"><table><tr><th>Size</th><th>Result</th><th>Volunteer</th>'
+        f'<th class="num">Search</th><th class="num">When</th></tr>{recent_rows}</table></div>'
+        if recent
+        else '<p class="empty">Volunteer results will appear here.</p>'
+    )
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gun Tiling Search</title><style>{STYLE}</style></head><body>
-<h1>Does the gun tile a rectangle?</h1>
-<p class="lead">A volunteer search for a rectangle tiled by the 10-cell polyomino B(1.2^3.1^3), the last open case
-of Dahlke's gun theorem. Each square below is one rectangle size.</p>
-{found_html}{bound_html}{download_html}
-<h2>Rectangle sizes</h2>
-<div class="wrap">{"".join(svg)}</div>
-<div class="wrap"><table><tr><th></th><th>Status</th><th class="num">Sizes (W &le; H)</th></tr>{legend}</table></div>
-<h2>Leaderboard</h2>
-<div class="wrap"><table><tr><th>Name</th><th class="num">Impossible</th><th class="num">Timed out</th>
-<th class="num">Tiled</th><th class="num">Hours</th></tr>{leader_rows}</table></div>
-<h2>Recent results</h2>
-<div class="wrap"><table><tr><th>Size</th><th>Result</th><th>Stage</th><th class="num">Hours</th><th>Name</th>
-<th>When</th></tr>{recent_rows}</table></div>
-</body></html>"""
+<title>fe70 Tiling Search</title><style>{STYLE}</style></head><body><main>
+<header>{piece_svg(piece.cells)}<div><h1>Does fe70 tile a rectangle?</h1>
+<p class="lead">fe70 is the 10-cell polyomino B(1.2^3.1^3) shown here, the last open case of Dahlke's gun
+theorem. This is a volunteer search for a rectangle it tiles; each square on the map is one rectangle size,
+checked by a complete computer search.</p>
+</div></header>
+{found_html}
+<div class="stats">{stats_html}</div>
+{join_html}
+<section class="card"><h2>Rectangle sizes</h2>
+<ul class="legend">{legend}</ul>
+<div class="map">{"".join(parts)}<div class="tip" hidden></div></div>
+<p class="note">{map_note(piece)}</p></section>
+<div class="two">
+<section class="card"><h2>Running now</h2>{running_html}</section>
+<section class="card"><h2>Leaderboard</h2>{leader_html}</section>
+</div>
+<section class="card"><h2>Recent results</h2>{recent_html}</section>
+<footer>Updated every 30 seconds. Raw data: <a href="/api/results">/api/results</a>.</footer>
+</main><script>{TOOLTIP_JS}</script></body></html>"""

@@ -72,7 +72,7 @@ class App:
 
     def _build(self, settings: Settings) -> None:
         root = self.root
-        root.title(f"Gun Tiling Search {__version__}")
+        root.title(f"fe70 Tiling Search {__version__}")
         root.minsize(560, 520)
         main = ttk.Frame(root, padding=12)
         main.pack(fill="both", expand=True)
@@ -386,7 +386,7 @@ def main() -> None:
         root.withdraw()
         from tkinter import messagebox
 
-        messagebox.showerror("Gun Tiling Search", str(error))
+        messagebox.showerror("fe70 Tiling Search", str(error))
         root.destroy()
         return
     if os.environ.get("TILINGVOL_AUTOSTART") == "1" and app.name_var.get().strip():
