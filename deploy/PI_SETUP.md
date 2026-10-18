@@ -45,7 +45,9 @@ ping -c1 -W2 <your-pc-address>     # should now fail
 curl -sI https://cloudflare.com | head -1   # should still work
 ```
 
-SSH from your PC to the Pi keeps working (it is an incoming connection).
+SSH and VNC from your PC to the Pi keep working (they are incoming connections from the home network),
+and so do RealVNC cloud connections (outgoing). VNC from the Pi to your PC is blocked on purpose.
+Never expose port 5900 to the internet or through the tunnel.
 
 ## 3. Service user and code
 
