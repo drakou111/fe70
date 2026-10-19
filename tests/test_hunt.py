@@ -97,11 +97,16 @@ def test_hunt_keeps_its_own_books(sib_config, submit_key):
         post_result(c, body)
         # no symmetric tiling: the hunt is done with the size, the main search is not
         ask(c, hunt=True, size=ASYMMETRIC_ONLY, expect=409)
-        main = ask(c, size=ASYMMETRIC_ONLY)
-        assert not any(s["symmetric"] for s in main["stages"])
         assert c.app.state.db.results("main") == []
         page = c.get("/").text
         assert "Symmetric hunt" in page and "Sizes with no symmetric tiling" in page
+        # on the map in its own colour, never as ruled out
+        assert (
+            "19 x 28: no symmetric tiling (an asymmetric one is still possible)" in page
+        )
+        assert "19 x 28: impossible" not in page
+        main = ask(c, size=ASYMMETRIC_ONLY)
+        assert not any(s["symmetric"] for s in main["stages"])
         release(c, main)
         # a size the main search settles is closed for the hunt too
         add_import(c.app, 18, 35, "full")

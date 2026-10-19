@@ -36,6 +36,7 @@ STYLE = """
 :root {
   --bg: #f6f7f5; --card: #ffffff; --fg: #1b1f1d; --muted: #66706b; --line: #e3e6e3;
   --todo: #e4e7e4; --timed: #f59f00; --run: #4263eb; --found: #fab005; --flag: #e8590c; --accent: #2b8a3e;
+  --sym: #b197fc;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #121514; --card: #1b1f1d; --fg: #e9ecea; --muted: #98a29d; --line: #2c322f; --todo: #2e3431; }
@@ -267,8 +268,9 @@ def render_hunt(db: Database, scheduler: Scheduler, active: list) -> str:
         '<section class="card"><h2>Symmetric hunt</h2><p class="note" style="margin:0 0 12px">'
         "Volunteers who turn on the hunt search only for tilings that look the same after a half turn. "
         "That search is much smaller, so it can reach larger sizes; if it finds a tiling, the question is "
-        'answered. "Impossible" here only rules out symmetric tilings, so these results do not change the '
-        f'map above.</p><div class="stats">{stats_html}</div>{table}</section>'
+        'answered. "Impossible" here only rules out symmetric tilings: those sizes show as "No symmetric '
+        'tiling" on the map above and still need the full search, so they never count toward the area '
+        f'bound.</p><div class="stats">{stats_html}</div>{table}</section>'
     )
 
 
@@ -283,6 +285,12 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         for j in active
         if j.lane != LANE_HUNT
     }
+    hunting = {
+        (min(j.width, j.height), max(j.width, j.height)): j
+        for j in active
+        if j.lane == LANE_HUNT
+    }
+    hunted = scheduler.summaries(db.results("hunt"))
     sizes = [k for k in scheduler.sizes if k[1] <= piece.max_side]
 
     def tile(key: tuple[int, int]) -> Tile:
@@ -304,6 +312,24 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         if s is not None and s.flagged:
             return Tile(
                 "flagged", "var(--flag)", f"{w} x {h}: waiting for a second check"
+            )
+        if key in hunting:
+            return Tile(
+                "running",
+                "var(--run)",
+                f"{w} x {h}: symmetric hunt running now ({hunting[key].name})",
+            )
+        sym = hunted.get(key)
+        if sym is not None and sym.decided and sym.verdict == VERDICT_IMPOSSIBLE:
+            also = (
+                f"; full search timed out after {hours(s.duration_s)}"
+                if s is not None and s.timed_out
+                else ""
+            )
+            return Tile(
+                "sym_impossible",
+                "var(--sym)",
+                f"{w} x {h}: no symmetric tiling (an asymmetric one is still possible){also}",
             )
         if s is not None and s.timed_out:
             return Tile(
@@ -361,6 +387,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
     legend_items = [
         ("impossible", "var(--accent)", "Impossible"),
         ("timed_out", "var(--timed)", "Timed out"),
+        ("sym_impossible", "var(--sym)", "No symmetric tiling"),
         ("running", "var(--run)", "Running now"),
         ("todo", "var(--todo)", "Not searched yet"),
         ("flagged", "var(--flag)", "Being re-checked"),
@@ -370,7 +397,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         f'<li><i style="background:{color}"></i>{label}<b>{counts.get(status, 0):,}</b></li>'
         for status, color, label in legend_items
         if counts.get(status)
-        or status in ("impossible", "timed_out", "running", "todo")
+        or status in ("impossible", "timed_out", "sym_impossible", "running", "todo")
     )
 
     open_sizes = sorted(
