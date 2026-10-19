@@ -77,6 +77,8 @@ class ApiClient:
         width: int | None = None,
         height: int | None = None,
         no_time_limit: bool = False,
+        hunt: bool = False,
+        custom_borders: tuple[int, ...] = (),
     ) -> Job:
         body = {
             "name": name,
@@ -86,6 +88,8 @@ class ApiClient:
             "width": width,
             "height": height,
             "no_time_limit": no_time_limit,
+            "hunt": hunt,
+            "custom_stages": list(custom_borders),
         }
         try:
             data = self._post("/api/jobs/request", body)

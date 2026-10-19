@@ -8,6 +8,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from tilingvol.shared.protocol import SYMMETRIC_TAG_PREFIX
+
+# results of the symmetric hunt; only a tiling found there (verdict "possible") also counts for the size
+HUNT_ROW = f"stage_tag LIKE '{SYMMETRIC_TAG_PREFIX}%'"
+MAIN_ROW = f"(NOT {HUNT_ROW} OR verdict = 'possible')"
+RESULT_KINDS = {"main": MAIN_ROW, "hunt": HUNT_ROW, "all": "1"}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
@@ -61,7 +68,8 @@ CREATE TABLE IF NOT EXISTS frames (          -- border fillings, saved the momen
     border INTEGER NOT NULL,
     name TEXT NOT NULL,
     submitted REAL NOT NULL,
-    placements TEXT NOT NULL
+    placements TEXT NOT NULL,
+    symmetric INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS frames_size ON frames(width, height);
 """
@@ -95,6 +103,7 @@ class PictureRow:
     stage_tag: str | None
     name: str
     border: int  # 0 = a full tiling
+    symmetric: bool = False
 
 
 @dataclass(frozen=True)
@@ -128,6 +137,11 @@ class Database:
         for column, kind in (("picture_border", "INTEGER"), ("picture", "TEXT")):
             if column not in columns:  # databases created before pictures existed
                 self._conn.execute(f"ALTER TABLE results ADD COLUMN {column} {kind}")
+        frame_columns = {r[1] for r in self._conn.execute("PRAGMA table_info(frames)")}
+        if "symmetric" not in frame_columns:  # created by version 0.8
+            self._conn.execute(
+                "ALTER TABLE frames ADD COLUMN symmetric INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -276,15 +290,15 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM ("
-                " SELECT 'picture', id, submitted, width, height, verdict, stage_tag, name, picture_border"
-                " FROM results WHERE picture IS NOT NULL AND flagged = 0"
+                " SELECT 'picture', id, submitted, width, height, verdict, stage_tag, name, picture_border,"
+                f" {HUNT_ROW} FROM results WHERE picture IS NOT NULL AND flagged = 0"
                 " UNION ALL"
-                " SELECT 'frame', f.id, f.submitted, f.width, f.height, r.verdict, r.stage_tag, f.name, f.border"
-                " FROM frames f LEFT JOIN results r ON r.job_id = f.job_id AND r.flagged = 0"
+                " SELECT 'frame', f.id, f.submitted, f.width, f.height, r.verdict, r.stage_tag, f.name, f.border,"
+                " f.symmetric FROM frames f LEFT JOIN results r ON r.job_id = f.job_id AND r.flagged = 0"
                 ") ORDER BY 3 DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [PictureRow(f"/{r[0]}/{r[1]}.png", *r[3:]) for r in rows]
+        return [PictureRow(f"/{r[0]}/{r[1]}.png", *r[3:9], bool(r[9])) for r in rows]
 
     def picture(self, result_id: int) -> tuple[int, int, list] | None:
         with self._lock:
@@ -302,13 +316,15 @@ class Database:
         border: int,
         name: str,
         placements: list,
+        symmetric: bool = False,
     ) -> bool:
         """Keep the border filling unless the job already saved one at least as deep; True if kept."""
         with self._lock:
             return (
                 self._conn.execute(
-                    "INSERT INTO frames (job_id, width, height, border, name, submitted, placements)"
-                    " VALUES (?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET border = excluded.border,"
+                    "INSERT INTO frames (job_id, width, height, border, name, submitted, placements,"
+                    " symmetric) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET"
+                    " border = excluded.border,"
                     " submitted = excluded.submitted, placements = excluded.placements"
                     " WHERE excluded.border > frames.border",
                     (
@@ -319,6 +335,7 @@ class Database:
                         name,
                         time.time(),
                         json.dumps(placements),
+                        int(symmetric),
                     ),
                 ).rowcount
                 > 0
@@ -333,24 +350,30 @@ class Database:
             ).fetchone()
         return (row[0], row[1], row[2], json.loads(row[3])) if row else None
 
-    def filled_border(self, width: int, height: int) -> int:
-        """Deepest border anyone has filled for this size (either orientation), 0 if none."""
+    def filled_border(self, width: int, height: int, symmetric: bool = False) -> int:
+        """Deepest border anyone has filled for this size (either orientation), 0 if none. A symmetric
+        filling is an ordinary one too; with symmetric=True only symmetric fillings count."""
+        frames_where = "symmetric = 1 AND " if symmetric else ""
+        results_where = f"{HUNT_ROW} AND " if symmetric else ""
         with self._lock:
             row = self._conn.execute(
                 "SELECT MAX(b) FROM ("
-                " SELECT border AS b FROM frames WHERE (width = ? AND height = ?) OR (width = ? AND height = ?)"
+                f" SELECT border AS b FROM frames WHERE {frames_where}"
+                " ((width = ? AND height = ?) OR (width = ? AND height = ?))"
                 " UNION ALL"
                 " SELECT picture_border FROM results WHERE picture_border > 0 AND flagged = 0"
-                " AND ((width = ? AND height = ?) OR (width = ? AND height = ?)))",
+                f" AND {results_where}((width = ? AND height = ?) OR (width = ? AND height = ?)))",
                 (width, height, height, width) * 2,
             ).fetchone()
         return row[0] or 0
 
-    def results(self) -> list[ResultRow]:
+    def results(self, kind: str = "main") -> list[ResultRow]:
+        """kind: "main" (what settles sizes), "hunt" (the symmetric hunt) or "all"."""
+        where = RESULT_KINDS[kind]
         with self._lock:
             rows = self._conn.execute(
                 "SELECT width, height, verdict, stage_tag, duration_s, name, ip, threads, peak_ram_mb, est_ram_mb,"
-                " submitted, flagged, hard, source FROM results ORDER BY id"
+                f" submitted, flagged, hard, source FROM results WHERE {where} ORDER BY id"
             ).fetchall()
         return [ResultRow(*r[:11], bool(r[11]), bool(r[12]), r[13]) for r in rows]
 

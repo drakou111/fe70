@@ -13,6 +13,7 @@ from tilingvol.server.config import ServerConfig
 from tilingvol.server.db import Database, ResultRow
 from tilingvol.server.scheduler import Scheduler
 from tilingvol.shared.protocol import (
+    LANE_HUNT,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
@@ -22,6 +23,8 @@ MANIFEST_NAME = "latest.json"
 MAX_MANIFEST_BYTES = 64 * 1024
 RECENT = 15
 GALLERY = 6
+HUNT_PILL = '<span class="pill hunt">hunt</span>'
+HUNT_FIGURE = ' class="hunt"'
 PITCH = 8  # map grid pitch in px; tiles are slightly smaller so they read as separate squares
 TILE = 6.5
 MAP_LEFT, MAP_TOP, MAP_BOTTOM = 36, 8, 28
@@ -33,7 +36,7 @@ PLATFORM_NAMES = {"windows": "Windows", "linux": "Linux", "macos": "macOS"}
 STYLE = """
 :root {
   --bg: #f6f7f5; --card: #ffffff; --fg: #1b1f1d; --muted: #66706b; --line: #e3e6e3;
-  --todo: #e4e7e4; --timed: #f59f00; --run: #4263eb; --found: #fab005; --flag: #e8590c; --accent: #2b8a3e;
+  --todo: #e4e7e4; --timed: #f59f00; --run: #4263eb; --found: #fab005; --flag: #e8590c; --accent: #2b8a3e; --hunt: #7c3aed;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #121514; --card: #1b1f1d; --fg: #e9ecea; --muted: #98a29d; --line: #2c322f; --todo: #2e3431; }
@@ -91,6 +94,9 @@ footer { color: var(--muted); font-size: 0.82rem; margin-top: 24px; }
 .gallery img { display: block; width: 100%; height: auto; border-radius: 6px; background: #222624; }
 .gallery figcaption { color: var(--muted); font-size: 0.8rem; margin-top: 6px; line-height: 1.35; }
 .gallery b { color: var(--fg); font-weight: 600; }
+.gallery figure.hunt img { outline: 3px solid var(--hunt); outline-offset: 2px; }
+.pill.hunt { background: rgba(124, 58, 237, 0.15); color: var(--hunt); }
+.hunt-title { color: var(--hunt); }
 """
 
 TOOLTIP_JS = """
@@ -197,14 +203,15 @@ def map_note(piece) -> str:
 def picture_caption(p) -> str:
     if p.border == 0:
         return "a complete tiling!"
+    prefix = "symmetric " if p.symmetric else ""
     if p.verdict is None:
-        return f"border {p.border} filled; searching deeper"
-    match = re.match(r"frame(\d+)", p.stage_tag)
+        return f"{prefix}border {p.border} filled; searching deeper"
+    match = re.search(r"frame(\d+)", p.stage_tag)
     deeper = f"border {match[1]}" if match else "the full search"
     outcome = {VERDICT_IMPOSSIBLE: "impossible", VERDICT_TIMED_OUT: "timed out"}.get(
         p.verdict, p.verdict
     )
-    return f"border {p.border} filled; {deeper} {outcome}"
+    return f"{prefix}border {p.border} filled; {deeper} {outcome}"
 
 
 def deciding_rows(results: list[ResultRow]) -> dict[tuple[int, int], ResultRow]:
@@ -220,13 +227,66 @@ def deciding_rows(results: list[ResultRow]) -> dict[tuple[int, int], ResultRow]:
     return best
 
 
+def render_hunt(db: Database, scheduler: Scheduler, active: list) -> str:
+    """The symmetric hunt keeps its own books: it can find a tiling, but its "impossible" settles nothing."""
+    hunt_results = db.results("hunt")
+    hunting = [j for j in active if j.lane == LANE_HUNT]
+    if not hunt_results and not hunting:
+        return ""
+    summaries = scheduler.summaries(hunt_results)
+    ruled_out = sorted(
+        (w * h, w, h)
+        for (w, h), s in summaries.items()
+        if s.decided and s.verdict == VERDICT_IMPOSSIBLE
+    )
+    timed_out = sum(1 for s in summaries.values() if s.timed_out and not s.decided)
+    largest = f"{ruled_out[-1][1]} x {ruled_out[-1][2]}" if ruled_out else "-"
+    stats = [
+        (
+            f"{len(ruled_out):,}",
+            "Sizes with no symmetric tiling",
+            f"largest: {largest}",
+        ),
+        (f"{timed_out:,}", "Timed out", "symmetric search undecided"),
+        (f"{len(hunting)}", "Hunting now", "volunteers with the hunt on"),
+    ]
+    stats_html = "".join(
+        f'<div class="stat"><span>{label}</span><b>{value}</b><span>{note}</span></div>'
+        for value, label, note in stats
+    )
+    recent = hunt_results[-RECENT:][::-1]
+    rows = "".join(
+        f'<tr><td>{r.width} x {r.height}</td><td><span class="pill {escape(r.verdict)}">'
+        f"{escape(r.verdict.replace('_', ' '))}</span></td><td>{escape(r.name)}</td>"
+        f'<td class="num">{hours(r.duration_s)}</td><td class="num">{ago(r.submitted)}</td></tr>'
+        for r in recent
+    )
+    table = (
+        f'<div class="scroll"><table><tr><th>Size</th><th>Symmetric result</th><th>Volunteer</th>'
+        f'<th class="num">Search</th><th class="num">When</th></tr>{rows}</table></div>'
+        if recent
+        else '<p class="empty">No hunt results yet.</p>'
+    )
+    return (
+        '<section class="card"><h2 class="hunt-title">Symmetric hunt</h2><p class="note" style="margin:0 0 12px">'
+        "Volunteers who turn on the hunt search only for tilings that look the same after a half turn. "
+        "That search is much smaller, so it can reach larger sizes; if it finds a tiling, the question is "
+        'answered. "Impossible" here only rules out symmetric tilings, so these results do not change the '
+        f'map above.</p><div class="stats">{stats_html}</div>{table}</section>'
+    )
+
+
 def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
     piece = config.piece
     results = db.results()
     summaries = scheduler.summaries(results)
     decisive = deciding_rows(results)
     active = db.active_jobs()
-    running = {(min(j.width, j.height), max(j.width, j.height)): j for j in active}
+    running = {
+        (min(j.width, j.height), max(j.width, j.height)): j
+        for j in active
+        if j.lane != LANE_HUNT
+    }
     sizes = [k for k in scheduler.sizes if k[1] <= piece.max_side]
 
     def tile(key: tuple[int, int]) -> Tile:
@@ -367,7 +427,8 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         )
 
     running_rows = "".join(
-        f"<tr><td>{j.width} x {j.height}</td><td>{escape(j.name)}</td><td>{escape(j.lane)}</td>"
+        f"<tr><td>{j.width} x {j.height}</td><td>{escape(j.name)}</td><td>"
+        f"{HUNT_PILL if j.lane == LANE_HUNT else escape(j.lane)}</td>"
         f'<td class="num">{ago(j.created)}</td></tr>'
         for j in sorted(active, key=lambda j: j.created)
     )
@@ -401,7 +462,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
 
     pictures = db.recent_pictures(GALLERY)
     figures = "".join(
-        f'<figure><a href="{p.url}"><img src="{p.url}" loading="lazy" '
+        f'<figure{HUNT_FIGURE if p.symmetric else ""}><a href="{p.url}"><img src="{p.url}" loading="lazy" '
         f'alt="{p.width} x {p.height}"></a><figcaption><b>{p.width} x {p.height}</b><br>'
         f"{escape(picture_caption(p))}<br>by {escape(p.name)}</figcaption></figure>"
         for p in pictures
@@ -413,6 +474,8 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         if pictures
         else ""
     )
+
+    hunt_html = render_hunt(db, scheduler, active)
 
     recent = [r for r in results if r.source == "volunteer"][-RECENT:][::-1]
     recent_rows = "".join(
@@ -450,5 +513,6 @@ checked by a complete computer search.</p>
 <section class="card"><h2>Leaderboard</h2>{leader_html}</section>
 </div>
 <section class="card"><h2>Recent results</h2>{recent_html}</section>
+{hunt_html}
 <footer>Updated every 30 seconds. Raw data: <a href="/api/results">/api/results</a>.</footer>
 </main><script>{TOOLTIP_JS}</script></body></html>"""

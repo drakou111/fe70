@@ -67,16 +67,22 @@ def test_full_button_cycle(app, server):
     assert "name" in app.error_var.get()
     assert app.state == State.IDLE
     app.name_var.set("gui tester")
+    app.stages_var.set("28, 24")
+    app.start_clicked()
+    assert "go up" in app.error_var.get()
+    assert app.state == State.IDLE
+    app.stages_var.set("")
+    assert str(app.log.tag_cget("hunt", "foreground")) == gui.HUNT_COLOR
     app.ram_var.set("2")
     app.threads_var.set("2")
     app.url_var.set(live_server.url)
     app.width_var.set("35")
-    app.height_var.set("35")
+    app.height_var.set("40")
     app.start_clicked()
     pump_until(
         app,
         lambda: (
-            app.state == State.RUNNING and app.slot_rows()[0][0].startswith("35 x 35")
+            app.state == State.RUNNING and app.slot_rows()[0][0].startswith("35 x 40")
         ),
         60,
     )

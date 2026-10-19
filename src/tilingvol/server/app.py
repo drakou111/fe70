@@ -5,6 +5,7 @@ validated by pydantic; nothing from a request is executed, unpickled or passed t
 parameterized; names are HTML-escaped on the page."""
 
 import hmac
+import itertools
 import logging
 import re
 import secrets
@@ -24,15 +25,24 @@ from tilingvol.server.scheduler import NoAssignment, RequestRefused, Scheduler
 from tilingvol.shared import token
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.protocol import (
+    LANE_HUNT,
+    MAX_BORDER,
+    MAX_CUSTOM_STAGES,
     NO_LIMIT,
     RELEASE_REASONS,
+    SYMMETRIC_TAG_PREFIX,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
     VERDICTS,
     Stage,
 )
-from tilingvol.shared.verify import TilingError, verify_border, verify_tiling
+from tilingvol.shared.verify import (
+    TilingError,
+    verify_border,
+    verify_symmetric,
+    verify_tiling,
+)
 
 log = logging.getLogger("tilingvol.server")
 
@@ -58,6 +68,9 @@ class JobRequest(BaseModel):
     width: int | None = Field(default=None, ge=1, le=10_000)
     height: int | None = Field(default=None, ge=1, le=10_000)
     no_time_limit: bool = False  # the volunteer searches each stage until it is decided
+    hunt: bool = False  # only 180-degree symmetric tilings (its "impossible" never settles a size)
+    # the volunteer's own border depths, rising; the full search always follows
+    custom_stages: list[int] = Field(default=[], max_length=MAX_CUSTOM_STAGES)
 
 
 class Heartbeat(BaseModel):
@@ -189,6 +202,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         name = body.name.strip()
         if not name or not name.isprintable():
             raise HTTPException(422, "invalid name")
+        custom = body.custom_stages
+        if not all(1 <= b <= MAX_BORDER for b in custom) or any(
+            b <= a for a, b in itertools.pairwise(custom)
+        ):
+            raise HTTPException(422, "custom stages must be rising border depths")
         requested = None
         if body.width is not None or body.height is not None:
             if body.width is None or body.height is None:
@@ -203,6 +221,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     body.max_threads,
                     requested,
                     no_time_limit=body.no_time_limit,
+                    hunt=body.hunt,
+                    custom_borders=tuple(body.custom_stages),
                 )
             except NoAssignment as error:
                 raise HTTPException(404, str(error)) from error
@@ -214,6 +234,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "border": s.border,
                     "lookahead": s.lookahead,
                     "time_limit_s": stage_limit(s, body),
+                    "symmetric": s.symmetric,
                 }
                 for s in assignment.stages
             ]
@@ -249,7 +270,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "est_ram_mb": assignment.est_ram_mb,
             "lane": assignment.lane,
             "heartbeat_interval_s": config.heartbeat_interval_s,
-            "filled_border": db.filled_border(assignment.width, assignment.height),
+            "filled_border": db.filled_border(
+                assignment.width, assignment.height, symmetric=body.hunt
+            ),
         }
 
     @app.post("/api/jobs/{job_id}/heartbeat")
@@ -259,9 +282,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(422, "invalid state")
         if job.state != "active":
             raise HTTPException(410, f"this job is {job.state}")
-        key = (job.width, job.height)
-        summary = scheduler.summaries().get(key)
-        if summary is not None and summary.decided:
+        if size_closed(job):
             db.end_job(job_id, "cancelled", "decided elsewhere")
             return {
                 "cancel": True,
@@ -269,6 +290,17 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             }
         db.touch_job(job_id, body.state)
         return {"ok": True}
+
+    def size_closed(job) -> bool:
+        """Settled for the main search, or, for a hunt job, already searched by another hunt."""
+        key = (job.width, job.height)
+        summary = scheduler.summaries().get(key)
+        if summary is not None and summary.decided:
+            return True
+        if job.lane != LANE_HUNT:
+            return False
+        hunted = scheduler.summaries(db.results("hunt")).get(key)
+        return hunted is not None and hunted.decided
 
     @app.post("/api/jobs/{job_id}/release")
     def release(job_id: str, body: Release) -> dict:
@@ -295,15 +327,24 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         ):
             raise HTTPException(422, "not a border stage of this job")
         border = job.stages[body.stage_index]["border"]
+        symmetric = job.stages[body.stage_index].get("symmetric", False)
         try:
             verify_border(config.piece, job.width, job.height, border, body.placements)
+            if symmetric:
+                verify_symmetric(config.piece, job.width, job.height, body.placements)
         except TilingError as error:
             log.warning("job %s: border filling rejected: %s", job_id, error)
             raise HTTPException(
                 422, f"the border filling is not valid: {error}"
             ) from error
         if db.add_frame(
-            job_id, job.width, job.height, border, job.name, body.placements
+            job_id,
+            job.width,
+            job.height,
+            border,
+            job.name,
+            body.placements,
+            symmetric,
         ):
             page_cache["at"] = 0.0
             log.info(
@@ -374,7 +415,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             except TilingError as error:
                 log.warning("job %s: invalid tiling: %s", job_id, error)
                 raise HTTPException(422, f"the tiling is not valid: {error}") from error
-        tag = Stage(stage["border"], stage["lookahead"], stage["time_limit_s"]).tag
+        tag = Stage.from_dict(stage).tag
         flagged = body.verdict == VERDICT_IMPOSSIBLE and scheduler.is_suspiciously_fast(
             job.width, job.height, tag, body.duration_s
         )
@@ -429,7 +470,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             return None, None
         if body.frame_border not in [s["border"] for s in job.stages]:
             return None, None
-        if body.frame_border <= db.filled_border(job.width, job.height):
+        hunt = job.lane == LANE_HUNT
+        if body.frame_border <= db.filled_border(job.width, job.height, symmetric=hunt):
             return (
                 None,
                 None,
@@ -442,6 +484,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 body.frame_border,
                 body.frame_placements,
             )
+            if hunt:
+                verify_symmetric(
+                    config.piece, job.width, job.height, body.frame_placements
+                )
         except TilingError as error:
             log.warning("job %s: border picture rejected: %s", job.job_id, error)
             return None, None
@@ -490,8 +536,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "submitted": r.submitted,
                 "flagged": r.flagged,
                 "source": r.source,
+                "hunt": r.stage_tag.startswith(SYMMETRIC_TAG_PREFIX),
             }
-            for r in db.results()
+            for r in db.results("all")
         ]
 
     @app.get("/api/solution/{width}x{height}")

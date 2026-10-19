@@ -93,6 +93,13 @@ sudo install -o tilingvol -m 600 ~/rect_sweep.txt /var/lib/tilingvol/rect_sweep.
 sudo -u tilingvol env TILINGVOL_ENV_FILE=/etc/tilingvol/tilingvol.env TILINGVOL_IMPORT_FILE=/var/lib/tilingvol/rect_sweep.txt /opt/tilingvol/app/.venv/bin/python -m tilingvol.server.import_sweep
 ```
 
+The symmetric sweep (`output/sym_hunt3.txt`) imports the same way and becomes symmetric hunt results:
+
+```sh
+sudo install -o tilingvol -m 600 ~/sym_hunt3.txt /var/lib/tilingvol/sym_hunt3.txt
+sudo -u tilingvol env TILINGVOL_ENV_FILE=/etc/tilingvol/tilingvol.env TILINGVOL_IMPORT_FILE=/var/lib/tilingvol/sym_hunt3.txt /opt/tilingvol/app/.venv/bin/python -m tilingvol.server.import_sweep
+```
+
 ## 5. Run the service
 
 ```sh

@@ -1,4 +1,5 @@
-"""Seed the database with the research sweep's results (output/rect_sweep.txt of the tiling repo).
+"""Seed the database with the research sweep's results (output/rect_sweep.txt of the tiling repo), or with
+the symmetric sweep's (output/sym_hunt3.txt), which become symmetric hunt results.
 Run: TILINGVOL_IMPORT_FILE=rect_sweep.txt uv run python -m tilingvol.server.import_sweep
 Safe to run again on a longer file: only lines not imported before are added; nothing is overwritten."""
 
@@ -17,6 +18,10 @@ from tilingvol.shared.protocol import (
 SWEEP_NAME = "Drakou111"
 EXTERNAL_NAME = "zach"
 LINE = re.compile(r"^(\d+)x(\d+) (SAT|UNSAT|UNKNOWN) (\d+)s ?(.*)$")
+SYMMETRIC_LINE = re.compile(
+    r"^gun (\d+)x(\d+) sym=180: (SAT|UNSAT|UNKNOWN)\S* \((\d+)s"
+)
+SYMMETRIC_TAG = "symfull"
 EXTERNAL_DEPTH = re.compile(
     r"frame (\d+)"
 )  # the collaborator's border depth (with extendability)
@@ -30,6 +35,10 @@ VERDICT = {
 def parse(path: Path) -> list[dict]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
+        symmetric = SYMMETRIC_LINE.match(line.strip())
+        if symmetric:
+            rows.append(symmetric_row(line, symmetric))
+            continue
         match = LINE.match(line.strip())
         if not match:
             continue
@@ -64,24 +73,45 @@ def parse(path: Path) -> list[dict]:
     return rows
 
 
+def symmetric_row(line: str, match: re.Match) -> dict:
+    w, h, verdict, seconds = int(match[1]), int(match[2]), match[3], int(match[4])
+    if verdict == "SAT":
+        raise ValueError(
+            f"the sweep file claims a symmetric tiling ({line!r}); add it by hand with its solution"
+        )
+    return {
+        "width": min(w, h),
+        "height": max(w, h),
+        "verdict": VERDICT[verdict],
+        "stage_tag": SYMMETRIC_TAG,
+        "duration_s": float(seconds),
+        "name": SWEEP_NAME,
+        "hard": False,
+    }
+
+
 def main() -> None:
     path = Path(os.environ.get("TILINGVOL_IMPORT_FILE", "rect_sweep.txt"))
     config = ServerConfig.from_env()
     db = Database(config.db_path)
-    # every result is one line; one already in the database (same size, verdict, stage, time) is skipped
-    # a result is one line; one already imported (same size, verdict and time) is skipped, except that a
-    # collaborator row first imported without its border depth gets the depth now
+    # a result is one line; one already imported (same size, verdict and time, and main search or hunt
+    # alike) is skipped, except that a collaborator row first imported without its border depth gets the
+    # depth now
     imported = {
-        (r.width, r.height, r.verdict, round(r.duration_s)): r.stage_tag
-        for r in db.results()
-        if r.source == "import"
+        kind: {
+            (r.width, r.height, r.verdict, round(r.duration_s)): r.stage_tag
+            for r in db.results(kind)
+            if r.source == "import"
+        }
+        for kind in ("main", "hunt")
     }
     rows, retagged = [], 0
     for row in parse(path):
         key = (row["width"], row["height"], row["verdict"], round(row["duration_s"]))
-        if key not in imported:
+        same_kind = imported["hunt" if row["stage_tag"] == SYMMETRIC_TAG else "main"]
+        if key not in same_kind:
             rows.append(row)
-        elif imported[key] == "external" and row["stage_tag"] != "external":
+        elif same_kind[key] == "external" and row["stage_tag"] != "external":
             retagged += db.retag_import(*key, row["stage_tag"])
     for row in rows:
         db.add_result(

@@ -86,7 +86,12 @@ def _run_stages(task: SolverTask, queue) -> None:
         stage = task.stages[index]
         queue.put((MSG_STAGE_START, index))
         built = build_model(
-            piece, task.width, task.height, stage.border, stage.lookahead
+            piece,
+            task.width,
+            task.height,
+            stage.border,
+            stage.lookahead,
+            stage.symmetric,
         )
         solver = cp_model.CpSolver()
         solver.parameters.num_workers = task.threads

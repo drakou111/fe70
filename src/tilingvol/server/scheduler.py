@@ -8,11 +8,12 @@ import math
 import re
 import statistics
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from tilingvol.server.config import ServerConfig
 from tilingvol.server.db import Database, ResultRow
 from tilingvol.shared.protocol import (
+    LANE_HUNT,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
@@ -194,17 +195,36 @@ class Scheduler:
 
     # stages
     def stages_for(
-        self, key: tuple[int, int], results: list[ResultRow]
+        self,
+        key: tuple[int, int],
+        results: list[ResultRow],
+        symmetric: bool = False,
+        custom_borders: tuple[int, ...] = (),
     ) -> tuple[Stage, ...]:
         """Adaptive: start at the depth that settled the nearest decided size (|dW| + |dH|, then the more
-        similar area), go border_increments steps of border_step deeper, then the full model. Either way,
-        border depths someone already filled for this size are skipped: a filled border proves nothing."""
-        filled = self.db.filled_border(*key)
+        similar area), go border_increments steps of border_step deeper, then the full model; or the
+        volunteer's own border depths. Either way, border depths someone already filled for this size are
+        skipped: a filled border proves nothing. The hunt runs the same stages restricted to symmetric
+        tilings, and only symmetric fillings let it skip a depth."""
+        planned = (
+            self._custom_stages(key, custom_borders)
+            if custom_borders
+            else self._planned_stages(key, results)
+        )
+        filled = self.db.filled_border(*key, symmetric=symmetric)
         return tuple(
-            s
-            for s in self._planned_stages(key, results)
+            replace(s, symmetric=symmetric)
+            for s in planned
             if s.border == 0 or s.border > filled
         )
+
+    def _custom_stages(
+        self, key: tuple[int, int], borders: tuple[int, ...]
+    ) -> tuple[Stage, ...]:
+        limit = self.config.stage_time_limit_s
+        deepest = min(key) // 2
+        kept = sorted({min(b, deepest) for b in borders})
+        return tuple(Stage(b, True, limit) for b in kept) + (Stage(0, False, limit),)
 
     def _planned_stages(
         self, key: tuple[int, int], results: list[ResultRow]
@@ -307,24 +327,42 @@ class Scheduler:
         max_threads: int,
         requested: tuple[int, int] | None,
         no_time_limit: bool = False,
+        hunt: bool = False,
+        custom_borders: tuple[int, ...] = (),
     ) -> Assignment:
         self.expire_leases()
         results = self.db.results()
         summaries = self.summaries(results)
         active = self.db.active_jobs()
-        leased = {(min(j.width, j.height), max(j.width, j.height)) for j in active}
         if sum(1 for j in active if j.ip == ip) >= self.config.max_active_jobs_per_ip:
             raise RequestRefused("too many sizes are already running from your network")
-        factor = self.ram_factor(results)
+        # the main search and the hunt keep separate books; a size settled by the main search (or a tiling
+        # found by the hunt) is closed for both
+        if hunt:
+            pool = self.summaries(self.db.results("hunt"))
+            pool.update({k: s for k, s in summaries.items() if s.decided})
+        else:
+            pool = summaries
+        leased = {
+            (min(j.width, j.height), max(j.width, j.height))
+            for j in active
+            if (j.lane == LANE_HUNT) == hunt
+        }
+        factor = self.ram_factor(self.db.results("all"))
         failures = self.db.memory_failures()
 
+        def assign(key: tuple[int, int], lane: str, fit: tuple[int, int]) -> Assignment:
+            stages = self.stages_for(key, results, hunt, custom_borders)
+            return Assignment(key[0], key[1], LANE_HUNT if hunt else lane, *fit, stages)
+
         if requested is not None:
-            return self._requested(
-                requested, summaries, leased, max_ram_mb, max_threads, factor, failures
+            key, fit = self._requested(
+                requested, pool, leased, max_ram_mb, max_threads, factor, failures
             )
+            return assign(key, LANE_REQUESTED, fit)
 
         def available(key: tuple[int, int]) -> bool:
-            s = summaries.get(key)
+            s = pool.get(key)
             if key in leased:
                 return False
             if s is None:
@@ -338,18 +376,16 @@ class Scheduler:
         if no_time_limit:
             # sizes that timed out before go to volunteers without a time limit first, smallest first
             for key in self.sizes:
-                s = summaries.get(key)
+                s = pool.get(key)
                 if s is None or not s.timed_out or s.decided or key in leased:
                     continue
                 fit = self.fit_threads(
                     *key, max_ram_mb, max_threads, factor, failures.get(key, 0)
                 )
                 if fit is not None:
-                    return Assignment(
-                        key[0], key[1], LANE_RETRY, *fit, self.stages_for(key, results)
-                    )
+                    return assign(key, LANE_RETRY, fit)
 
-        lane = self._lane(active)
+        lane = LANE_HUNT if hunt else self._lane(active)
         order = self.sizes
         if lane == LANE_BATTLE:
             seeds = self.battle_seeds(results)
@@ -371,7 +407,7 @@ class Scheduler:
             )
             if fit is None:
                 continue
-            return Assignment(key[0], key[1], lane, *fit, self.stages_for(key, results))
+            return assign(key, lane, fit)
         smallest = min(
             (key for key in self.sizes if available(key)),
             key=lambda k: k[0] * k[1],
@@ -395,7 +431,7 @@ class Scheduler:
 
     def _requested(
         self, requested, summaries, leased, max_ram_mb, max_threads, factor, failures
-    ) -> Assignment:
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
         width, height = requested
         key = (min(width, height), max(width, height))
         if not (1 <= key[0] and key[1] <= self.config.request_max_side):
@@ -422,10 +458,4 @@ class Scheduler:
             raise RequestRefused(
                 f"{width} x {height} needs more RAM than {max_ram_mb} MB"
             )
-        return Assignment(
-            key[0],
-            key[1],
-            LANE_REQUESTED,
-            *fit,
-            self.stages_for(key, self.db.results()),
-        )
+        return key, fit

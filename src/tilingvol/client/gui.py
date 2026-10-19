@@ -44,6 +44,10 @@ FIRST_UPDATE_CHECK_S = 5.0
 APP_EVENT = -1  # events that belong to the window, not to one search
 SHUTDOWN_TIMEOUT_S = 20.0
 PICTURE_MAX_PX = 240
+HUNT_COLOR = (
+    "#7c3aed"  # symmetric hunt sizes, in the log, the status table and the pictures
+)
+HUNT_PICTURE_PREFIX = "sym"
 BUTTON_HELP_DEFAULT = "Point at a button to see what it does."
 BUTTON_HELP = {
     "start": "Start: get a size from the server and search it, then the next one, until you stop.",
@@ -124,6 +128,8 @@ class App:
         self.token_var = tk.StringVar(value=settings.access_token)
         self.no_limit_var = tk.BooleanVar(value=settings.no_time_limit)
         self.tree_var = tk.BooleanVar(value=settings.tree_progress)
+        self.hunt_var = tk.BooleanVar(value=settings.symmetric_hunt)
+        self.stages_var = tk.StringVar(value=settings.custom_stages)
         self.width_var = tk.StringVar()
         self.height_var = tk.StringVar()
         total_gb = installed_ram_mb() / 1024
@@ -201,6 +207,29 @@ class App:
             variable=self.tree_var,
         )
         self.tree_check.grid(row=4, column=0, columnspan=4, sticky="w", pady=2)
+        ttk.Style(root).configure("Hunt.TCheckbutton", foreground=HUNT_COLOR)
+        self.hunt_check = ttk.Checkbutton(
+            self.advanced,
+            text="Symmetric hunt: search only tilings that look the same after a half turn (much faster, "
+            "finds a tiling if a symmetric one exists; its 'impossible' rules out symmetric tilings only)",
+            variable=self.hunt_var,
+            style="Hunt.TCheckbutton",
+        )
+        self.hunt_check.grid(row=5, column=0, columnspan=4, sticky="w", pady=2)
+        ttk.Label(self.advanced, text="Custom stages").grid(
+            row=6, column=0, sticky="w", pady=2
+        )
+        self.stages_entry = ttk.Entry(
+            self.advanced, textvariable=self.stages_var, width=20
+        )
+        self.stages_entry.grid(row=6, column=1, columnspan=3, sticky="w", pady=2)
+        ttk.Label(
+            self.advanced,
+            text="Border depths to try in order, like 24, 28, 32; the full search always runs last. "
+            "Leave empty for the server's stages.",
+            foreground="#66706b",
+            wraplength=520,
+        ).grid(row=7, column=0, columnspan=4, sticky="w")
         ttk.Label(self.advanced, text="Request a size (optional)").grid(
             row=1, column=0, sticky="w", pady=2
         )
@@ -279,6 +308,8 @@ class App:
 
         self.log = ScrolledText(main, height=10, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, pady=(8, 0))
+        self.log.tag_configure("hunt", foreground=HUNT_COLOR)
+        self.table.tag_configure("hunt", foreground=HUNT_COLOR)
         self._apply_state(State.IDLE)
 
     def _button_help(self, key: str) -> str:
@@ -317,12 +348,15 @@ class App:
                 access_token=self.token_var.get(),
                 no_time_limit=self.no_limit_var.get(),
                 tree_progress=self.tree_var.get(),
+                symmetric_hunt=self.hunt_var.get(),
+                custom_stages=self.stages_var.get(),
             ).validated()
             requested = self._requested_size()
         except ValueError as error:
             self.error_var.set(str(error))
             return
         self.store.save(settings)
+        self.stages_var.set(settings.custom_stages)
         self._server_url = settings.server_url
         if self.state == State.IDLE:
             self._set_slot_count(settings.parallel)
@@ -447,12 +481,14 @@ class App:
                 self._show_update(event.message)
             elif event.kind == "picture" and event.picture:
                 threading.Thread(
-                    target=self._save_picture, args=(event.picture,), daemon=True
+                    target=self._save_picture,
+                    args=(event.picture, event.hunt),
+                    daemon=True,
                 ).start()
             elif event.kind == "picture_ready":
                 self._show_picture(Path(event.message))
             else:
-                self._append_log(event.message)
+                self._append_log(event.message, event.hunt)
         if status_changed:
             self._show_status()
         self.root.after(PUMP_MS, self._pump)
@@ -462,14 +498,14 @@ class App:
         folder.mkdir(exist_ok=True)
         return folder
 
-    def _save_picture(self, picture: tuple[str, int, int, int, list]) -> None:
+    def _save_picture(
+        self, picture: tuple[str, int, int, int, list], hunt: bool = False
+    ) -> None:
         """Background thread: render and save the PNG, then hand the file to the window."""
         piece, width, height, border, placements = picture
-        name = (
-            f"{width}x{height}-tiling.png"
-            if border == 0
-            else f"{width}x{height}-border{border}.png"
-        )
+        kind = "tiling" if border == 0 else f"border{border}"
+        prefix = HUNT_PICTURE_PREFIX if hunt else ""
+        name = f"{width}x{height}-{prefix}{kind}.png"
         path = self.pictures_dir() / name
         try:
             path.write_bytes(
@@ -489,10 +525,12 @@ class App:
         self._picture_image = image.subsample(factor) if factor > 1 else image
         self.picture_label.configure(image=self._picture_image)
         size, _, kind = path.stem.partition("-")
+        hunt = kind.startswith(HUNT_PICTURE_PREFIX)
+        kind = kind.removeprefix(HUNT_PICTURE_PREFIX)
         what = (
             "A COMPLETE TILING!"
             if kind == "tiling"
-            else f"{kind.replace('border', 'border depth ')} filled"
+            else f"{'symmetric ' if hunt else ''}{kind.replace('border', 'border depth ')} filled"
         )
         self.picture_var.set(
             f"{size.replace('x', ' x ')}: {what}\nSaved as {path.name}"
@@ -515,9 +553,9 @@ class App:
         if self._ready_update is not None:
             self.update_button.pack(side="right")
 
-    def _append_log(self, message: str) -> None:
+    def _append_log(self, message: str, hunt: bool = False) -> None:
         self.log.configure(state="normal")
-        self.log.insert("end", message + "\n")
+        self.log.insert("end", message + "\n", ("hunt",) if hunt else ())
         lines = int(self.log.index("end-1c").split(".")[0])
         if lines > MAX_LOG_LINES:
             self.log.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
@@ -533,7 +571,8 @@ class App:
                 waiting = status.state.value if status else "starting"
                 rows.append(("-", waiting, "-", "-", "-"))
                 continue
-            size = f"{job.width} x {job.height} ({job.threads} threads)"
+            kind = " symmetric" if job.hunt else ""
+            size = f"{job.width} x {job.height}{kind} ({job.threads} threads)"
             if status.stage_index >= 0:
                 stage = job.stages[status.stage_index]
                 stage_text = (
@@ -566,8 +605,10 @@ class App:
             f"running. Finished sizes: {finished}"
         )
         self.table.delete(*self.table.get_children())
-        for row in self.slot_rows():
-            self.table.insert("", "end", values=row)
+        for index, row in enumerate(self.slot_rows()):
+            status = self.slot_status.get(index)
+            hunt = status is not None and status.job is not None and status.job.hunt
+            self.table.insert("", "end", values=row, tags=("hunt",) if hunt else ())
 
     def _apply_state(self, state: State) -> None:
         self.state = state
@@ -593,6 +634,8 @@ class App:
             self.token_entry,
             self.no_limit_check,
             self.tree_check,
+            self.hunt_check,
+            self.stages_entry,
             self.width_entry,
             self.height_entry,
         ):

@@ -7,7 +7,11 @@ infeasible, so is the rectangle.
 
 For the gun the proven wall lemmas are added (research PROOF_NOTES.md section 1): Lemma 1 (a piece
 perpendicular to a wall and touching it has its bump at distance 1..3), Lemma 2 (floor neighbour) and
-Lemma 3 (forced corner). They are stated once in wall coordinates (u along the wall, v away from it)."""
+Lemma 3 (forced corner). They are stated once in wall coordinates (u along the wall, v away from it).
+
+symmetric=True keeps only tilings (or border fillings) unchanged by a 180-degree turn: every placement is
+chosen together with its turned copy, so a pair that would overlap itself can never be chosen. Infeasible
+then means only "no symmetric tiling", never "no tiling"."""
 
 from dataclasses import dataclass
 
@@ -155,7 +159,12 @@ def lemma2_pairs(width: int, height: int) -> list[tuple[frozenset, list[frozense
 
 
 def build_model(
-    piece: PieceSpec, width: int, height: int, border: int, lookahead: bool
+    piece: PieceSpec,
+    width: int,
+    height: int,
+    border: int,
+    lookahead: bool,
+    symmetric: bool = False,
 ) -> BuiltModel:
     model = cp_model.CpModel()
     variables: dict[frozenset, cp_model.IntVar] = {}
@@ -196,6 +205,15 @@ def build_model(
                 placement_of[cells] = (orientation, x0, y0)
                 for c in cells:
                     cover.setdefault(c, []).append(v)
+
+    if symmetric:
+        for cells, v in variables.items():
+            twin = frozenset((width - 1 - x, height - 1 - y) for x, y in cells)
+            partner = variables.get(twin)
+            if partner is None or cells & twin:
+                model.Add(v == 0)
+            elif placement_of[cells] < placement_of[twin]:
+                model.Add(v == partner)
 
     for y in range(height):
         for x in range(width):

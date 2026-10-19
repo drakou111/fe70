@@ -91,6 +91,7 @@ class Event:
     status: Status | None = None
     # for "picture": (piece, width, height, border or 0 for a tiling, placements)
     picture: tuple[str, int, int, int, list] | None = None
+    hunt: bool = False  # about a symmetric hunt size (the window shows those in their own colour)
 
 
 class ActiveClock:
@@ -419,6 +420,8 @@ class Controller:
                 width,
                 height,
                 settings.no_time_limit,
+                settings.symmetric_hunt,
+                settings.custom_borders,
             )
         except NoJobAvailable as error:
             self._log(
@@ -443,6 +446,10 @@ class Controller:
         job = self._job
         self._next_heartbeat_at = time.monotonic() + job.heartbeat_interval_s
         stages = ", ".join(s.describe() for s in job.stages)
+        if settings.symmetric_hunt and not job.hunt:
+            self._log(
+                "This server does not run the symmetric hunt yet, so this is an ordinary size."
+            )
         if job.filled_border:
             self._log(
                 f"An earlier search of {job.width} x {job.height} already filled border depth "
@@ -521,6 +528,7 @@ class Controller:
                             stage.border,
                             message[2],
                         ),
+                        hunt=job.hunt,
                     )
                 )
             elif kind == MSG_IMPOSSIBLE:
@@ -615,12 +623,19 @@ class Controller:
         if solution is not None:
             self._on_event(
                 Event(
-                    "picture", picture=(job.piece, job.width, job.height, 0, solution)
+                    "picture",
+                    picture=(job.piece, job.width, job.height, 0, solution),
+                    hunt=job.hunt,
                 )
             )
         self._pending.add(submission.to_dict())
         stage = job.stages[stage_index]
-        if verdict == VERDICT_IMPOSSIBLE:
+        if verdict == VERDICT_IMPOSSIBLE and job.hunt:
+            text = (
+                f"{job.width} x {job.height} has no symmetric tiling (proved at {stage.describe()}); "
+                f"an asymmetric one is still possible"
+            )
+        elif verdict == VERDICT_IMPOSSIBLE:
             text = f"{job.width} x {job.height} is IMPOSSIBLE (proved at {stage.describe()})"
         elif verdict == VERDICT_POSSIBLE:
             text = f"{job.width} x {job.height}: A TILING WAS FOUND! The solution is being sent to the server"
@@ -629,7 +644,7 @@ class Controller:
         self._finished += 1
         message = f"{self._prefix}{text}, after {format_duration(duration)}."
         log.info(message)
-        self._on_event(Event("result", message))
+        self._on_event(Event("result", message, hunt=job.hunt))
         self._job = None
         self._flush_pending()
 
@@ -746,7 +761,8 @@ class Controller:
 
     def _log(self, message: str) -> None:
         log.info(self._prefix + message)
-        self._on_event(Event("log", self._prefix + message))
+        hunt = self._job is not None and self._job.hunt
+        self._on_event(Event("log", self._prefix + message, hunt=hunt))
 
     def _emit_status(self, force: bool = False) -> None:
         now = time.monotonic()

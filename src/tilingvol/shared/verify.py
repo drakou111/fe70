@@ -69,3 +69,19 @@ def verify_border(
                 and not grid[y * width + x]
             ):
                 raise TilingError(f"border cell ({x}, {y}) is not covered")
+
+
+def verify_symmetric(
+    piece: PieceSpec, width: int, height: int, placements: list[list[int]]
+) -> None:
+    """Raise TilingError unless turning the placements by 180 degrees gives the same set of pieces (the
+    placements must already be valid, e.g. checked by verify_border)."""
+    shapes = piece.orientations
+    pieces = {
+        frozenset((x0 + dx, y0 + dy) for dx, dy in shapes[o])
+        for o, x0, y0 in placements
+    }
+    for cells in pieces:
+        if frozenset((width - 1 - x, height - 1 - y) for x, y in cells) not in pieces:
+            x, y = min(cells)
+            raise TilingError(f"the piece at ({x}, {y}) has no turned twin")

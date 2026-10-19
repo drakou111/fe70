@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from tilingvol.client.memory_guard import installed_ram_mb
+from tilingvol.shared.protocol import parse_custom_stages
 
 DEV_SERVER_URL = "http://127.0.0.1:8000"
 
@@ -71,6 +72,11 @@ class Settings:
     no_time_limit: bool = False
     # let half the threads do CP-SAT's tree search, which reports progress (may change the speed)
     tree_progress: bool = False
+    # search only 180-degree symmetric tilings (finds a tiling sooner if one is symmetric; its
+    # "impossible" rules out symmetric tilings only)
+    symmetric_hunt: bool = False
+    # own border depths, e.g. "24, 28, 32"; the full search always follows. Empty: the server's stages
+    custom_stages: str = ""
 
     @staticmethod
     def defaults() -> "Settings":
@@ -101,12 +107,18 @@ class Settings:
         token = self.access_token.strip()
         if token and not token.isprintable():
             raise ValueError("the access token contains unprintable characters")
+        depths = parse_custom_stages(self.custom_stages)
         return replace(
             self,
             name=validate_name(self.name),
             server_url=self.server_url.strip(),
             access_token=token,
+            custom_stages=", ".join(str(d) for d in depths),
         )
+
+    @property
+    def custom_borders(self) -> tuple[int, ...]:
+        return parse_custom_stages(self.custom_stages)
 
     def slot_settings(self) -> "Settings":
         """What one of the parallel searches may use."""

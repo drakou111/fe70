@@ -1,5 +1,6 @@
 """Messages exchanged between client and server, as plain dataclasses with dict (JSON) conversion."""
 
+import itertools
 from dataclasses import asdict, dataclass
 
 VERDICT_IMPOSSIBLE = "impossible"
@@ -16,12 +17,38 @@ RELEASE_REASONS = (RELEASE_GAVE_UP, RELEASE_MEMORY, RELEASE_CLOSED, RELEASE_ERRO
 
 NO_LIMIT = 0.0  # a stage time limit of 0 means: search until the stage is decided
 
+LANE_HUNT = "hunt"  # 180-degree symmetric tilings only; its "impossible" proves nothing about the size
+SYMMETRIC_TAG_PREFIX = "sym"
+MAX_CUSTOM_STAGES = 8
+MAX_BORDER = 1000
+
+
+def parse_custom_stages(text: str) -> tuple[int, ...]:
+    """Border depths typed by the volunteer, e.g. "24, 28 32"; the full search always follows. Empty: the
+    server's own stages."""
+    parts = text.replace(",", " ").split()
+    if not all(p.isdigit() for p in parts):
+        raise ValueError(
+            "custom stages are whole-number border depths, like 24, 28, 32"
+        )
+    depths = tuple(int(p) for p in parts)
+    if len(depths) > MAX_CUSTOM_STAGES:
+        raise ValueError(f"at most {MAX_CUSTOM_STAGES} custom stages")
+    if not all(1 <= d <= MAX_BORDER for d in depths):
+        raise ValueError(f"border depths must be between 1 and {MAX_BORDER}")
+    if any(b <= a for a, b in itertools.pairwise(depths)):
+        raise ValueError("custom border depths must go up, like 24, 28, 32")
+    return depths
+
 
 @dataclass(frozen=True)
 class Stage:
     border: int  # 0 = the full rectangle model
     lookahead: bool
     time_limit_s: float  # NO_LIMIT = unlimited
+    symmetric: bool = (
+        False  # only tilings unchanged by a 180-degree turn (the hunt lane)
+    )
 
     @property
     def unlimited(self) -> bool:
@@ -35,12 +62,28 @@ class Stage:
 
     @property
     def tag(self) -> str:
-        if self.border == 0:
-            return "full"
-        return f"frame{self.border}" + ("L" if self.lookahead else "")
+        base = (
+            "full"
+            if self.border == 0
+            else f"frame{self.border}" + ("L" if self.lookahead else "")
+        )
+        return SYMMETRIC_TAG_PREFIX + base if self.symmetric else base
 
     def describe(self) -> str:
-        return "full search" if self.border == 0 else f"border depth {self.border}"
+        text = "full search" if self.border == 0 else f"border depth {self.border}"
+        return "symmetric " + text if self.symmetric else text
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: dict) -> "Stage":
+        return Stage(
+            int(data["border"]),
+            bool(data["lookahead"]),
+            float(data["time_limit_s"]),
+            bool(data.get("symmetric", False)),
+        )
 
 
 @dataclass(frozen=True)
@@ -57,15 +100,16 @@ class Job:
     heartbeat_interval_s: float
     filled_border: int = 0  # deepest border an earlier search of this size filled; the stages start deeper
 
+    @property
+    def hunt(self) -> bool:
+        return any(stage.symmetric for stage in self.stages)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
     @staticmethod
     def from_dict(data: dict) -> "Job":
-        stages = tuple(
-            Stage(int(s["border"]), bool(s["lookahead"]), float(s["time_limit_s"]))
-            for s in data["stages"]
-        )
+        stages = tuple(Stage.from_dict(s) for s in data["stages"])
         return Job(
             job_id=str(data["job_id"]),
             nonce=str(data["nonce"]),
