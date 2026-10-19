@@ -429,12 +429,13 @@ class Controller:
             return
         except ServerError as error:
             if error.status in RETRYABLE_STATUSES:
+                # a requested size is kept: the retry asks for it again
                 self._log(f"{error}. Retrying in {UNREACHABLE_RETRY_S:.0f} s.")
                 self._next_request_at = time.monotonic() + UNREACHABLE_RETRY_S
             else:
                 self._log(f"The server refused the request: {error}")
                 self._state = State.IDLE
-            self._requested = None
+                self._requested = None
             return
         self._requested = None
         self._filled_stage = -1
