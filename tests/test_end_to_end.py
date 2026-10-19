@@ -94,7 +94,9 @@ def test_timeout_excludes_pauses(sib_config, make_live_server, controller):
 
 def test_stop_keeps_the_size_and_give_up_releases_it(live_server, controller):
     c, recorder = controller
-    c.start(settings(live_server.url), requested=(35, 35))
+    c.start(
+        settings(live_server.url), requested=(35, 40)
+    )  # its full search takes over 30 s
     wait_for(
         lambda: (
             (s := recorder.last_status()) and s.job is not None and s.stage_index >= 0
@@ -105,7 +107,7 @@ def test_stop_keeps_the_size_and_give_up_releases_it(live_server, controller):
     wait_for(lambda: recorder.last_status().state == State.STOPPED, 10)
     held = recorder.last_status().job
     active = live_server.db.active_jobs()
-    assert [(j.width, j.height) for j in active] == [(35, 35)]
+    assert [(j.width, j.height) for j in active] == [(35, 40)]
     c.give_up()
     wait_for(lambda: recorder.last_status().state == State.IDLE, 10)
     assert held.width == 35
