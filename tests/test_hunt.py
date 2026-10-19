@@ -194,4 +194,15 @@ def test_hunt_finds_a_symmetric_tiling_end_to_end(live_server, tmp_path, submit_
     verify_symmetric(SIBLING, *SYMMETRIC_SIZE, solution)
     # a tiling from the hunt settles the size for everyone
     assert any(r.verdict == "possible" for r in live_server.db.results("main"))
-    assert any(e.hunt for e in recorder.events if e.kind in ("log", "result"))
+    assert any(e.hunt for e in recorder.events if e.kind == "picture")
+
+
+def test_hunt_pictures_have_their_own_colours():
+    from tilingvol.shared.picture import HUNT_PALETTE, PALETTE, render_png, render_rgb
+
+    _, placements = solve(*SYMMETRIC_SIZE)
+    assert not set(HUNT_PALETTE) & set(PALETTE)
+    normal = render_png(SIBLING, *SYMMETRIC_SIZE, placements)
+    assert render_png(SIBLING, *SYMMETRIC_SIZE, placements, symmetric=True) != normal
+    _, _, pixels = render_rgb(SIBLING, *SYMMETRIC_SIZE, placements, HUNT_PALETTE)
+    assert bytes(HUNT_PALETTE[placements[0][0]]) in pixels

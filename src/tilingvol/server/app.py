@@ -493,7 +493,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             return None, None
         return body.frame_border, body.frame_placements
 
-    def png(key: tuple, found: tuple[int, int, list] | None) -> Response:
+    def png(key: tuple, found: tuple[int, int, list, bool] | None) -> Response:
         if key not in picture_cache:
             if found is None:
                 raise HTTPException(404, "no picture")

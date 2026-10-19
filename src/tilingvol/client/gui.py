@@ -44,9 +44,6 @@ FIRST_UPDATE_CHECK_S = 5.0
 APP_EVENT = -1  # events that belong to the window, not to one search
 SHUTDOWN_TIMEOUT_S = 20.0
 PICTURE_MAX_PX = 240
-HUNT_COLOR = (
-    "#7c3aed"  # symmetric hunt sizes, in the log, the status table and the pictures
-)
 HUNT_PICTURE_PREFIX = "sym"
 BUTTON_HELP_DEFAULT = "Point at a button to see what it does."
 BUTTON_HELP = {
@@ -207,13 +204,11 @@ class App:
             variable=self.tree_var,
         )
         self.tree_check.grid(row=4, column=0, columnspan=4, sticky="w", pady=2)
-        ttk.Style(root).configure("Hunt.TCheckbutton", foreground=HUNT_COLOR)
         self.hunt_check = ttk.Checkbutton(
             self.advanced,
             text="Symmetric hunt: search only tilings that look the same after a half turn (much faster, "
             "finds a tiling if a symmetric one exists; its 'impossible' rules out symmetric tilings only)",
             variable=self.hunt_var,
-            style="Hunt.TCheckbutton",
         )
         self.hunt_check.grid(row=5, column=0, columnspan=4, sticky="w", pady=2)
         ttk.Label(self.advanced, text="Custom stages").grid(
@@ -308,8 +303,6 @@ class App:
 
         self.log = ScrolledText(main, height=10, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, pady=(8, 0))
-        self.log.tag_configure("hunt", foreground=HUNT_COLOR)
-        self.table.tag_configure("hunt", foreground=HUNT_COLOR)
         self._apply_state(State.IDLE)
 
     def _button_help(self, key: str) -> str:
@@ -488,7 +481,7 @@ class App:
             elif event.kind == "picture_ready":
                 self._show_picture(Path(event.message))
             else:
-                self._append_log(event.message, event.hunt)
+                self._append_log(event.message)
         if status_changed:
             self._show_status()
         self.root.after(PUMP_MS, self._pump)
@@ -509,7 +502,7 @@ class App:
         path = self.pictures_dir() / name
         try:
             path.write_bytes(
-                render_png(piece_by_name(piece), width, height, placements)
+                render_png(piece_by_name(piece), width, height, placements, hunt)
             )
         except (ValueError, IndexError, OSError) as error:
             log.exception("could not save the picture %s", name)
@@ -553,9 +546,9 @@ class App:
         if self._ready_update is not None:
             self.update_button.pack(side="right")
 
-    def _append_log(self, message: str, hunt: bool = False) -> None:
+    def _append_log(self, message: str) -> None:
         self.log.configure(state="normal")
-        self.log.insert("end", message + "\n", ("hunt",) if hunt else ())
+        self.log.insert("end", message + "\n")
         lines = int(self.log.index("end-1c").split(".")[0])
         if lines > MAX_LOG_LINES:
             self.log.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
@@ -605,10 +598,8 @@ class App:
             f"running. Finished sizes: {finished}"
         )
         self.table.delete(*self.table.get_children())
-        for index, row in enumerate(self.slot_rows()):
-            status = self.slot_status.get(index)
-            hunt = status is not None and status.job is not None and status.job.hunt
-            self.table.insert("", "end", values=row, tags=("hunt",) if hunt else ())
+        for row in self.slot_rows():
+            self.table.insert("", "end", values=row)
 
     def _apply_state(self, state: State) -> None:
         self.state = state

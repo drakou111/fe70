@@ -91,7 +91,7 @@ class Event:
     status: Status | None = None
     # for "picture": (piece, width, height, border or 0 for a tiling, placements)
     picture: tuple[str, int, int, int, list] | None = None
-    hunt: bool = False  # about a symmetric hunt size (the window shows those in their own colour)
+    hunt: bool = False  # a picture from the symmetric hunt (drawn in its own colours)
 
 
 class ActiveClock:
@@ -644,7 +644,7 @@ class Controller:
         self._finished += 1
         message = f"{self._prefix}{text}, after {format_duration(duration)}."
         log.info(message)
-        self._on_event(Event("result", message, hunt=job.hunt))
+        self._on_event(Event("result", message))
         self._job = None
         self._flush_pending()
 
@@ -761,8 +761,7 @@ class Controller:
 
     def _log(self, message: str) -> None:
         log.info(self._prefix + message)
-        hunt = self._job is not None and self._job.hunt
-        self._on_event(Event("log", self._prefix + message, hunt=hunt))
+        self._on_event(Event("log", self._prefix + message))
 
     def _emit_status(self, force: bool = False) -> None:
         now = time.monotonic()

@@ -18,6 +18,17 @@ PALETTE = (
     (214, 196, 52),
     (120, 82, 206),
 )
+# symmetric hunt pictures use their own colours, so they are told apart at a glance
+HUNT_PALETTE = (
+    (142, 68, 173),
+    (214, 92, 168),
+    (88, 86, 204),
+    (236, 140, 190),
+    (112, 48, 140),
+    (176, 128, 236),
+    (200, 60, 120),
+    (70, 120, 200),
+)
 EMPTY = (34, 38, 36)
 EDGE = (24, 26, 25)
 
@@ -34,11 +45,15 @@ def piece_grid(
 
 
 def render_rgb(
-    piece: PieceSpec, width: int, height: int, placements: list[list[int]]
+    piece: PieceSpec,
+    width: int,
+    height: int,
+    placements: list[list[int]],
+    palette: tuple = PALETTE,
 ) -> tuple[int, int, bytes]:
     """(pixel width, pixel height, RGB bytes); row 0 of the rectangle is drawn at the bottom."""
     grid = piece_grid(piece, width, height, placements)
-    colors = [PALETTE[p[0] % len(PALETTE)] for p in placements]
+    colors = [palette[p[0] % len(palette)] for p in placements]
     out_w, out_h = width * SCALE, height * SCALE
     rows = []
     for py in range(out_h):
@@ -80,6 +95,11 @@ def encode_png(width: int, height: int, rgb: bytes) -> bytes:
 
 
 def render_png(
-    piece: PieceSpec, width: int, height: int, placements: list[list[int]]
+    piece: PieceSpec,
+    width: int,
+    height: int,
+    placements: list[list[int]],
+    symmetric: bool = False,
 ) -> bytes:
-    return encode_png(*render_rgb(piece, width, height, placements))
+    palette = HUNT_PALETTE if symmetric else PALETTE
+    return encode_png(*render_rgb(piece, width, height, placements, palette))

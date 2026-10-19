@@ -23,8 +23,7 @@ MANIFEST_NAME = "latest.json"
 MAX_MANIFEST_BYTES = 64 * 1024
 RECENT = 15
 GALLERY = 6
-HUNT_PILL = '<span class="pill hunt">hunt</span>'
-HUNT_FIGURE = ' class="hunt"'
+HUNT_PILL = '<span class="pill">hunt</span>'
 PITCH = 8  # map grid pitch in px; tiles are slightly smaller so they read as separate squares
 TILE = 6.5
 MAP_LEFT, MAP_TOP, MAP_BOTTOM = 36, 8, 28
@@ -36,7 +35,7 @@ PLATFORM_NAMES = {"windows": "Windows", "linux": "Linux", "macos": "macOS"}
 STYLE = """
 :root {
   --bg: #f6f7f5; --card: #ffffff; --fg: #1b1f1d; --muted: #66706b; --line: #e3e6e3;
-  --todo: #e4e7e4; --timed: #f59f00; --run: #4263eb; --found: #fab005; --flag: #e8590c; --accent: #2b8a3e; --hunt: #7c3aed;
+  --todo: #e4e7e4; --timed: #f59f00; --run: #4263eb; --found: #fab005; --flag: #e8590c; --accent: #2b8a3e;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #121514; --card: #1b1f1d; --fg: #e9ecea; --muted: #98a29d; --line: #2c322f; --todo: #2e3431; }
@@ -94,9 +93,6 @@ footer { color: var(--muted); font-size: 0.82rem; margin-top: 24px; }
 .gallery img { display: block; width: 100%; height: auto; border-radius: 6px; background: #222624; }
 .gallery figcaption { color: var(--muted); font-size: 0.8rem; margin-top: 6px; line-height: 1.35; }
 .gallery b { color: var(--fg); font-weight: 600; }
-.gallery figure.hunt img { outline: 3px solid var(--hunt); outline-offset: 2px; }
-.pill.hunt { background: rgba(124, 58, 237, 0.15); color: var(--hunt); }
-.hunt-title { color: var(--hunt); }
 """
 
 TOOLTIP_JS = """
@@ -268,7 +264,7 @@ def render_hunt(db: Database, scheduler: Scheduler, active: list) -> str:
         else '<p class="empty">No hunt results yet.</p>'
     )
     return (
-        '<section class="card"><h2 class="hunt-title">Symmetric hunt</h2><p class="note" style="margin:0 0 12px">'
+        '<section class="card"><h2>Symmetric hunt</h2><p class="note" style="margin:0 0 12px">'
         "Volunteers who turn on the hunt search only for tilings that look the same after a half turn. "
         "That search is much smaller, so it can reach larger sizes; if it finds a tiling, the question is "
         'answered. "Impossible" here only rules out symmetric tilings, so these results do not change the '
@@ -462,7 +458,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
 
     pictures = db.recent_pictures(GALLERY)
     figures = "".join(
-        f'<figure{HUNT_FIGURE if p.symmetric else ""}><a href="{p.url}"><img src="{p.url}" loading="lazy" '
+        f'<figure><a href="{p.url}"><img src="{p.url}" loading="lazy" '
         f'alt="{p.width} x {p.height}"></a><figcaption><b>{p.width} x {p.height}</b><br>'
         f"{escape(picture_caption(p))}<br>by {escape(p.name)}</figcaption></figure>"
         for p in pictures

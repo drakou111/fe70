@@ -72,7 +72,6 @@ def test_full_button_cycle(app, server):
     assert "go up" in app.error_var.get()
     assert app.state == State.IDLE
     app.stages_var.set("")
-    assert str(app.log.tag_cget("hunt", "foreground")) == gui.HUNT_COLOR
     app.ram_var.set("2")
     app.threads_var.set("2")
     app.url_var.set(live_server.url)

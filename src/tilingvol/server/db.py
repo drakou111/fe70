@@ -300,13 +300,15 @@ class Database:
             ).fetchall()
         return [PictureRow(f"/{r[0]}/{r[1]}.png", *r[3:9], bool(r[9])) for r in rows]
 
-    def picture(self, result_id: int) -> tuple[int, int, list] | None:
+    def picture(self, result_id: int) -> tuple[int, int, list, bool] | None:
+        """(width, height, placements, from the symmetric hunt)"""
         with self._lock:
             row = self._conn.execute(
-                "SELECT width, height, picture FROM results WHERE id = ? AND picture IS NOT NULL",
+                f"SELECT width, height, picture, {HUNT_ROW} FROM results WHERE id = ?"
+                " AND picture IS NOT NULL",
                 (result_id,),
             ).fetchone()
-        return (row[0], row[1], json.loads(row[2])) if row else None
+        return (row[0], row[1], json.loads(row[2]), bool(row[3])) if row else None
 
     def add_frame(
         self,
@@ -341,14 +343,16 @@ class Database:
                 > 0
             )
 
-    def frame(self, frame_id: int) -> tuple[int, int, int, list] | None:
-        """(border, width, height, placements)"""
+    def frame(self, frame_id: int) -> tuple[int, int, int, list, bool] | None:
+        """(border, width, height, placements, symmetric)"""
         with self._lock:
             row = self._conn.execute(
-                "SELECT border, width, height, placements FROM frames WHERE id = ?",
+                "SELECT border, width, height, placements, symmetric FROM frames WHERE id = ?",
                 (frame_id,),
             ).fetchone()
-        return (row[0], row[1], row[2], json.loads(row[3])) if row else None
+        if row is None:
+            return None
+        return row[0], row[1], row[2], json.loads(row[3]), bool(row[4])
 
     def filled_border(self, width: int, height: int, symmetric: bool = False) -> int:
         """Deepest border anyone has filled for this size (either orientation), 0 if none. A symmetric
