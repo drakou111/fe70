@@ -16,6 +16,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from tilingvol import __version__
+from tilingvol.client import tls
 from tilingvol.client.api import TIMEOUT_S, ApiClient, ServerError
 
 MAX_UPDATE_BYTES = 400 << 20
@@ -170,7 +171,7 @@ class Updater:
         )
         try:
             with (
-                urllib.request.urlopen(request, timeout=TIMEOUT_S) as response,
+                tls.urlopen(request, timeout=TIMEOUT_S) as response,
                 target.open("wb") as out,
             ):
                 while chunk := response.read(CHUNK_BYTES):

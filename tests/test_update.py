@@ -168,3 +168,30 @@ def test_no_release_and_page_links(
     with_downloads = make_live_server(sib_config, download_dir=tmp_path / "downloads")
     html = urllib.request.urlopen(with_downloads.url + "/").read().decode()
     assert f"version {NEW_VERSION}" in html and "fe70-9.9.9-windows.exe" in html
+
+
+def test_https_falls_back_to_the_system_store_only_on_certificate_errors(monkeypatch):
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    from tilingvol.client import tls
+
+    used = []
+
+    def fake_urlopen(request, timeout, context):
+        used.append(context)
+        if context is tls.BUNDLED_CONTEXT:
+            raise urllib.error.URLError(ssl.SSLCertVerificationError("expired"))
+        return "opened"
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert tls.urlopen(urllib.request.Request("https://example.test/"), 5) == "opened"
+    assert used == [tls.BUNDLED_CONTEXT, tls.SYSTEM_CONTEXT]
+
+    def unreachable(request, timeout, context):
+        raise urllib.error.URLError(ConnectionRefusedError())
+
+    monkeypatch.setattr(urllib.request, "urlopen", unreachable)
+    with pytest.raises(urllib.error.URLError):
+        tls.urlopen(urllib.request.Request("https://example.test/"), 5)

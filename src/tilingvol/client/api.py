@@ -1,4 +1,4 @@
-"""Small JSON-over-HTTP client for the coordination server (stdlib only, to keep the executable small)."""
+"""Small JSON-over-HTTP client for the coordination server (stdlib plus certifi, to keep the executable small)."""
 
 import json
 import re
@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 
 from tilingvol import __version__
+from tilingvol.client import tls
 from tilingvol.shared.pieces import PIECES
 from tilingvol.shared.protocol import Job, ResultSubmission
 
@@ -155,7 +156,7 @@ class ApiClient:
 
     def _send(self, request: urllib.request.Request) -> dict:
         try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
+            with tls.urlopen(request, timeout=TIMEOUT_S) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as error:
             try:

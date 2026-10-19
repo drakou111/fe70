@@ -1008,11 +1008,12 @@ wheels = [
 
 [[package]]
 name = "tilingvol"
-version = "0.8.1"
+version = "0.8.2"
 source = { editable = "." }
 
 [package.optional-dependencies]
 client = [
+    { name = "certifi" },
     { name = "cryptography" },
     { name = "ortools" },
     { name = "psutil" },
@@ -1032,6 +1033,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", marker = "extra == 'client'", specifier = ">=2024.2" },
     { name = "cryptography", marker = "extra == 'client'", specifier = ">=42" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.110" },
     { name = "ortools", marker = "extra == 'client'", specifier = ">=9.10" },

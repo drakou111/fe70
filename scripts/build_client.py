@@ -91,6 +91,8 @@ def build() -> None:
         str(ROOT / "src"),
         "--collect-all",
         "ortools",
+        "--collect-data",
+        "certifi",  # the root list the app checks HTTPS against (tilingvol/client/tls.py)
         "--hidden-import",
         "tilingvol.client._k",
     ]
