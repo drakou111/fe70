@@ -141,3 +141,55 @@ def test_tree_workers_need_enough_threads():
     from tilingvol.client.controller import tree_workers_for
 
     assert [tree_workers_for(t) for t in (1, 2, 3, 4, 8, 10)] == [0, 0, 0, 2, 4, 5]
+
+
+def test_wall_lemma_shortcut_drops_exactly_the_lemma1_placements():
+    from tilingvol.client.model import violates_lemma1, wall_frames
+
+    width, height = 135, 140
+    frames = wall_frames(width, height)
+    expected = set()
+    for orientation, shape in enumerate(GUN.orientations):
+        max_x = max(x for x, _ in shape)
+        max_y = max(y for _, y in shape)
+        for y0 in range(height - max_y):
+            for x0 in range(width - max_x):
+                cells = [(x0 + dx, y0 + dy) for dx, dy in shape]
+                if not any(violates_lemma1(cells, f) for f in frames):
+                    expected.add((orientation, x0, y0))
+    built = build_model(GUN, width, height, 0, False)
+    assert set(built.placement_of.values()) == expected
+
+
+def frame_status(width: int, height: int, border: int, lookahead: bool) -> str:
+    from ortools.sat.python import cp_model
+
+    solver = cp_model.CpSolver()
+    solver.parameters.num_workers = 4
+    solver.parameters.max_time_in_seconds = 60
+    built = build_model(SIBLING, width, height, border, lookahead)
+    return solver.StatusName(solver.Solve(built.model))
+
+
+def test_lookahead_keeps_its_strength():
+    # 12 x 14: its depth-3 border can be filled, but every filling leaves an interior cell no free piece fits
+    assert frame_status(12, 14, 3, lookahead=False) == "OPTIMAL"
+    assert frame_status(12, 14, 3, lookahead=True) == "INFEASIBLE"
+    assert frame_status(19, 28, 3, lookahead=True) == "OPTIMAL"  # it really tiles
+
+
+def test_lookahead_accepts_the_border_of_a_real_tiling(sibling_tiling):
+    from ortools.sat.python import cp_model
+
+    border = 3
+    built = build_model(SIBLING, 19, 28, border, True)
+    by_placement = {
+        p: v for v, p in zip(built.variables.values(), built.placement_of.values())
+    }
+    kept = [tuple(p) for p in sibling_tiling if tuple(p) in by_placement]
+    assert kept
+    for placement in kept:
+        built.model.Add(by_placement[placement] == 1)
+    solver = cp_model.CpSolver()
+    solver.parameters.num_workers = 4
+    assert solver.Solve(built.model) in (cp_model.OPTIMAL, cp_model.FEASIBLE)

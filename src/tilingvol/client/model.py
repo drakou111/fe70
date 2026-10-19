@@ -78,6 +78,28 @@ def violates_lemma1(cells_xy, frame: WallFrame) -> bool:
     return sorted(v for _, v in bump) != [1, 2, 3]
 
 
+def lemma1_bad_walls(
+    shape: list[tuple[int, int]], width: int, height: int
+) -> tuple[str, ...]:
+    """Walls this orientation must not touch. Lemma 1 depends only on distances from the wall, so one
+    touching position per wall decides it for every position along that wall, and for both directions."""
+    max_x = max(x for x, _ in shape)
+    max_y = max(y for _, y in shape)
+    corner = {
+        "bottom": (0, 0),
+        "top": (0, height - 1 - max_y),
+        "left": (0, 0),
+        "right": (width - 1 - max_x, 0),
+    }
+    bad = []
+    for wall in WALLS:
+        x0, y0 = corner[wall]
+        cells = [(x0 + dx, y0 + dy) for dx, dy in shape]
+        if violates_lemma1(cells, WallFrame(wall, False, width, height)):
+            bad.append(wall)
+    return tuple(bad)
+
+
 def canonical_corner() -> list[list[tuple[int, int]]]:
     """Lemma 3 in bottom-wall coordinates, corner at u = v = 0; S is given by its bar only."""
     p0 = [(0, v) for v in range(7)] + [(1, v) for v in (1, 2, 3)]
@@ -140,25 +162,34 @@ def build_model(
     placement_of: dict[frozenset, tuple[int, int, int]] = {}
     cover: dict[tuple[int, int], list] = {}
     use_lemmas = piece.use_wall_lemmas
-    frames = wall_frames(width, height)
     interior_candidates = []
 
     def in_frame(x: int, y: int) -> bool:
         return border == 0 or min(x, y, width - 1 - x, height - 1 - y) < border
 
+    def touches(wall: str, x0: int, y0: int, max_x: int, max_y: int) -> bool:
+        if wall == "bottom":
+            return y0 == 0
+        if wall == "top":
+            return y0 + max_y == height - 1
+        if wall == "left":
+            return x0 == 0
+        return x0 + max_x == width - 1
+
     for orientation, shape in enumerate(piece.orientations):
         max_x = max(x for x, _ in shape)
         max_y = max(y for _, y in shape)
+        bad_walls = lemma1_bad_walls(shape, width, height) if use_lemmas else ()
         for y0 in range(height - max_y):
             for x0 in range(width - max_x):
+                if bad_walls and any(
+                    touches(wall, x0, y0, max_x, max_y) for wall in bad_walls
+                ):
+                    continue
                 cells = frozenset((x0 + dx, y0 + dy) for dx, dy in shape)
                 if not any(in_frame(cx, cy) for cx, cy in cells):
                     if lookahead:
                         interior_candidates.append(cells)
-                    continue
-                if use_lemmas and any(
-                    violates_lemma1(cells, frame) for frame in frames
-                ):
                     continue
                 v = model.NewBoolVar("")
                 variables[cells] = v
@@ -175,27 +206,29 @@ def build_model(
                 model.AddAtMostOne(options)
 
     if lookahead and border:
+        # Only placements wholly inside the interior can be free: every other one overlaps a frame cell,
+        # which is covered exactly once, so its "free" literal would be false anyway.
         covered = {}
-        for y in range(height):
-            for x in range(width):
-                options = cover.get((x, y), [])
-                is_covered = model.NewBoolVar("")
+        for y in range(border, height - border):
+            for x in range(border, width - border):
+                options = cover.get((x, y))
                 if options:
+                    is_covered = model.NewBoolVar("")
                     model.Add(sum(options) == is_covered)
-                else:
-                    model.Add(is_covered == 0)
-                covered[(x, y)] = is_covered
+                    covered[(x, y)] = is_covered
         free_at: dict[tuple[int, int], list] = {}
-        for cells in list(variables) + interior_candidates:
+        for cells in interior_candidates:
             free = model.NewBoolVar("")
             for c in cells:
-                model.AddImplication(free, covered[c].Not())
-            for c in cells:
+                if c in covered:
+                    model.AddImplication(free, covered[c].Not())
                 free_at.setdefault(c, []).append(free)
-        for y in range(height):
-            for x in range(width):
-                if not in_frame(x, y):
-                    model.AddBoolOr(free_at.get((x, y), []) + [covered[(x, y)]])
+        for y in range(border, height - border):
+            for x in range(border, width - border):
+                literals = free_at.get((x, y), [])
+                if (x, y) in covered:
+                    literals.append(covered[(x, y)])
+                model.AddBoolOr(literals)
 
     if use_lemmas:
         for alternatives in corner_options(width, height):

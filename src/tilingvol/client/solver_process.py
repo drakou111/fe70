@@ -108,6 +108,8 @@ def _run_stages(task: SolverTask, queue) -> None:
             for cells, v in built.variables.items()
             if solver.Value(v)
         ]
+        # free this stage's model before the next one is built, so two never share the RAM
+        del built, solver
         if stage.border == 0:
             queue.put((MSG_POSSIBLE, index, placements))
             return
