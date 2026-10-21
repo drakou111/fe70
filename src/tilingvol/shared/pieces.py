@@ -85,7 +85,7 @@ SIBLING = PieceSpec(
     cells=normalize([(x, 0) for x in range(5)] + [(1, 1), (2, 1)]),
     min_side=10,
     max_side=40,
-    dead_sides=frozenset({142}),
+    dead_sides=frozenset(),
     use_wall_lemmas=False,
     gun_coloring=False,
 )
