@@ -33,8 +33,8 @@ def test_gun_admissibility_matches_research_rule():
 
 def test_gun_candidates_skip_exactly_dead_sides():
     sizes = GUN.candidate_sizes()
-    assert (135, 184) in sizes
-    assert all(136 not in s and min(s) >= 135 for s in sizes)
+    assert (138, 140) in sizes
+    assert all(min(s) >= 137 for s in sizes)
 
 
 def solve_sibling(width: int, height: int) -> list[list[int]]:

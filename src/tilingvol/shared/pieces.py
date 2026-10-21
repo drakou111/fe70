@@ -72,9 +72,9 @@ class PieceSpec:
 GUN = PieceSpec(
     name="gun",
     cells=normalize([(x, 0) for x in range(7)] + [(1, 1), (2, 1), (3, 1)]),
-    min_side=135,
+    min_side=137,
     max_side=240,
-    dead_sides=frozenset({136}),
+    dead_sides=frozenset(),
     use_wall_lemmas=True,
     gun_coloring=True,
 )
