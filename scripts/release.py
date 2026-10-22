@@ -3,7 +3,9 @@ release/latest.json. Upload the contents of release/ to the Pi's download folder
 
 Builds for other systems (from the GitHub workflow) can be dropped into release/ under their names
 (fe70-<version>-linux, fe70-<version>-macos.zip) and are signed in the same run;
-set TILINGVOL_SKIP_BUILD=1 to only sign. Run: uv run python scripts/release.py"""
+set TILINGVOL_SKIP_BUILD=1 to only sign. A version that was already built is never rebuilt: apps only
+update to a higher version, so a second build under the same number would never reach those who have the
+first. Bump __version__ instead. Run: uv run python scripts/release.py"""
 
 import hashlib
 import json
@@ -83,6 +85,12 @@ def main() -> None:
     key = load_private_key()
     RELEASE_DIR.mkdir(exist_ok=True)
     if os.environ.get("TILINGVOL_SKIP_BUILD") != "1":
+        existing = RELEASE_DIR / release_name(current_platform())
+        if existing.exists():
+            raise SystemExit(
+                f"{existing.name} was already built; apps that have it would never update to a rebuild. "
+                f"Raise __version__ in src/tilingvol/__init__.py (and pyproject.toml), then run this again."
+            )
         build_this_platform()
     platforms = {}
     for platform in SUFFIXES:
