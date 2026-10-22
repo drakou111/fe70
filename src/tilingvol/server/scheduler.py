@@ -278,24 +278,50 @@ class Scheduler:
         depths = (first + i * config.strip_step for i in range(config.strip_stages))
         return tuple(d for d in depths if d <= MAX_STRIP_ROWS)
 
-    def _wants_strip(self, active) -> bool:
-        lanes = [
-            j.lane for j in active if j.lane in (LANE_AREA, LANE_BATTLE, LANE_STRIP)
-        ]
-        strips = lanes.count(LANE_STRIP)
-        return (strips + 1) / (len(lanes) + 1) <= self.config.strip_share
-
     def _pick_strip(
         self,
         active,
         max_ram_mb: int,
         max_threads: int,
-        factor: float,
-        failures: dict,
         no_time_limit: bool,
-    ) -> Assignment | None:
+        requested_width: int | None,
+    ) -> Assignment:
         states = self.width_states()
         leased = {j.width for j in active if j.lane == LANE_STRIP}
+        factor = self.ram_factor(self.db.results("all"))
+        failures = self.db.memory_failures()
+        reach = self.piece.strip_reach
+        limit = self.config.stage_time_limit_s
+
+        def fit(w: int, depths: tuple[int, ...]) -> tuple[int, int] | None:
+            failed = failures.get((w, depths[-1]), 0)
+            return self.fit_threads(
+                w, depths[-1] + reach, max_ram_mb, max_threads, factor, failed
+            )
+
+        def assignment(
+            w: int, depths: tuple[int, ...], lane: str, threads_ram
+        ) -> Assignment:
+            stages = tuple(Stage(0, False, limit, strip_rows=d) for d in depths)
+            return Assignment(w, depths[-1], lane, *threads_ram, stages)
+
+        if requested_width is not None:
+            w = requested_width
+            state = states.get(w)
+            if not 1 <= w <= self.config.request_max_side:
+                raise RequestRefused(
+                    f"widths are limited to {self.config.request_max_side}"
+                )
+            if w < self.piece.min_side or w in self.dead_widths(states):
+                raise RequestRefused(f"width {w} is already ruled out")
+            if w in leased:
+                raise RequestRefused(f"width {w} is being run by someone right now")
+            depths = self.strip_depths(state)
+            threads_ram = fit(w, depths) if depths else None
+            if threads_ram is None:
+                raise RequestRefused(f"width {w} needs more RAM than {max_ram_mb} MB")
+            return assignment(w, depths, LANE_STRIP, threads_ram)
+
         candidates = []
         for w in self.strip_widths():
             state = states.get(w)
@@ -310,21 +336,13 @@ class Scheduler:
             depths = self.strip_depths(state)
             if depths:
                 candidates.append((w * depths[0], w, depths))
-        reach = self.piece.strip_reach
-        limit = self.config.stage_time_limit_s
         for _, w, depths in sorted(candidates):
-            fit = self.fit_threads(
-                w,
-                depths[-1] + reach,
-                max_ram_mb,
-                max_threads,
-                factor,
-                failures.get((w, depths[-1]), 0),
-            )
-            if fit is not None:
-                stages = tuple(Stage(0, False, limit, strip_rows=d) for d in depths)
-                return Assignment(w, depths[-1], LANE_STRIP, *fit, stages)
-        return None
+            threads_ram = fit(w, depths)
+            if threads_ram is not None:
+                return assignment(w, depths, LANE_STRIP, threads_ram)
+        if candidates:
+            raise NoAssignment(f"no open width fits in {max_ram_mb} MB")
+        raise NoAssignment("every width in range is ruled out or running")
 
     # stages
     def stages_for(
@@ -462,14 +480,21 @@ class Scheduler:
         no_time_limit: bool = False,
         hunt: bool = False,
         custom_borders: tuple[int, ...] = (),
-        strips_ok: bool = False,
+        strip: bool = False,
+        requested_width: int | None = None,
     ) -> Assignment:
+        """strip: a half-strip width (requested_width, or the cheapest open one); otherwise a rectangle
+        size, or a size for the symmetric hunt."""
         self.expire_leases()
-        results = self.db.results()
-        summaries = self.summaries(results)
         active = self.db.active_jobs()
         if sum(1 for j in active if j.ip == ip) >= self.config.max_active_jobs_per_ip:
             raise RequestRefused("too many sizes are already running from your network")
+        if strip:
+            return self._pick_strip(
+                active, max_ram_mb, max_threads, no_time_limit, requested_width
+            )
+        results = self.db.results()
+        summaries = self.summaries(results)
         # the main search and the hunt keep separate books; a size settled by the main search (or a tiling
         # found by the hunt) is closed for both
         if hunt:
@@ -495,13 +520,6 @@ class Scheduler:
                 requested, pool, leased, max_ram_mb, max_threads, factor, failures
             )
             return assign(key, LANE_REQUESTED, fit)
-
-        if not hunt and strips_ok and self._wants_strip(active):
-            strip = self._pick_strip(
-                active, max_ram_mb, max_threads, factor, failures, no_time_limit
-            )
-            if strip is not None:
-                return strip
 
         def available(key: tuple[int, int]) -> bool:
             s = pool.get(key)

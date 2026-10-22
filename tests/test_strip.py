@@ -89,7 +89,6 @@ def test_the_client_rejects_malformed_strip_jobs():
 def strip_config(sib_config):
     return replace(
         sib_config,
-        strip_share=1.0,
         strip_first_rows=4,
         strip_step=4,
         strip_stages=2,
@@ -102,8 +101,11 @@ def strip_client(strip_config):
         yield c
 
 
-def request(client, version=STRIP_SINCE, size=None, no_time_limit=False):
+def request(
+    client, version=STRIP_SINCE, size=None, no_time_limit=False, search="width"
+):
     body = {
+        "search": search,
         "name": NAME,
         "max_ram_mb": 8192,
         "max_threads": 4,
@@ -123,10 +125,28 @@ def test_strip_jobs_go_to_new_apps_only_cheapest_width_first(strip_client):
     assert (first["width"], second["width"]) == (10, 11)
     assert [s["strip_rows"] for s in first["stages"]] == [4, 8]
     assert first["height"] == 8
-    old = request(strip_client, version="0.9.0").json()
+    board = request(strip_client, search="board").json()
+    assert board["lane"] != "strip" and not any(
+        s["strip_rows"] for s in board["stages"]
+    )
+    old = request(strip_client, version="0.9.0", search=None).json()
     assert old["lane"] != "strip" and not any(
         s.get("strip_rows") for s in old["stages"]
     )
+    too_old = request(strip_client, version="0.9.0")
+    assert too_old.status_code == 426
+    assert request(strip_client, search="nonsense").status_code == 422
+
+
+def test_a_volunteer_can_ask_for_one_width(strip_client, submit_key):
+    job = request(strip_client, size=(17, None)).json()
+    assert (job["lane"], job["width"]) == ("strip", 17)
+    taken = request(strip_client, size=(17, None))
+    assert taken.status_code == 409 and "being run" in taken.text
+    post_result(strip_client, submission(submit_key, job, "impossible", 0, 3.0))
+    dead = request(strip_client, size=(17, None))
+    assert dead.status_code == 409 and "ruled out" in dead.text
+    assert request(strip_client, size=(9, None)).status_code == 409
 
 
 def test_a_ruled_out_width_leaves_the_map(strip_client, submit_key):
@@ -136,9 +156,9 @@ def test_a_ruled_out_width_leaves_the_map(strip_client, submit_key):
     post_result(strip_client, body)
     states = strip_client.get("/api/strips").json()["widths"]
     assert {"width": 10, "dead_rows": 4, "dead_by": NAME}.items() <= states[0].items()
-    refused = request(strip_client, size=(10, 14))
+    refused = request(strip_client, size=(10, 14), search="board")
     assert refused.status_code == 409 and "excluded" in refused.text
-    rect = request(strip_client, version="0.9.0").json()
+    rect = request(strip_client, search="board").json()
     assert 10 not in (rect["width"], rect["height"])
     page = strip_client.get("/").text
     assert "Widths ruled out" in page and "RULED OUT, the first 4 rows" in page
@@ -194,7 +214,7 @@ def strip_scheduler(config, results: list[tuple[int, int, str]]) -> Scheduler:
 def pick_strip(scheduler: Scheduler, no_time_limit: bool = False):
     """Pick and lease, as the server does."""
     a = scheduler.pick(
-        NAME, "1.2.3.4", 8192, 4, None, no_time_limit=no_time_limit, strips_ok=True
+        NAME, "1.2.3.4", 8192, 4, None, no_time_limit=no_time_limit, strip=True
     )
     stages = [s.to_dict() for s in a.stages]
     scheduler.db.add_job(
@@ -261,7 +281,7 @@ def test_a_real_run_rules_out_widths_and_sends_pictures(
 ):
     server = make_live_server(strip_config)
     c, recorder = controller
-    c.start(settings(server.url))
+    c.start(replace(settings(server.url), search="width"))
     wait_for(lambda: server.db.strip_fills(), 120)
     c.stop()
     dead = {r.width for r in server.db.strip_results() if r.verdict == "impossible"}

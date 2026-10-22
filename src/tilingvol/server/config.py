@@ -58,10 +58,9 @@ class ServerConfig:
     border_step: int = 2
     border_increments: int = 2
     stage_time_limit_s: float = 10800.0
-    # half-strip depth jobs: the share of searches that get one (apps from STRIP_SINCE on), the first depth
-    # of an untried width, the step between depths, the depths per job, and how many timeouts send a width
-    # to volunteers without a time limit only
-    strip_share: float = 0.0
+    # half-strip depth jobs (volunteers who chose "width"): the first depth of an untried width, the step
+    # between depths, the depths per job, and how many timeouts send a width to volunteers without a time
+    # limit only
     strip_first_rows: int = 24
     strip_step: int = 8
     strip_stages: int = 6
@@ -120,7 +119,6 @@ class ServerConfig:
             stage_time_limit_s=float(
                 os.environ.get("TILINGVOL_STAGE_TIME_LIMIT_S", "10800")
             ),
-            strip_share=float(os.environ.get("TILINGVOL_STRIP_SHARE", "1.0")),
             strip_first_rows=int(os.environ.get("TILINGVOL_STRIP_FIRST_ROWS", "24")),
             strip_step=int(os.environ.get("TILINGVOL_STRIP_STEP", "8")),
             strip_stages=int(os.environ.get("TILINGVOL_STRIP_STAGES", "6")),

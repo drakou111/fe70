@@ -22,6 +22,11 @@ LANE_HUNT = "hunt"  # 180-degree symmetric tilings only; its "impossible" proves
 # half-strip depth: can rows 0..h-1 of the width-W half-strip be covered? "impossible" rules out every
 # rectangle with a side W (research repo, FIVE_DIVISIBLE_SIDE.md); apps before STRIP_SINCE cannot run it
 LANE_STRIP = "strip"
+# what a volunteer chose to run (apps from STRIP_SINCE on send it; older ones send only the hunt flag)
+SEARCH_BOARD = "board"  # rectangle sizes
+SEARCH_WIDTH = "width"  # half-strip widths
+SEARCH_SYMMETRIC = "symmetric"  # the symmetric hunt
+SEARCHES = (SEARCH_BOARD, SEARCH_WIDTH, SEARCH_SYMMETRIC)
 STRIP_SINCE = "0.10.0"
 MAX_STRIP_ROWS = 1000
 SYMMETRIC_TAG_PREFIX = "sym"

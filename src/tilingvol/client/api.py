@@ -8,7 +8,13 @@ import urllib.request
 from tilingvol import __version__
 from tilingvol.client import tls
 from tilingvol.shared.pieces import PIECES
-from tilingvol.shared.protocol import MAX_STRIP_ROWS, Job, ResultSubmission
+from tilingvol.shared.protocol import (
+    MAX_STRIP_ROWS,
+    SEARCH_BOARD,
+    SEARCH_SYMMETRIC,
+    Job,
+    ResultSubmission,
+)
 
 TIMEOUT_S = 30
 MAX_RESPONSE_BYTES = 1 << 20
@@ -86,7 +92,7 @@ class ApiClient:
         width: int | None = None,
         height: int | None = None,
         no_time_limit: bool = False,
-        hunt: bool = False,
+        search: str = SEARCH_BOARD,
         custom_borders: tuple[int, ...] = (),
     ) -> Job:
         body = {
@@ -97,7 +103,9 @@ class ApiClient:
             "width": width,
             "height": height,
             "no_time_limit": no_time_limit,
-            "hunt": hunt,
+            "search": search,
+            "hunt": search
+            == SEARCH_SYMMETRIC,  # servers before 0.10 only know this flag
             "custom_stages": list(custom_borders),
         }
         try:

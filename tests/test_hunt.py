@@ -189,7 +189,7 @@ def test_hunt_finds_a_symmetric_tiling_end_to_end(live_server, tmp_path, submit_
     c.launch()
     try:
         c.start(
-            replace(settings(live_server.url), symmetric_hunt=True),
+            replace(settings(live_server.url), search="symmetric"),
             requested=SYMMETRIC_SIZE,
         )
         wait_for(lambda: live_server.db.solution(*SYMMETRIC_SIZE) is not None, 120)

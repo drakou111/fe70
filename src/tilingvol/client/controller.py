@@ -41,6 +41,7 @@ from tilingvol.shared.protocol import (
     RELEASE_ERROR,
     RELEASE_GAVE_UP,
     RELEASE_MEMORY,
+    SEARCH_WIDTH,
     VERDICT_FILLED,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
@@ -267,7 +268,9 @@ class Controller:
         self._commands: queue.Queue = queue.Queue()
         self._state = State.IDLE
         self._settings: Settings | None = None
-        self._requested: tuple[int, int] | None = None
+        self._requested: tuple[int, int | None] | None = (
+            None  # (width, None): a strip width
+        )
         self._api: ApiClient | None = None
         self._job: Job | None = None
         self._filled_stage = (
@@ -299,7 +302,7 @@ class Controller:
 
     # commands, safe to call from any thread
     def start(
-        self, settings: Settings, requested: tuple[int, int] | None = None
+        self, settings: Settings, requested: tuple[int, int | None] | None = None
     ) -> None:
         self._commands.put(("start", settings, requested))
 
@@ -426,7 +429,7 @@ class Controller:
                 width,
                 height,
                 settings.no_time_limit,
-                settings.symmetric_hunt,
+                settings.search,
                 settings.custom_borders,
             )
         except NoJobAvailable as error:
@@ -455,6 +458,10 @@ class Controller:
         if settings.symmetric_hunt and not job.hunt:
             self._log(
                 "This server does not run the symmetric hunt yet, so this is an ordinary size."
+            )
+        if settings.search == SEARCH_WIDTH and not job.strip:
+            self._log(
+                "This server does not hand out strip widths yet, so this is a rectangle size."
             )
         if job.strip:
             self._log(

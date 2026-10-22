@@ -7,7 +7,12 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from tilingvol.client.memory_guard import installed_ram_mb
-from tilingvol.shared.protocol import parse_custom_stages
+from tilingvol.shared.protocol import (
+    SEARCH_SYMMETRIC,
+    SEARCH_WIDTH,
+    SEARCHES,
+    parse_custom_stages,
+)
 
 DEV_SERVER_URL = "http://127.0.0.1:8000"
 
@@ -72,9 +77,9 @@ class Settings:
     no_time_limit: bool = False
     # let half the threads do CP-SAT's tree search, which reports progress (may change the speed)
     tree_progress: bool = False
-    # search only 180-degree symmetric tilings (finds a tiling sooner if one is symmetric; its
-    # "impossible" rules out symmetric tilings only)
-    symmetric_hunt: bool = False
+    # what to run: rectangle sizes ("board"), half-strip widths ("width"), or the symmetric hunt, which
+    # searches only 180-degree symmetric tilings (its "impossible" rules out symmetric tilings only)
+    search: str = SEARCH_WIDTH
     # own border depths, e.g. "24, 28, 32"; the full search always follows. Empty: the server's stages
     custom_stages: str = ""
 
@@ -107,6 +112,8 @@ class Settings:
         token = self.access_token.strip()
         if token and not token.isprintable():
             raise ValueError("the access token contains unprintable characters")
+        if self.search not in SEARCHES:
+            raise ValueError(f"unknown search {self.search!r}")
         depths = parse_custom_stages(self.custom_stages)
         return replace(
             self,
@@ -115,6 +122,10 @@ class Settings:
             access_token=token,
             custom_stages=", ".join(str(d) for d in depths),
         )
+
+    @property
+    def symmetric_hunt(self) -> bool:
+        return self.search == SEARCH_SYMMETRIC
 
     @property
     def custom_borders(self) -> tuple[int, ...]:
@@ -139,6 +150,10 @@ class SettingsStore:
         if not self.path.exists():
             return base
         data = json.loads(self.path.read_text(encoding="utf-8"))
+        if (
+            data.get("symmetric_hunt") and "search" not in data
+        ):  # saved by version 0.9 or older
+            data["search"] = SEARCH_SYMMETRIC
         known = {k: v for k, v in data.items() if k in Settings.__dataclass_fields__}
         return replace(base, **known)
 

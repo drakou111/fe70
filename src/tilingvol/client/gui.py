@@ -33,6 +33,7 @@ from tilingvol.client.update import (
 )
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.pieces import piece_by_name
+from tilingvol.shared.protocol import SEARCH_BOARD, SEARCH_SYMMETRIC, SEARCH_WIDTH
 
 APP_TITLE = "fe70"
 PUMP_MS = 200
@@ -45,6 +46,18 @@ APP_EVENT = -1  # events that belong to the window, not to one search
 SHUTDOWN_TIMEOUT_S = 20.0
 PICTURE_MAX_PX = 240
 HUNT_PICTURE_PREFIX = "sym"
+SEARCH_LABELS = {
+    SEARCH_WIDTH: "Strip widths",
+    SEARCH_BOARD: "Rectangle sizes (board)",
+    SEARCH_SYMMETRIC: "Symmetric hunt",
+}
+SEARCH_HINTS = {
+    SEARCH_WIDTH: "Fill a half-strip of one width deeper and deeper. If a depth cannot be filled, no "
+    "rectangle has that side at any height, so a whole row and column of the board is ruled out.",
+    SEARCH_BOARD: "Search one rectangle size completely: impossible, or a tiling.",
+    SEARCH_SYMMETRIC: "Search only tilings that look the same after a half turn: much faster, and it "
+    "finds a tiling if a symmetric one exists; its 'impossible' rules out symmetric tilings only.",
+}
 BUTTON_HELP_DEFAULT = "Point at a button to see what it does."
 BUTTON_HELP = {
     "start": "Start: get a size from the server and search it, then the next one, until you stop.",
@@ -125,7 +138,9 @@ class App:
         self.token_var = tk.StringVar(value=settings.access_token)
         self.no_limit_var = tk.BooleanVar(value=settings.no_time_limit)
         self.tree_var = tk.BooleanVar(value=settings.tree_progress)
-        self.hunt_var = tk.BooleanVar(value=settings.symmetric_hunt)
+        self.search_var = tk.StringVar(value=SEARCH_LABELS[settings.search])
+        self.search_hint_var = tk.StringVar()
+        self.request_label_var = tk.StringVar()
         self.stages_var = tk.StringVar(value=settings.custom_stages)
         self.width_var = tk.StringVar()
         self.height_var = tk.StringVar()
@@ -169,6 +184,22 @@ class App:
         for var in (self.ram_var, self.threads_var, self.parallel_var):
             var.trace_add("write", lambda *_: self._show_share())
         self._show_share()
+        ttk.Label(form, text="Search").grid(row=4, column=0, sticky="w", pady=2)
+        self.search_box = ttk.Combobox(
+            form,
+            textvariable=self.search_var,
+            values=list(SEARCH_LABELS.values()),
+            state="readonly",
+            width=26,
+        )
+        self.search_box.grid(row=4, column=1, columnspan=2, sticky="w", pady=2)
+        self.search_box.bind("<<ComboboxSelected>>", lambda _e: self._apply_search())
+        ttk.Label(
+            form,
+            textvariable=self.search_hint_var,
+            foreground="#66706b",
+            wraplength=520,
+        ).grid(row=5, column=0, columnspan=3, sticky="w")
         form.columnconfigure(2, weight=1)
 
         self.advanced_shown = tk.BooleanVar(value=False)
@@ -204,13 +235,6 @@ class App:
             variable=self.tree_var,
         )
         self.tree_check.grid(row=4, column=0, columnspan=4, sticky="w", pady=2)
-        self.hunt_check = ttk.Checkbutton(
-            self.advanced,
-            text="Symmetric hunt: search only tilings that look the same after a half turn (much faster, "
-            "finds a tiling if a symmetric one exists; its 'impossible' rules out symmetric tilings only)",
-            variable=self.hunt_var,
-        )
-        self.hunt_check.grid(row=5, column=0, columnspan=4, sticky="w", pady=2)
         ttk.Label(self.advanced, text="Custom stages").grid(
             row=6, column=0, sticky="w", pady=2
         )
@@ -225,7 +249,7 @@ class App:
             foreground="#66706b",
             wraplength=520,
         ).grid(row=7, column=0, columnspan=4, sticky="w")
-        ttk.Label(self.advanced, text="Request a size (optional)").grid(
+        ttk.Label(self.advanced, textvariable=self.request_label_var).grid(
             row=1, column=0, sticky="w", pady=2
         )
         self.width_entry = ttk.Entry(
@@ -305,6 +329,24 @@ class App:
         self.log.pack(fill="both", expand=True, pady=(8, 0))
         self._apply_state(State.IDLE)
 
+    def _search(self) -> str:
+        label = self.search_var.get()
+        return next(k for k, v in SEARCH_LABELS.items() if v == label)
+
+    def _apply_search(self) -> None:
+        """Fields that mean nothing for the chosen search are greyed out (only while idle)."""
+        search = self._search()
+        self.search_hint_var.set(SEARCH_HINTS[search])
+        width = search == SEARCH_WIDTH
+        self.request_label_var.set(
+            "Request a width (optional)" if width else "Request a size (optional)"
+        )
+        if self.state != State.IDLE:
+            return
+        state = "disabled" if width else "normal"
+        self.height_entry.configure(state=state)
+        self.stages_entry.configure(state=state)
+
     def _button_help(self, key: str) -> str:
         if key == "pause" and self.state == State.PAUSED:
             return BUTTON_HELP["resume"]
@@ -341,7 +383,7 @@ class App:
                 access_token=self.token_var.get(),
                 no_time_limit=self.no_limit_var.get(),
                 tree_progress=self.tree_var.get(),
-                symmetric_hunt=self.hunt_var.get(),
+                search=self._search(),
                 custom_stages=self.stages_var.get(),
             ).validated()
             requested = self._requested_size()
@@ -386,8 +428,14 @@ class App:
             controller.launch()
             self.slots.append(controller)
 
-    def _requested_size(self) -> tuple[int, int] | None:
+    def _requested_size(self) -> tuple[int, int | None] | None:
         w, h = self.width_var.get().strip(), self.height_var.get().strip()
+        if self._search() == SEARCH_WIDTH:
+            if not w:
+                return None
+            if not w.isdigit():
+                raise ValueError("a requested width must be a whole number")
+            return int(w), None
         if not w and not h:
             return None
         if not (w.isdigit() and h.isdigit()):
@@ -640,12 +688,13 @@ class App:
             self.token_entry,
             self.no_limit_check,
             self.tree_check,
-            self.hunt_check,
             self.stages_entry,
             self.width_entry,
             self.height_entry,
         ):
             entry.configure(state=field_state)
+        self.search_box.configure(state="readonly" if idle else "disabled")
+        self._apply_search()
 
 
 def main() -> None:

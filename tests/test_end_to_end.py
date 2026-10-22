@@ -10,7 +10,7 @@ from tests.conftest import wait_for
 from tilingvol.client.controller import Controller, SolverRunner, State
 from tilingvol.client.settings import PendingResults, Settings
 from tilingvol.shared.pieces import GUN
-from tilingvol.shared.protocol import Job, Stage
+from tilingvol.shared.protocol import SEARCH_BOARD, Job, Stage
 
 NAME = "e2e"
 
@@ -48,7 +48,11 @@ def controller(tmp_path, submit_key):
 
 def settings(url: str, ram_mb: int = 4096, threads: int = 2) -> Settings:
     return Settings(
-        name=NAME, max_ram_mb=ram_mb, max_threads=threads, server_url=url
+        name=NAME,
+        max_ram_mb=ram_mb,
+        max_threads=threads,
+        server_url=url,
+        search=SEARCH_BOARD,
     ).validated()
 
 

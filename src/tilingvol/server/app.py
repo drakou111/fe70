@@ -31,6 +31,9 @@ from tilingvol.shared.protocol import (
     MAX_CUSTOM_STAGES,
     NO_LIMIT,
     RELEASE_REASONS,
+    SEARCH_SYMMETRIC,
+    SEARCH_WIDTH,
+    SEARCHES,
     STRIP_SINCE,
     SYMMETRIC_TAG_PREFIX,
     VERDICT_FILLED,
@@ -73,6 +76,8 @@ class JobRequest(BaseModel):
     height: int | None = Field(default=None, ge=1, le=10_000)
     no_time_limit: bool = False  # the volunteer searches each stage until it is decided
     hunt: bool = False  # only 180-degree symmetric tilings (its "impossible" never settles a size)
+    # board, width or symmetric (apps from STRIP_SINCE on); None: an older app, which sends only `hunt`
+    search: str | None = Field(default=None, max_length=12)
     # the volunteer's own border depths, rising; the full search always follows
     custom_stages: list[int] = Field(default=[], max_length=MAX_CUSTOM_STAGES)
 
@@ -213,8 +218,19 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             b <= a for a, b in itertools.pairwise(custom)
         ):
             raise HTTPException(422, "custom stages must be rising border depths")
+        if body.search is not None and body.search not in SEARCHES:
+            raise HTTPException(422, f"search must be one of {', '.join(SEARCHES)}")
+        hunt = body.hunt if body.search is None else body.search == SEARCH_SYMMETRIC
+        strip = body.search == SEARCH_WIDTH
+        if strip and version_tuple(body.client_version) < version_tuple(STRIP_SINCE):
+            raise HTTPException(
+                426, f"strip widths need version {STRIP_SINCE} or newer"
+            )
         requested = None
-        if body.width is not None or body.height is not None:
+        requested_width = None
+        if strip:
+            requested_width = body.width
+        elif body.width is not None or body.height is not None:
             if body.width is None or body.height is None:
                 raise HTTPException(422, "give both width and height")
             requested = (body.width, body.height)
@@ -227,10 +243,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     body.max_threads,
                     requested,
                     no_time_limit=body.no_time_limit,
-                    hunt=body.hunt,
+                    hunt=hunt,
                     custom_borders=tuple(body.custom_stages),
-                    strips_ok=version_tuple(body.client_version)
-                    >= version_tuple(STRIP_SINCE),
+                    strip=strip,
+                    requested_width=requested_width,
                 )
             except NoAssignment as error:
                 raise HTTPException(404, str(error)) from error
@@ -281,9 +297,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "heartbeat_interval_s": config.heartbeat_interval_s,
             "filled_border": 0
             if assignment.lane == LANE_STRIP
-            else db.filled_border(
-                assignment.width, assignment.height, symmetric=body.hunt
-            ),
+            else db.filled_border(assignment.width, assignment.height, symmetric=hunt),
         }
 
     @app.post("/api/jobs/{job_id}/heartbeat")
