@@ -2,7 +2,11 @@
 
 Two lanes, as in the research sweep: "area" (smallest area first, raises the area bound) and "battle"
 (nearest to slow settled misses, which on the sibling piece were the only misses next to tileable sizes).
-Timed-out sizes do not steer the battle lane, so it cannot chase its own timeouts."""
+Timed-out sizes do not steer the battle lane, so it cannot chase its own timeouts.
+
+A third lane, "strip", hands out half-strip depth searches: one width per searcher, at rising depths. A
+depth that cannot be covered rules out every rectangle with that side, so the width leaves the map. The
+cheapest width goes first: smallest width x next depth."""
 
 import math
 import re
@@ -11,9 +15,12 @@ import time
 from dataclasses import dataclass, field, replace
 
 from tilingvol.server.config import ServerConfig
-from tilingvol.server.db import Database, ResultRow
+from tilingvol.server.db import Database, ResultRow, StripFillRow, StripResultRow
 from tilingvol.shared.protocol import (
     LANE_HUNT,
+    LANE_STRIP,
+    MAX_STRIP_ROWS,
+    VERDICT_FILLED,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
@@ -57,6 +64,55 @@ class Assignment:
     threads: int
     est_ram_mb: int
     stages: tuple[Stage, ...] = ()
+
+
+@dataclass(frozen=True)
+class WidthState:
+    """What is known about one half-strip width."""
+
+    width: int
+    dead_rows: int | None = (
+        None  # the smallest depth proved impossible: no rectangle has this side
+    )
+    dead_by: str = ""
+    filled_rows: int = 0  # the deepest depth known to be coverable
+    filled_by: str = ""
+    timeouts: tuple[int, ...] = ()  # depths whose search timed out
+
+    @property
+    def dead(self) -> bool:
+        return self.dead_rows is not None
+
+
+def width_states(
+    strip_results: list[StripResultRow], fills: list[StripFillRow]
+) -> dict[int, WidthState]:
+    dead: dict[int, tuple[int, str]] = {}
+    filled: dict[int, tuple[int, str]] = {}
+    timeouts: dict[int, list[int]] = {}
+    for r in strip_results:
+        if r.verdict == VERDICT_IMPOSSIBLE:
+            if r.width not in dead or r.rows < dead[r.width][0]:
+                dead[r.width] = (r.rows, r.name)
+        elif r.verdict == VERDICT_FILLED:
+            if r.rows > filled.get(r.width, (0, ""))[0]:
+                filled[r.width] = (r.rows, r.name)
+        elif r.verdict == VERDICT_TIMED_OUT:
+            timeouts.setdefault(r.width, []).append(r.rows)
+    for f in fills:
+        if f.rows > filled.get(f.width, (0, ""))[0]:
+            filled[f.width] = (f.rows, f.name)
+    return {
+        w: WidthState(
+            w,
+            dead[w][0] if w in dead else None,
+            dead[w][1] if w in dead else "",
+            filled.get(w, (0, ""))[0],
+            filled.get(w, (0, ""))[1],
+            tuple(sorted(timeouts.get(w, ()))),
+        )
+        for w in sorted(set(dead) | set(filled) | set(timeouts))
+    }
 
 
 @dataclass
@@ -192,6 +248,83 @@ class Scheduler:
         return duration_s < self.config.fast_flag_factor * trend_seconds(
             trend, width * height
         )
+
+    # half-strip widths
+    def width_states(self) -> dict[int, WidthState]:
+        return width_states(self.db.strip_results(), self.db.strip_fills())
+
+    def dead_widths(self, states: dict[int, WidthState] | None = None) -> set[int]:
+        """Sides no rectangle can have, beyond those below piece.min_side."""
+        states = self.width_states() if states is None else states
+        return set(self.piece.dead_sides) | {w for w, s in states.items() if s.dead}
+
+    def is_dead(self, key: tuple[int, int], dead: set[int] | None = None) -> bool:
+        dead = self.dead_widths() if dead is None else dead
+        return self.piece.exact_dead(*key) or key[0] in dead or key[1] in dead
+
+    def strip_widths(self) -> list[int]:
+        return [
+            w
+            for w in range(self.piece.min_side, self.piece.max_side + 1)
+            if w not in self.piece.dead_sides
+        ]
+
+    def strip_depths(self, state: WidthState | None) -> tuple[int, ...]:
+        """The next depths to try: past the deepest filling and past every depth that timed out (a
+        deeper depth that cannot be covered proves just as much)."""
+        config = self.config
+        base = max((state.filled_rows, *state.timeouts)) if state else 0
+        first = base + config.strip_step if base else config.strip_first_rows
+        depths = (first + i * config.strip_step for i in range(config.strip_stages))
+        return tuple(d for d in depths if d <= MAX_STRIP_ROWS)
+
+    def _wants_strip(self, active) -> bool:
+        lanes = [
+            j.lane for j in active if j.lane in (LANE_AREA, LANE_BATTLE, LANE_STRIP)
+        ]
+        strips = lanes.count(LANE_STRIP)
+        return (strips + 1) / (len(lanes) + 1) <= self.config.strip_share
+
+    def _pick_strip(
+        self,
+        active,
+        max_ram_mb: int,
+        max_threads: int,
+        factor: float,
+        failures: dict,
+        no_time_limit: bool,
+    ) -> Assignment | None:
+        states = self.width_states()
+        leased = {j.width for j in active if j.lane == LANE_STRIP}
+        candidates = []
+        for w in self.strip_widths():
+            state = states.get(w)
+            if w in leased or (state is not None and state.dead):
+                continue
+            if (
+                state is not None
+                and len(state.timeouts) >= self.config.strip_max_timeouts
+                and not no_time_limit
+            ):
+                continue
+            depths = self.strip_depths(state)
+            if depths:
+                candidates.append((w * depths[0], w, depths))
+        reach = self.piece.strip_reach
+        limit = self.config.stage_time_limit_s
+        for _, w, depths in sorted(candidates):
+            fit = self.fit_threads(
+                w,
+                depths[-1] + reach,
+                max_ram_mb,
+                max_threads,
+                factor,
+                failures.get((w, depths[-1]), 0),
+            )
+            if fit is not None:
+                stages = tuple(Stage(0, False, limit, strip_rows=d) for d in depths)
+                return Assignment(w, depths[-1], LANE_STRIP, *fit, stages)
+        return None
 
     # stages
     def stages_for(
@@ -329,6 +462,7 @@ class Scheduler:
         no_time_limit: bool = False,
         hunt: bool = False,
         custom_borders: tuple[int, ...] = (),
+        strips_ok: bool = False,
     ) -> Assignment:
         self.expire_leases()
         results = self.db.results()
@@ -346,10 +480,11 @@ class Scheduler:
         leased = {
             (min(j.width, j.height), max(j.width, j.height))
             for j in active
-            if (j.lane == LANE_HUNT) == hunt
+            if (j.lane == LANE_HUNT) == hunt and j.lane != LANE_STRIP
         }
         factor = self.ram_factor(self.db.results("all"))
         failures = self.db.memory_failures()
+        dead = self.dead_widths()
 
         def assign(key: tuple[int, int], lane: str, fit: tuple[int, int]) -> Assignment:
             stages = self.stages_for(key, results, hunt, custom_borders)
@@ -361,9 +496,16 @@ class Scheduler:
             )
             return assign(key, LANE_REQUESTED, fit)
 
+        if not hunt and strips_ok and self._wants_strip(active):
+            strip = self._pick_strip(
+                active, max_ram_mb, max_threads, factor, failures, no_time_limit
+            )
+            if strip is not None:
+                return strip
+
         def available(key: tuple[int, int]) -> bool:
             s = pool.get(key)
-            if key in leased:
+            if key in leased or self.is_dead(key, dead):
                 return False
             if s is None:
                 return True
@@ -378,6 +520,8 @@ class Scheduler:
             for key in self.sizes:
                 s = pool.get(key)
                 if s is None or not s.timed_out or s.decided or key in leased:
+                    continue
+                if self.is_dead(key, dead):
                     continue
                 fit = self.fit_threads(
                     *key, max_ram_mb, max_threads, factor, failures.get(key, 0)
@@ -440,7 +584,7 @@ class Scheduler:
             )
         if not self.piece.admissible(*key):
             raise RequestRefused(f"{width} x {height} is impossible by coloring alone")
-        if self.piece.exact_dead(*key):
+        if self.is_dead(key):
             raise RequestRefused(
                 f"{width} x {height} is already excluded by the exact width results"
             )

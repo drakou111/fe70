@@ -475,7 +475,7 @@ class App:
             elif event.kind == "picture" and event.picture:
                 threading.Thread(
                     target=self._save_picture,
-                    args=(event.picture, event.hunt),
+                    args=(event.picture, event.hunt, event.strip),
                     daemon=True,
                 ).start()
             elif event.kind == "picture_ready":
@@ -492,13 +492,20 @@ class App:
         return folder
 
     def _save_picture(
-        self, picture: tuple[str, int, int, int, list], hunt: bool = False
+        self,
+        picture: tuple[str, int, int, int, list],
+        hunt: bool = False,
+        strip: bool = False,
     ) -> None:
         """Background thread: render and save the PNG, then hand the file to the window."""
         piece, width, height, border, placements = picture
         kind = "tiling" if border == 0 else f"border{border}"
         prefix = HUNT_PICTURE_PREFIX if hunt else ""
-        name = f"{width}x{height}-{prefix}{kind}.png"
+        name = (
+            f"{width}-strip{border}.png"
+            if strip
+            else f"{width}x{height}-{prefix}{kind}.png"
+        )
         path = self.pictures_dir() / name
         try:
             path.write_bytes(
@@ -520,11 +527,15 @@ class App:
         size, _, kind = path.stem.partition("-")
         hunt = kind.startswith(HUNT_PICTURE_PREFIX)
         kind = kind.removeprefix(HUNT_PICTURE_PREFIX)
-        what = (
-            "A COMPLETE TILING!"
-            if kind == "tiling"
-            else f"{'symmetric ' if hunt else ''}{kind.replace('border', 'border depth ')} filled"
-        )
+        if kind.startswith("strip"):
+            what = f"strip depth {kind.removeprefix('strip')} filled"
+            size = f"width {size}"
+        else:
+            what = (
+                "A COMPLETE TILING!"
+                if kind == "tiling"
+                else f"{'symmetric ' if hunt else ''}{kind.replace('border', 'border depth ')} filled"
+            )
         self.picture_var.set(
             f"{size.replace('x', ' x ')}: {what}\nSaved as {path.name}"
         )
@@ -565,7 +576,11 @@ class App:
                 rows.append(("-", waiting, "-", "-", "-"))
                 continue
             kind = " symmetric" if job.hunt else ""
-            size = f"{job.width} x {job.height}{kind} ({job.threads} threads)"
+            size = (
+                f"strip width {job.width} ({job.threads} threads)"
+                if job.strip
+                else f"{job.width} x {job.height}{kind} ({job.threads} threads)"
+            )
             if status.stage_index >= 0:
                 stage = job.stages[status.stage_index]
                 stage_text = (

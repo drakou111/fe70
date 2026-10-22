@@ -8,7 +8,7 @@ import urllib.request
 from tilingvol import __version__
 from tilingvol.client import tls
 from tilingvol.shared.pieces import PIECES
-from tilingvol.shared.protocol import Job, ResultSubmission
+from tilingvol.shared.protocol import MAX_STRIP_ROWS, Job, ResultSubmission
 
 TIMEOUT_S = 30
 MAX_RESPONSE_BYTES = 1 << 20
@@ -43,6 +43,15 @@ def validate_job(job: Job, max_threads: int) -> Job:
         problems.append(f"{job.threads} threads is more than the {max_threads} allowed")
     if not 1 <= len(job.stages) <= MAX_STAGES or job.stages[-1].border != 0:
         problems.append("bad stage list")
+    if job.strip:
+        depths = [stage.strip_rows for stage in job.stages]
+        if not (
+            all(1 <= d <= MAX_STRIP_ROWS for d in depths)
+            and depths == sorted(set(depths))
+            and job.height == depths[-1]
+            and not any(stage.border or stage.symmetric for stage in job.stages)
+        ):
+            problems.append("bad strip depths")
     for stage in job.stages:
         if not (
             0 <= stage.border <= min(job.width, job.height) // 2

@@ -85,3 +85,35 @@ def verify_symmetric(
         if frozenset((width - 1 - x, height - 1 - y) for x, y in cells) not in pieces:
             x, y = min(cells)
             raise TilingError(f"the piece at ({x}, {y}) has no turned twin")
+
+
+def verify_strip(
+    piece: PieceSpec, width: int, rows: int, placements: list[list[int]]
+) -> None:
+    """Raise TilingError unless the placements cover rows 0..rows-1 of the width-W half-strip exactly once,
+    with every piece starting in those rows (it may stick out above them) and no two pieces overlapping."""
+    if width <= 0 or rows <= 0:
+        raise TilingError("strip width and depth must be positive")
+    shapes = piece.orientations
+    top = rows + piece.strip_reach
+    grid = bytearray(width * top)
+    for index, placement in enumerate(placements):
+        if len(placement) != 3 or not all(isinstance(v, int) for v in placement):
+            raise TilingError(f"piece {index}: expected [orientation, x, y]")
+        orientation, x0, y0 = placement
+        if not 0 <= orientation < len(shapes):
+            raise TilingError(f"piece {index}: orientation {orientation} out of range")
+        if not 0 <= y0 < rows:
+            raise TilingError(
+                f"piece {index}: it does not start in the first {rows} rows"
+            )
+        for dx, dy in shapes[orientation]:
+            x, y = x0 + dx, y0 + dy
+            if not 0 <= x < width:
+                raise TilingError(f"piece {index}: cell ({x}, {y}) outside the strip")
+            if grid[y * width + x]:
+                raise TilingError(f"piece {index}: cell ({x}, {y}) covered twice")
+            grid[y * width + x] = 1
+    if not all(grid[: rows * width]):
+        cell = grid.index(0)
+        raise TilingError(f"cell ({cell % width}, {cell // width}) is not covered")

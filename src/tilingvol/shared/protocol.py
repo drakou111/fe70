@@ -6,7 +6,8 @@ from dataclasses import asdict, dataclass
 VERDICT_IMPOSSIBLE = "impossible"
 VERDICT_TIMED_OUT = "timed_out"
 VERDICT_POSSIBLE = "possible"
-VERDICTS = (VERDICT_IMPOSSIBLE, VERDICT_TIMED_OUT, VERDICT_POSSIBLE)
+VERDICT_FILLED = "filled"  # strip jobs only: every depth of the job could be filled
+VERDICTS = (VERDICT_IMPOSSIBLE, VERDICT_TIMED_OUT, VERDICT_POSSIBLE, VERDICT_FILLED)
 
 RELEASE_GAVE_UP = "gave_up"
 RELEASE_MEMORY = "memory"
@@ -18,6 +19,11 @@ RELEASE_REASONS = (RELEASE_GAVE_UP, RELEASE_MEMORY, RELEASE_CLOSED, RELEASE_ERRO
 NO_LIMIT = 0.0  # a stage time limit of 0 means: search until the stage is decided
 
 LANE_HUNT = "hunt"  # 180-degree symmetric tilings only; its "impossible" proves nothing about the size
+# half-strip depth: can rows 0..h-1 of the width-W half-strip be covered? "impossible" rules out every
+# rectangle with a side W (research repo, FIVE_DIVISIBLE_SIDE.md); apps before STRIP_SINCE cannot run it
+LANE_STRIP = "strip"
+STRIP_SINCE = "0.10.0"
+MAX_STRIP_ROWS = 1000
 SYMMETRIC_TAG_PREFIX = "sym"
 MAX_CUSTOM_STAGES = 8
 MAX_BORDER = 1000
@@ -49,6 +55,7 @@ class Stage:
     symmetric: bool = (
         False  # only tilings unchanged by a 180-degree turn (the hunt lane)
     )
+    strip_rows: int = 0  # > 0: cover the first strip_rows rows of the width-W half-strip (border is 0)
 
     @property
     def unlimited(self) -> bool:
@@ -62,6 +69,8 @@ class Stage:
 
     @property
     def tag(self) -> str:
+        if self.strip_rows:
+            return f"strip{self.strip_rows}"
         base = (
             "full"
             if self.border == 0
@@ -70,6 +79,8 @@ class Stage:
         return SYMMETRIC_TAG_PREFIX + base if self.symmetric else base
 
     def describe(self) -> str:
+        if self.strip_rows:
+            return f"strip depth {self.strip_rows}"
         text = "full search" if self.border == 0 else f"border depth {self.border}"
         return "symmetric " + text if self.symmetric else text
 
@@ -83,6 +94,7 @@ class Stage:
             bool(data["lookahead"]),
             float(data["time_limit_s"]),
             bool(data.get("symmetric", False)),
+            int(data.get("strip_rows", 0)),
         )
 
 
@@ -103,6 +115,11 @@ class Job:
     @property
     def hunt(self) -> bool:
         return any(stage.symmetric for stage in self.stages)
+
+    @property
+    def strip(self) -> bool:
+        """A half-strip depth job of width `width`; `height` is its deepest depth."""
+        return any(stage.strip_rows for stage in self.stages)
 
     def to_dict(self) -> dict:
         return asdict(self)

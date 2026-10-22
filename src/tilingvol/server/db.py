@@ -72,6 +72,32 @@ CREATE TABLE IF NOT EXISTS frames (          -- border fillings, saved the momen
     symmetric INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS frames_size ON frames(width, height);
+CREATE TABLE IF NOT EXISTS strip_results (   -- half-strip depth searches; rows = the depth of the verdict
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT,
+    width INTEGER NOT NULL,
+    rows INTEGER NOT NULL,
+    verdict TEXT NOT NULL,                    -- impossible (width ruled out), timed_out, filled
+    duration_s REAL NOT NULL,
+    name TEXT NOT NULL,
+    ip TEXT,
+    threads INTEGER,
+    peak_ram_mb INTEGER,
+    client_version TEXT,
+    submitted REAL NOT NULL,
+    source TEXT NOT NULL                      -- volunteer or import
+);
+CREATE INDEX IF NOT EXISTS strip_results_width ON strip_results(width);
+CREATE TABLE IF NOT EXISTS strip_fills (     -- the deepest filling of each strip job, saved when found
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL UNIQUE,
+    width INTEGER NOT NULL,
+    rows INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    submitted REAL NOT NULL,
+    placements TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS strip_fills_width ON strip_fills(width);
 """
 
 
@@ -104,6 +130,26 @@ class PictureRow:
     name: str
     border: int  # 0 = a full tiling
     symmetric: bool = False
+
+
+@dataclass(frozen=True)
+class StripResultRow:
+    width: int
+    rows: int
+    verdict: str
+    duration_s: float
+    name: str
+    submitted: float
+    source: str
+
+
+@dataclass(frozen=True)
+class StripFillRow:
+    fill_id: int
+    width: int
+    rows: int
+    name: str
+    submitted: float
 
 
 @dataclass(frozen=True)
@@ -399,6 +445,109 @@ class Database:
                 " AND width = ? AND height = ? AND verdict = ? AND CAST(ROUND(duration_s) AS INTEGER) = ?",
                 (stage_tag, width, height, verdict, duration_s),
             ).rowcount
+
+    # half-strip depth
+    def add_strip_result(
+        self,
+        *,
+        job_id: str | None,
+        width: int,
+        rows: int,
+        verdict: str,
+        duration_s: float,
+        name: str,
+        ip: str | None,
+        threads: int | None,
+        peak_ram_mb: int | None,
+        client_version: str | None,
+        source: str,
+        submitted: float | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO strip_results (job_id, width, rows, verdict, duration_s, name, ip, threads,"
+                " peak_ram_mb, client_version, submitted, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    width,
+                    rows,
+                    verdict,
+                    duration_s,
+                    name,
+                    ip,
+                    threads,
+                    peak_ram_mb,
+                    client_version,
+                    submitted or time.time(),
+                    source,
+                ),
+            )
+
+    def import_strip_result(
+        self, width: int, rows: int, verdict: str, duration_s: float, name: str
+    ) -> bool:
+        """Add a known result unless the same one was imported before; True if added."""
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "INSERT INTO strip_results (width, rows, verdict, duration_s, name, submitted, source)"
+                    " SELECT ?,?,?,?,?,?, 'import' WHERE NOT EXISTS (SELECT 1 FROM strip_results"
+                    " WHERE source = 'import' AND width = ? AND rows = ? AND verdict = ?)",
+                    (
+                        width,
+                        rows,
+                        verdict,
+                        duration_s,
+                        name,
+                        time.time(),
+                        width,
+                        rows,
+                        verdict,
+                    ),
+                ).rowcount
+                > 0
+            )
+
+    def strip_results(self) -> list[StripResultRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT width, rows, verdict, duration_s, name, submitted, source FROM strip_results"
+                " ORDER BY id"
+            ).fetchall()
+        return [StripResultRow(*r) for r in rows]
+
+    def add_strip_fill(
+        self, job_id: str, width: int, rows: int, name: str, placements: list
+    ) -> bool:
+        """Keep the filling unless the job already saved one at least as deep; True if kept."""
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "INSERT INTO strip_fills (job_id, width, rows, name, submitted, placements)"
+                    " VALUES (?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET rows = excluded.rows,"
+                    " submitted = excluded.submitted, placements = excluded.placements"
+                    " WHERE excluded.rows > strip_fills.rows",
+                    (job_id, width, rows, name, time.time(), json.dumps(placements)),
+                ).rowcount
+                > 0
+            )
+
+    def strip_fills(self) -> list[StripFillRow]:
+        """Every saved filling, oldest first (without the placements)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, width, rows, name, submitted FROM strip_fills ORDER BY id"
+            ).fetchall()
+        return [StripFillRow(*r) for r in rows]
+
+    def strip_fill(self, fill_id: int) -> tuple[int, int, list] | None:
+        """(width, rows, placements)"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT width, rows, placements FROM strip_fills WHERE id = ?",
+                (fill_id,),
+            ).fetchone()
+        return (row[0], row[1], json.loads(row[2])) if row else None
 
     def use_salt(self, salt: str) -> bool:
         """Record a salt; False if it was used before."""

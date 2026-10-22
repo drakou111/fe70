@@ -24,6 +24,7 @@ from tilingvol.client.api import ApiClient, NoJobAvailable, ServerError
 from tilingvol.client.settings import PendingResults, Settings
 from tilingvol.client.solver_process import (
     MSG_ERROR,
+    MSG_FILLED,
     MSG_FRAME_FEASIBLE,
     MSG_IMPOSSIBLE,
     MSG_POSSIBLE,
@@ -34,11 +35,13 @@ from tilingvol.client.solver_process import (
     run_task,
 )
 from tilingvol.shared import token
+from tilingvol.shared.pieces import piece_by_name
 from tilingvol.shared.protocol import (
     RELEASE_CLOSED,
     RELEASE_ERROR,
     RELEASE_GAVE_UP,
     RELEASE_MEMORY,
+    VERDICT_FILLED,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
@@ -92,6 +95,9 @@ class Event:
     # for "picture": (piece, width, height, border or 0 for a tiling, placements)
     picture: tuple[str, int, int, int, list] | None = None
     hunt: bool = False  # a picture from the symmetric hunt (drawn in its own colours)
+    strip: bool = (
+        False  # a half-strip filling: border is its depth, height includes the overhang
+    )
 
 
 class ActiveClock:
@@ -450,6 +456,12 @@ class Controller:
             self._log(
                 "This server does not run the symmetric hunt yet, so this is an ordinary size."
             )
+        if job.strip:
+            self._log(
+                f"Got strip width {job.width} ({job.threads} threads, about {job.est_ram_mb / 1024:.1f} GB). "
+                f"Stages: {stages}. If a depth cannot be filled, no rectangle has a side {job.width}."
+            )
+            return
         if job.filled_border:
             self._log(
                 f"An earlier search of {job.width} x {job.height} already filled border depth "
@@ -514,28 +526,42 @@ class Controller:
                 stage = job.stages[message[1]]
                 self._filled_stage = message[1]
                 self._unsent_frame = (message[1], message[2])
-                self._log(
-                    f"A {stage.describe()} can be filled, so it proves nothing; going deeper."
-                )
+                if job.strip:
+                    self._log(
+                        f"Width {job.width}: {stage.describe()} can be filled, so the strip lives at "
+                        f"least {stage.strip_rows} rows; going deeper."
+                    )
+                    reach = piece_by_name(job.piece).strip_reach
+                    picture = (
+                        job.piece,
+                        job.width,
+                        stage.strip_rows + reach,
+                        stage.strip_rows,
+                        message[2],
+                    )
+                else:
+                    self._log(
+                        f"A {stage.describe()} can be filled, so it proves nothing; going deeper."
+                    )
+                    picture = (
+                        job.piece,
+                        job.width,
+                        job.height,
+                        stage.border,
+                        message[2],
+                    )
                 self._send_frame(job)
                 self._on_event(
-                    Event(
-                        "picture",
-                        picture=(
-                            job.piece,
-                            job.width,
-                            job.height,
-                            stage.border,
-                            message[2],
-                        ),
-                        hunt=job.hunt,
-                    )
+                    Event("picture", picture=picture, hunt=job.hunt, strip=job.strip)
                 )
             elif kind == MSG_IMPOSSIBLE:
                 self._finish(VERDICT_IMPOSSIBLE, message[1], None)
                 return
             elif kind == MSG_POSSIBLE:
                 self._finish(VERDICT_POSSIBLE, message[1], message[2])
+                return
+            elif kind == MSG_FILLED:
+                self._finish(VERDICT_FILLED, message[1], None)
                 return
             elif kind == MSG_STOPPED:
                 self._memory_failure(
@@ -556,7 +582,7 @@ class Controller:
         elif not runner.alive() and runner.exit_code() is not None:
             # a final message may arrive just before exit
             for message in runner.drain():
-                if message[0] in (MSG_IMPOSSIBLE, MSG_POSSIBLE):
+                if message[0] in (MSG_IMPOSSIBLE, MSG_POSSIBLE, MSG_FILLED):
                     solution = message[2] if len(message) > 2 else None
                     self._finish(message[0], message[1], solution)
                     return
@@ -617,7 +643,11 @@ class Controller:
             token.sign(self._key, payload),
             __version__,
             solution,
-            frame_border=job.stages[frame[0]].border if frame else None,
+            frame_border=(
+                job.stages[frame[0]].strip_rows or job.stages[frame[0]].border
+                if frame
+                else None
+            ),
             frame_placements=frame[1] if frame else None,
         )
         if solution is not None:
@@ -630,7 +660,16 @@ class Controller:
             )
         self._pending.add(submission.to_dict())
         stage = job.stages[stage_index]
-        if verdict == VERDICT_IMPOSSIBLE and job.hunt:
+        if job.strip and verdict == VERDICT_IMPOSSIBLE:
+            text = (
+                f"Width {job.width} is RULED OUT: the first {stage.strip_rows} rows of its half-strip "
+                f"cannot be covered, so no rectangle has a side {job.width}"
+            )
+        elif job.strip and verdict == VERDICT_FILLED:
+            text = f"Width {job.width}: every depth up to {stage.strip_rows} rows was filled"
+        elif job.strip:
+            text = f"Width {job.width} timed out at {stage.describe()}"
+        elif verdict == VERDICT_IMPOSSIBLE and job.hunt:
             text = (
                 f"{job.width} x {job.height} has no symmetric tiling (proved at {stage.describe()}); "
                 f"an asymmetric one is still possible"

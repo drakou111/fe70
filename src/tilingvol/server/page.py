@@ -10,10 +10,12 @@ from html import escape
 from pathlib import Path
 
 from tilingvol.server.config import ServerConfig
-from tilingvol.server.db import Database, ResultRow
-from tilingvol.server.scheduler import Scheduler
+from tilingvol.server.db import Database, ResultRow, StripResultRow
+from tilingvol.server.scheduler import Scheduler, WidthState
 from tilingvol.shared.protocol import (
     LANE_HUNT,
+    LANE_STRIP,
+    VERDICT_FILLED,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
@@ -31,12 +33,21 @@ TICK_STEP = 20
 FAST_S, SLOW_S = 300.0, 10800.0
 GREEN_FAST, GREEN_SLOW = (140, 233, 154), (43, 138, 62)
 PLATFORM_NAMES = {"windows": "Windows", "linux": "Linux", "macos": "macOS"}
+STRIP_CHART_ROWS = (
+    160  # the depth axis starts this tall and grows with the deepest result
+)
+STRIP_BAR_PX = 1.2  # chart pixels per row of depth
+STRIP_PITCH = 8
+STRIP_BAR = 6.5
+STRIP_LEFT, STRIP_TOP, STRIP_BOTTOM = 36, 8, 30
+STRIP_TICK = 10
+STRIP_GALLERY = 6
 
 STYLE = """
 :root {
   --bg: #f6f7f5; --card: #ffffff; --fg: #1b1f1d; --muted: #66706b; --line: #e3e6e3;
   --todo: #e4e7e4; --timed: #f59f00; --run: #4263eb; --found: #fab005; --flag: #e8590c; --accent: #2b8a3e;
-  --sym: #b197fc;
+  --sym: #b197fc; --alive: #74c0fc;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #121514; --card: #1b1f1d; --fg: #e9ecea; --muted: #98a29d; --line: #2c322f; --todo: #2e3431; }
@@ -51,7 +62,7 @@ h1 { font-size: 1.6rem; line-height: 1.2; margin: 0 0 4px; letter-spacing: -0.01
 h2 { font-size: 1.05rem; margin: 0 0 12px; }
 .lead { color: var(--muted); margin: 0; max-width: 60ch; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
 .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
 .stat b { display: block; font-size: 1.5rem; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
 .stat span { color: var(--muted); font-size: 0.85rem; }
@@ -97,19 +108,21 @@ footer { color: var(--muted); font-size: 0.82rem; margin-top: 24px; }
 """
 
 TOOLTIP_JS = """
-const map = document.querySelector('.map'), tip = document.querySelector('.tip');
-function show(e) {
-  const text = e.target.dataset ? e.target.dataset.t : null;
-  if (!text) { tip.hidden = true; return; }
-  tip.textContent = text; tip.hidden = false;
-  const box = map.getBoundingClientRect();
-  let x = e.clientX - box.left + 14, y = e.clientY - box.top + 14;
-  if (x + tip.offsetWidth > box.width) x = e.clientX - box.left - tip.offsetWidth - 10;
-  tip.style.left = x + 'px'; tip.style.top = y + 'px';
-}
-map.addEventListener('mousemove', show);
-map.addEventListener('click', show);
-map.addEventListener('mouseleave', () => { tip.hidden = true; });
+document.querySelectorAll('.map').forEach(map => {
+  const tip = map.querySelector('.tip');
+  function show(e) {
+    const text = e.target.dataset ? e.target.dataset.t : null;
+    if (!text) { tip.hidden = true; return; }
+    tip.textContent = text; tip.hidden = false;
+    const box = map.getBoundingClientRect();
+    let x = e.clientX - box.left + 14, y = e.clientY - box.top + 14;
+    if (x + tip.offsetWidth > box.width) x = e.clientX - box.left - tip.offsetWidth - 10;
+    tip.style.left = x + 'px'; tip.style.top = y + 'px';
+  }
+  map.addEventListener('mousemove', show);
+  map.addEventListener('click', show);
+  map.addEventListener('mouseleave', () => { tip.hidden = true; });
+});
 """
 
 
@@ -180,8 +193,8 @@ def piece_svg(cells, size: int = 14) -> str:
     )
 
 
-def map_note(piece) -> str:
-    dead = ", ".join(str(v) for v in sorted(piece.dead_sides))
+def map_note(piece, dead_sides: set[int]) -> str:
+    dead = ", ".join(str(v) for v in sorted(dead_sides) if v >= piece.min_side)
     exact = f"Sizes with a side below {piece.min_side}" + (
         f" or equal to {dead}" if dead else ""
     )
@@ -192,7 +205,8 @@ def map_note(piece) -> str:
     )
     return (
         f"Height H goes up, width W across; only W &le; H is shown, and darker green means a longer search. "
-        f"{exact} are ruled out by exact strip computations; sizes failing {coloring} cannot be tiled and are "
+        f"{exact} are ruled out by exact strip computations (see Widths below); sizes failing {coloring} "
+        f"cannot be tiled and are "
         f"not drawn."
     )
 
@@ -274,9 +288,133 @@ def render_hunt(db: Database, scheduler: Scheduler, active: list) -> str:
     )
 
 
+def width_text(w: int, s: WidthState | None, runner: str | None) -> str:
+    five = " (divisible by 5)" if w % 5 == 0 else ""
+    if s is not None and s.dead:
+        return (
+            f"width {w}{five}: RULED OUT, the first {s.dead_rows} rows cannot be covered "
+            f"({s.dead_by}); no rectangle has this side"
+        )
+    parts = [f"width {w}{five}:"]
+    if s is not None and s.filled_rows:
+        parts.append(f"filled {s.filled_rows} rows ({s.filled_by})")
+    else:
+        parts.append("not searched yet")
+    if s is not None and s.timeouts:
+        parts.append("; timed out at " + ", ".join(map(str, s.timeouts)))
+    if runner:
+        parts.append(f"; running now ({runner})")
+    return " ".join(parts)
+
+
+def render_widths(
+    db: Database,
+    scheduler: Scheduler,
+    states: dict[int, WidthState],
+    active: list,
+) -> str:
+    """One bar per width: how deep its half-strip has been filled, or the depth where it died."""
+    widths = scheduler.strip_widths()
+    if not widths:
+        return ""
+    running = {j.width: j.name for j in active if j.lane == LANE_STRIP}
+    deepest = max(
+        (max(s.filled_rows, s.dead_rows or 0) for s in states.values()), default=0
+    )
+    top_rows = max(STRIP_CHART_ROWS, deepest + 8)
+    low, high = widths[0], widths[-1]
+    span = high - low + 1
+    chart_h = top_rows * STRIP_BAR_PX
+    width = STRIP_LEFT + span * STRIP_PITCH + 4
+    height = STRIP_TOP + chart_h + STRIP_BOTTOM
+    base = STRIP_TOP + chart_h
+
+    def px(w: int) -> float:
+        return STRIP_LEFT + (w - low) * STRIP_PITCH
+
+    parts = [
+        f'<svg viewBox="0 0 {width} {height:.0f}" role="img" aria-label="Half-strip depth of every width">'
+    ]
+    for rows in range(0, top_rows + 1, 40):
+        y = base - rows * STRIP_BAR_PX
+        parts.append(
+            f'<line class="grid" x1="{STRIP_LEFT}" y1="{y:.1f}" x2="{px(high) + STRIP_BAR}" y2="{y:.1f}"/>'
+        )
+        parts.append(
+            f'<text x="{STRIP_LEFT - 6}" y="{y + 3.5:.1f}" text-anchor="end">{rows}</text>'
+        )
+    counts = {"dead": 0, "alive": 0, "running": 0, "todo": 0}
+    for w in widths:
+        s = states.get(w)
+        x = px(w)
+        if s is not None and s.dead:
+            status, fill, rows = "dead", "var(--accent)", s.dead_rows
+        elif w in running:
+            status, fill, rows = "running", "var(--run)", s.filled_rows if s else 0
+        elif s is not None and s.filled_rows:
+            status, fill, rows = "alive", "var(--alive)", s.filled_rows
+        else:
+            status, fill, rows = "todo", "var(--todo)", 0
+        counts[status] += 1
+        bar = max(rows * STRIP_BAR_PX, 3.0)
+        parts.append(
+            f'<rect x="{x}" y="{base - bar:.1f}" width="{STRIP_BAR}" height="{bar:.1f}" rx="1.6" '
+            f'fill="{fill}" data-t="{escape(width_text(w, s, running.get(w)))}"/>'
+        )
+        if w % 5 == 0:
+            parts.append(
+                f'<circle cx="{x + STRIP_BAR / 2}" cy="{base + 6}" r="1.8" fill="var(--muted)"/>'
+            )
+        if w % STRIP_TICK == 0:
+            parts.append(
+                f'<text x="{x + STRIP_BAR / 2}" y="{base + 20}" text-anchor="middle">{w}</text>'
+            )
+    parts.append("</svg>")
+    legend_items = [
+        ("dead", "var(--accent)", "Ruled out (bar: the depth that cannot be covered)"),
+        ("alive", "var(--alive)", "Filled this deep so far"),
+        ("running", "var(--run)", "Running now"),
+        ("todo", "var(--todo)", "Not searched yet"),
+    ]
+    legend = "".join(
+        f'<li><i style="background:{color}"></i>{label}<b>{counts[status]:,}</b></li>'
+        for status, color, label in legend_items
+    )
+
+    fills = db.strip_fills()[::-1][:STRIP_GALLERY]
+    figures = "".join(
+        f'<figure><a href="/strip/{f.fill_id}.png"><img src="/strip/{f.fill_id}.png" loading="lazy" '
+        f'alt="width {f.width}, {f.rows} rows"></a><figcaption><b>width {f.width}</b><br>'
+        f"{f.rows} rows filled<br>by {escape(f.name)}</figcaption></figure>"
+        for f in fills
+    )
+    gallery = (
+        f'<h2 style="margin-top:18px">Latest strip fillings</h2><div class="gallery">{figures}</div>'
+        if fills
+        else ""
+    )
+    return (
+        '<section class="card"><h2>Widths</h2><p class="note" style="margin:0 0 12px">'
+        "If a rectangle W x H exists, stacking copies of it fills the width-W half-strip (a floor and two "
+        "walls, open at the top) forever, and the same goes for width H. So if the first rows of a "
+        "half-strip cannot be covered, no rectangle has that side, at any height: one search removes a "
+        "whole row and column of the map. Every rectangle has a side divisible by 5 (dots), so those "
+        "widths alone bound the box.</p>"
+        f'<ul class="legend">{legend}</ul><div class="map">{"".join(parts)}'
+        f'<div class="tip" hidden></div></div>{gallery}</section>'
+    )
+
+
+def strip_size(r: StripResultRow) -> str:
+    return f"width {r.width}, {r.rows} rows"
+
+
 def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
     piece = config.piece
     results = db.results()
+    strip_results = db.strip_results()
+    states = scheduler.width_states()
+    dead = scheduler.dead_widths(states)
     summaries = scheduler.summaries(results)
     decisive = deciding_rows(results)
     active = db.active_jobs()
@@ -291,7 +429,11 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         if j.lane == LANE_HUNT
     }
     hunted = scheduler.summaries(db.results("hunt"))
-    sizes = [k for k in scheduler.sizes if k[1] <= piece.max_side]
+    sizes = [
+        k
+        for k in scheduler.sizes
+        if k[1] <= piece.max_side and not scheduler.is_dead(k, dead)
+    ]
 
     def tile(key: tuple[int, int]) -> Tile:
         w, h = key
@@ -404,6 +546,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         (w * h, w, h)
         for w, h in scheduler.sizes
         if not (summaries.get((w, h)) and summaries[(w, h)].decided)
+        and not scheduler.is_dead((w, h), dead)
     )
     bound_value, bound_note = "-", "every size is decided"
     if open_sizes:
@@ -415,11 +558,18 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         j.name for j in active
     }
     volunteer_hours = (
-        sum(r.duration_s for r in results if r.source == "volunteer") / 3600
-    )
+        sum(r.duration_s for r in results if r.source == "volunteer")
+        + sum(r.duration_s for r in strip_results if r.source == "volunteer")
+    ) / 3600
+    in_range = [w for w in dead if piece.min_side <= w <= piece.max_side]
     stats = [
         (bound_value, "Area bound", bound_note),
         (f"{counts.get('impossible', 0):,}", "Sizes ruled out", "by complete search"),
+        (
+            f"{len(in_range)}",
+            "Widths ruled out",
+            f"of {piece.min_side} to {piece.max_side}, by strip search",
+        ),
         (f"{len(active)}", "Running now", f"{len(volunteer_names)} volunteers"),
         (f"{volunteer_hours:,.0f}", "Volunteer hours", "of search so far"),
     ]
@@ -450,7 +600,8 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         )
 
     running_rows = "".join(
-        f"<tr><td>{j.width} x {j.height}</td><td>{escape(j.name)}</td><td>"
+        f"<tr><td>{f'width {j.width}' if j.lane == LANE_STRIP else f'{j.width} x {j.height}'}</td>"
+        f"<td>{escape(j.name)}</td><td>"
         f"{HUNT_PILL if j.lane == LANE_HUNT else escape(j.lane)}</td>"
         f'<td class="num">{ago(j.created)}</td></tr>'
         for j in sorted(active, key=lambda j: j.created)
@@ -468,6 +619,11 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
             continue
         row = board.setdefault(r.name, [0, 0, 0.0])
         row[0] += r.verdict in (VERDICT_IMPOSSIBLE, VERDICT_POSSIBLE)
+        row[1] += r.verdict == VERDICT_TIMED_OUT
+        row[2] += r.duration_s
+    for r in strip_results:
+        row = board.setdefault(r.name, [0, 0, 0.0])
+        row[0] += r.verdict == VERDICT_IMPOSSIBLE
         row[1] += r.verdict == VERDICT_TIMED_OUT
         row[2] += r.duration_s
     leaders = sorted(board.items(), key=lambda item: (-item[1][0], -item[1][2]))
@@ -500,14 +656,31 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
 
     hunt_html = render_hunt(db, scheduler, active)
 
-    recent = [r for r in results if r.source == "volunteer"][-RECENT:][::-1]
-    recent_rows = "".join(
-        f'<tr><td>{r.width} x {r.height}</td><td><span class="pill {escape(r.verdict)}">'
-        f"{escape(r.verdict.replace('_', ' '))}{' (flagged)' if r.flagged else ''}</span></td>"
-        f'<td>{escape(r.name)}</td><td class="num">{hours(r.duration_s)}</td>'
-        f'<td class="num">{ago(r.submitted)}</td></tr>'
-        for r in recent
-    )
+    recent = sorted(
+        [r for r in results if r.source == "volunteer"]
+        + [r for r in strip_results if r.source == "volunteer"],
+        key=lambda r: r.submitted,
+    )[-RECENT:][::-1]
+
+    def recent_row(r) -> str:
+        if isinstance(r, StripResultRow):
+            size = strip_size(r)
+            label = {
+                VERDICT_IMPOSSIBLE: "width ruled out",
+                VERDICT_FILLED: "filled",
+            }.get(r.verdict, r.verdict.replace("_", " "))
+            pill = "impossible" if r.verdict == VERDICT_IMPOSSIBLE else r.verdict
+        else:
+            size = f"{r.width} x {r.height}"
+            label = r.verdict.replace("_", " ") + (" (flagged)" if r.flagged else "")
+            pill = r.verdict
+        return (
+            f'<tr><td>{size}</td><td><span class="pill {escape(pill)}">{escape(label)}</span></td>'
+            f'<td>{escape(r.name)}</td><td class="num">{hours(r.duration_s)}</td>'
+            f'<td class="num">{ago(r.submitted)}</td></tr>'
+        )
+
+    recent_rows = "".join(recent_row(r) for r in recent)
     recent_html = (
         f'<div class="scroll"><table><tr><th>Size</th><th>Result</th><th>Volunteer</th>'
         f'<th class="num">Search</th><th class="num">When</th></tr>{recent_rows}</table></div>'
@@ -529,7 +702,8 @@ checked by a complete computer search.</p>
 <section class="card"><h2>Rectangle sizes</h2>
 <ul class="legend">{legend}</ul>
 <div class="map">{"".join(parts)}<div class="tip" hidden></div></div>
-<p class="note">{map_note(piece)}</p></section>
+<p class="note">{map_note(piece, dead)}</p></section>
+{render_widths(db, scheduler, states, active)}
 {gallery_html}
 <div class="two">
 <section class="card"><h2>Running now</h2>{running_html}</section>

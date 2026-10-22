@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from tilingvol.server import page
+from tilingvol.server import known_strips, page
 from tilingvol.server.config import ServerConfig
 from tilingvol.server.db import Database
 from tilingvol.server.scheduler import NoAssignment, RequestRefused, Scheduler
@@ -26,11 +26,14 @@ from tilingvol.shared import token
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.protocol import (
     LANE_HUNT,
+    LANE_STRIP,
     MAX_BORDER,
     MAX_CUSTOM_STAGES,
     NO_LIMIT,
     RELEASE_REASONS,
+    STRIP_SINCE,
     SYMMETRIC_TAG_PREFIX,
+    VERDICT_FILLED,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
@@ -40,6 +43,7 @@ from tilingvol.shared.protocol import (
 from tilingvol.shared.verify import (
     TilingError,
     verify_border,
+    verify_strip,
     verify_symmetric,
     verify_tiling,
 )
@@ -137,6 +141,8 @@ class RateLimiter:
 def create_app(config: ServerConfig | None = None) -> FastAPI:
     config = config or ServerConfig.from_env()
     db = Database(config.db_path)
+    if added := known_strips.seed(db, config.piece.name):
+        log.info("added %d known strip results", added)
     scheduler = Scheduler(db, config)
     limiter = RateLimiter(config.max_requests_per_minute)
     pick_lock = threading.Lock()
@@ -223,6 +229,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     no_time_limit=body.no_time_limit,
                     hunt=body.hunt,
                     custom_borders=tuple(body.custom_stages),
+                    strips_ok=version_tuple(body.client_version)
+                    >= version_tuple(STRIP_SINCE),
                 )
             except NoAssignment as error:
                 raise HTTPException(404, str(error)) from error
@@ -235,6 +243,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "lookahead": s.lookahead,
                     "time_limit_s": stage_limit(s, body),
                     "symmetric": s.symmetric,
+                    "strip_rows": s.strip_rows,
                 }
                 for s in assignment.stages
             ]
@@ -270,7 +279,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "est_ram_mb": assignment.est_ram_mb,
             "lane": assignment.lane,
             "heartbeat_interval_s": config.heartbeat_interval_s,
-            "filled_border": db.filled_border(
+            "filled_border": 0
+            if assignment.lane == LANE_STRIP
+            else db.filled_border(
                 assignment.width, assignment.height, symmetric=body.hunt
             ),
         }
@@ -284,16 +295,22 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(410, f"this job is {job.state}")
         if size_closed(job):
             db.end_job(job_id, "cancelled", "decided elsewhere")
-            return {
-                "cancel": True,
-                "reason": f"{job.width} x {job.height} was decided by someone else",
-            }
+            what = (
+                f"width {job.width}"
+                if job.lane == LANE_STRIP
+                else f"{job.width} x {job.height}"
+            )
+            return {"cancel": True, "reason": f"{what} was decided by someone else"}
         db.touch_job(job_id, body.state)
         return {"ok": True}
 
     def size_closed(job) -> bool:
         """Settled for the main search, or, for a hunt job, already searched by another hunt."""
+        if job.lane == LANE_STRIP:
+            return job.width in scheduler.dead_widths()
         key = (job.width, job.height)
+        if scheduler.is_dead(key):
+            return True
         summary = scheduler.summaries().get(key)
         if summary is not None and summary.decided:
             return True
@@ -321,6 +338,13 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         job = owned_job(job_id, body.nonce)
         if job.state != "active":
             raise HTTPException(410, f"this job is {job.state}")
+        if body.stage_index < len(job.stages) and job.stages[body.stage_index].get(
+            "strip_rows"
+        ):
+            save_strip_fill(
+                job, job.stages[body.stage_index]["strip_rows"], body.placements
+            )
+            return {"ok": True}
         if (
             body.stage_index >= len(job.stages)
             or not job.stages[body.stage_index]["border"]
@@ -352,6 +376,19 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             )
         return {"ok": True}
 
+    def save_strip_fill(job, rows: int, placements: list) -> None:
+        """A strip filling: checked cell by cell, then kept (the deepest per job) and shown on the page."""
+        try:
+            verify_strip(config.piece, job.width, rows, placements)
+        except TilingError as error:
+            log.warning("job %s: strip filling rejected: %s", job.job_id, error)
+            raise HTTPException(
+                422, f"the strip filling is not valid: {error}"
+            ) from error
+        if db.add_strip_fill(job.job_id, job.width, rows, job.name, placements):
+            page_cache["at"] = 0.0
+            log.info("job %s: width %d filled to depth %d", job.job_id, job.width, rows)
+
     @app.post("/api/jobs/{job_id}/result")
     def result(job_id: str, body: Submission, request: Request) -> dict:
         job = owned_job(job_id, body.nonce)
@@ -368,6 +405,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if not (HEX.fullmatch(body.salt) and TOKEN_HEX.fullmatch(body.token)):
             raise HTTPException(422, "invalid salt or token format")
         stage = job.stages[body.stage_index]
+        strip = job.lane == LANE_STRIP
+        if strip and body.verdict == VERDICT_POSSIBLE:
+            raise HTTPException(422, "a strip search has no tiling to send")
+        if (body.verdict == VERDICT_FILLED) and (
+            not strip or body.stage_index != len(job.stages) - 1
+        ):
+            raise HTTPException(
+                422, "'filled' only ends a strip search after its last depth"
+            )
         if (body.verdict == VERDICT_POSSIBLE) != (body.solution is not None):
             raise HTTPException(
                 422, "a solution goes with, and only with, a 'possible' verdict"
@@ -409,6 +455,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             and body.duration_s > sum(limits) + IMPOSSIBLE_SLACK_S
         ):
             raise HTTPException(422, "the reported duration exceeds the stage limits")
+        if strip:
+            return strip_result(job, body, stage)
         if body.verdict == VERDICT_POSSIBLE:
             try:
                 verify_tiling(config.piece, job.width, job.height, body.solution)
@@ -461,6 +509,44 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             else "Recorded; it was unusually fast, so someone will double-check it."
         )
         return {"ok": True, "message": message}
+
+    def strip_result(job, body: Submission, stage: dict) -> dict:
+        rows = stage["strip_rows"]
+        depths = [s["strip_rows"] for s in job.stages]
+        if body.frame_border in depths and body.frame_placements is not None:
+            try:  # the last filling, if the heartbeats could not send it on the way
+                save_strip_fill(job, body.frame_border, body.frame_placements)
+            except HTTPException:
+                pass  # already logged; the result itself still counts
+        db.add_strip_result(
+            job_id=job.job_id,
+            width=job.width,
+            rows=rows,
+            verdict=body.verdict,
+            duration_s=body.duration_s,
+            name=job.name,
+            ip=job.ip,
+            threads=job.threads,
+            peak_ram_mb=body.peak_ram_mb,
+            client_version=body.client_version,
+            source="volunteer",
+        )
+        db.end_job(job.job_id, "done", body.verdict, body.peak_ram_mb)
+        page_cache["at"] = 0.0
+        log.info(
+            "job %s: width %d %s at depth %d by %r (%.0f s)",
+            job.job_id,
+            job.width,
+            body.verdict,
+            rows,
+            job.name,
+            body.duration_s,
+        )
+        if body.verdict == VERDICT_IMPOSSIBLE:
+            log.warning(
+                "WIDTH RULED OUT: %d (depth %d) by %r", job.width, rows, job.name
+            )
+        return {"ok": True, "message": "Thank you!"}
 
     def picture_of(job, body: Submission) -> tuple[int | None, list | None]:
         """The tiling itself, or the deepest border filling if it is genuine (display only)."""
@@ -521,6 +607,46 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         response = png(("frame", frame_id, border), tuple(picture))
         response.headers["Cache-Control"] = "public, max-age=300"
         return response
+
+    @app.get("/strip/{fill_id}.png")
+    def strip_png(fill_id: int) -> Response:
+        found = db.strip_fill(fill_id)
+        if found is None:
+            raise HTTPException(404, "no picture")
+        width, rows, placements = found
+        height = rows + config.piece.strip_reach
+        response = png(("strip", fill_id, rows), (width, height, placements))
+        response.headers["Cache-Control"] = "public, max-age=300"
+        return response
+
+    @app.get("/api/strips")
+    def strips() -> dict:
+        states = scheduler.width_states()
+        return {
+            "widths": [
+                {
+                    "width": s.width,
+                    "dead_rows": s.dead_rows,
+                    "dead_by": s.dead_by,
+                    "filled_rows": s.filled_rows,
+                    "filled_by": s.filled_by,
+                    "timeouts": list(s.timeouts),
+                }
+                for s in states.values()
+            ],
+            "results": [
+                {
+                    "width": r.width,
+                    "rows": r.rows,
+                    "verdict": r.verdict,
+                    "duration_s": r.duration_s,
+                    "name": r.name,
+                    "submitted": r.submitted,
+                    "source": r.source,
+                }
+                for r in db.strip_results()
+            ],
+        }
 
     @app.get("/api/results")
     def results() -> list[dict]:

@@ -277,3 +277,35 @@ def build_model(
                 ).OnlyEnforceIf(variables[trigger])
 
     return BuiltModel(model, variables, placement_of)
+
+
+def build_strip_model(piece: PieceSpec, width: int, rows: int) -> BuiltModel:
+    """Cover rows 0..rows-1 of the width-W half-strip (floor and two walls, open top) exactly once. Every
+    piece starts in those rows and may stick out above them, where pieces must not overlap. Infeasible
+    means the half-strip dies by row `rows`, so no rectangle has a side W. Same model as zach's
+    strip_depth_cpsat.py; no wall lemmas, since those are proved for rectangles."""
+    model = cp_model.CpModel()
+    variables: dict[frozenset, cp_model.IntVar] = {}
+    placement_of: dict[frozenset, tuple[int, int, int]] = {}
+    covering: dict[tuple[int, int], list] = {}
+    for orientation, shape in enumerate(piece.orientations):
+        max_x = max(x for x, _ in shape)
+        for y0 in range(rows):
+            for x0 in range(width - max_x):
+                cells = frozenset((x0 + dx, y0 + dy) for dx, dy in shape)
+                v = model.NewBoolVar("")
+                variables[cells] = v
+                placement_of[cells] = (orientation, x0, y0)
+                for cell in cells:
+                    covering.setdefault(cell, []).append(v)
+    for y in range(rows + piece.strip_reach):
+        for x in range(width):
+            options = covering.get((x, y), [])
+            if y < rows:
+                if options:
+                    model.AddExactlyOne(options)
+                else:
+                    model.AddBoolOr([])  # nothing can cover this cell
+            elif len(options) > 1:
+                model.AddAtMostOne(options)
+    return BuiltModel(model, variables, placement_of)

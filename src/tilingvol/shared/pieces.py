@@ -43,6 +43,11 @@ class PieceSpec:
     def orientations(self) -> tuple[Shape, ...]:
         return all_orientations(self.cells)
 
+    @cached_property
+    def strip_reach(self) -> int:
+        """How far a piece can stick out above its lowest row."""
+        return max(max(y for _, y in shape) for shape in self.orientations)
+
     def admissible(self, width: int, height: int) -> bool:
         """Necessary coloring conditions only."""
         if self.gun_coloring:
@@ -74,7 +79,7 @@ GUN = PieceSpec(
     cells=normalize([(x, 0) for x in range(7)] + [(1, 1), (2, 1), (3, 1)]),
     min_side=137,
     max_side=240,
-    dead_sides=frozenset({141, 142, 143}),
+    dead_sides=frozenset(),  # widths ruled out by strip searches live in the server's database
     use_wall_lemmas=True,
     gun_coloring=True,
 )
