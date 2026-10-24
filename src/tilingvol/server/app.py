@@ -78,8 +78,11 @@ class JobRequest(BaseModel):
     hunt: bool = False  # only 180-degree symmetric tilings (its "impossible" never settles a size)
     # board, width or symmetric (apps from STRIP_SINCE on); None: an older app, which sends only `hunt`
     search: str | None = Field(default=None, max_length=12)
-    # the volunteer's own border depths, rising; the full search always follows
+    # the volunteer's own depths, rising: border depths (the full search always follows), or strip
+    # depths for a width search
     custom_stages: list[int] = Field(default=[], max_length=MAX_CUSTOM_STAGES)
+    # the volunteer's own time limit per stage, at least the server's; None: the server's
+    time_limit_s: float | None = Field(default=None, gt=0, le=LEGACY_UNLIMITED_STAGE_S)
 
 
 class Heartbeat(BaseModel):
@@ -197,7 +200,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     def stage_limit(stage: Stage, body: JobRequest) -> float:
         if not body.no_time_limit:
-            return stage.time_limit_s
+            return body.time_limit_s or stage.time_limit_s
         # apps before NO_LIMIT_SINCE reject a limit of 0; they get the longest limit they accept
         if version_tuple(body.client_version) >= version_tuple(NO_LIMIT_SINCE):
             return NO_LIMIT
@@ -223,6 +226,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             b <= a for a, b in itertools.pairwise(custom)
         ):
             raise HTTPException(422, "custom stages must be rising border depths")
+        if (
+            body.time_limit_s is not None
+            and body.time_limit_s < config.stage_time_limit_s
+        ):
+            raise HTTPException(
+                422,
+                f"the time limit must be at least the server's "
+                f"{config.stage_time_limit_s / 3600:g} h (or 0 for no limit)",
+            )
         if body.search is not None and body.search not in SEARCHES:
             raise HTTPException(422, f"search must be one of {', '.join(SEARCHES)}")
         hunt = body.hunt if body.search is None else body.search == SEARCH_SYMMETRIC

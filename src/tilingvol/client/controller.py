@@ -439,6 +439,7 @@ class Controller:
                 settings.no_time_limit,
                 settings.search,
                 settings.custom_borders,
+                settings.time_limit_s,
             )
         except NoJobAvailable as error:
             self._log(

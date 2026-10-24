@@ -285,8 +285,17 @@ class Scheduler:
         max_threads: int,
         no_time_limit: bool,
         requested_width: int | None,
+        custom_depths: tuple[int, ...] = (),
     ) -> Assignment:
+        """custom_depths: the volunteer's own depths; those a width is already filled to are skipped,
+        and if none is left the server's depths are used."""
         states = self.width_states()
+
+        def depths_for(state: WidthState | None) -> tuple[int, ...]:
+            filled = state.filled_rows if state else 0
+            own = tuple(d for d in custom_depths if d > filled)
+            return own or self.strip_depths(state)
+
         leased = {j.width for j in active if j.lane == LANE_STRIP}
         factor = self.ram_factor(self.db.results("all"))
         failures = self.db.memory_failures()
@@ -316,7 +325,7 @@ class Scheduler:
                 raise RequestRefused(f"width {w} is already ruled out")
             if w in leased:
                 raise RequestRefused(f"width {w} is being run by someone right now")
-            depths = self.strip_depths(state)
+            depths = depths_for(state)
             threads_ram = fit(w, depths) if depths else None
             if threads_ram is None:
                 raise RequestRefused(f"width {w} needs more RAM than {max_ram_mb} MB")
@@ -333,7 +342,7 @@ class Scheduler:
                 and not no_time_limit
             ):
                 continue
-            depths = self.strip_depths(state)
+            depths = depths_for(state)
             if depths:
                 candidates.append((w * depths[0], w, depths))
         for _, w, depths in sorted(candidates):
@@ -491,7 +500,12 @@ class Scheduler:
             raise RequestRefused("too many sizes are already running from your network")
         if strip:
             return self._pick_strip(
-                active, max_ram_mb, max_threads, no_time_limit, requested_width
+                active,
+                max_ram_mb,
+                max_threads,
+                no_time_limit,
+                requested_width,
+                custom_borders,
             )
         results = self.db.results()
         summaries = self.summaries(results)

@@ -349,3 +349,26 @@ def test_the_page_and_the_token_error_say_whom_to_ask(strip_config, tmp_path):
         assert "ask <b>Drakou111 on Discord</b>" in page
         refused = request(client)
         assert refused.status_code == 401 and "Drakou111 on Discord" in refused.text
+
+
+def test_own_strip_depths_and_time_limits(strip_client, submit_key):
+    def ask(**extra):
+        body = {
+            "name": NAME,
+            "max_ram_mb": 8192,
+            "max_threads": 4,
+            "client_version": STRIP_SINCE,
+            "search": "width",
+            **extra,
+        }
+        return strip_client.post("/api/jobs/request", json=body)
+
+    job = ask(custom_stages=[12, 20], time_limit_s=14400.0).json()
+    assert [s["strip_rows"] for s in job["stages"]] == [12, 20]
+    assert {s["time_limit_s"] for s in job["stages"]} == {14400.0}
+    too_short = ask(time_limit_s=30.0)
+    assert too_short.status_code == 422 and "at least the server's" in too_short.text
+    # depths a width is already filled to are skipped
+    post_result(strip_client, submission(submit_key, job, "filled", 1, 3.0))
+    again = ask(width=job["width"], custom_stages=[12, 20, 28]).json()
+    assert [s["strip_rows"] for s in again["stages"]] == [28]

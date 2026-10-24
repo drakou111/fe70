@@ -193,3 +193,54 @@ def test_lookahead_accepts_the_border_of_a_real_tiling(sibling_tiling):
     solver = cp_model.CpSolver()
     solver.parameters.num_workers = 4
     assert solver.Solve(built.model) in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+
+
+def test_empty_form_fields_mean_the_defaults(monkeypatch):
+    import os
+
+    from tilingvol.client import settings as settings_module
+    from tilingvol.client.settings import Form, form_from_saved
+
+    monkeypatch.setattr(settings_module, "installed_ram_mb", lambda: 65536)
+    monkeypatch.setattr(os, "cpu_count", lambda: 24)
+    resolved = Form(name="x").resolve()
+    s = resolved.settings
+    assert (s.max_ram_mb, s.max_threads, s.parallel) == (32768, 23, 1)
+    assert (s.time_limit_s, s.no_time_limit, s.custom_stages) == (None, False, "")
+    assert (resolved.requested_size, resolved.requested_widths) == (None, ())
+    assert s.server_url == settings_module.default_server_url()
+
+    widths = Form(name="x", request="149, 150", time_limit_hours="5").resolve()
+    assert widths.requested_widths == (149, 150)
+    assert widths.settings.time_limit_s == 5 * 3600
+    assert Form(name="x", time_limit_hours="0").resolve().settings.no_time_limit
+    board = Form(name="x", search="board", request="150x168").resolve()
+    assert board.requested_size == (150, 168)
+    for bad in (
+        Form(name="x", ram_gb="lots"),
+        Form(name="x", threads="2.5"),
+        Form(name="x", search="board", request="150"),
+        Form(name="x", time_limit_hours="-1"),
+    ):
+        with pytest.raises(ValueError):
+            bad.resolve()
+
+    # a settings file from 0.10: default numbers become empty fields
+    old = form_from_saved(
+        {
+            "name": "x",
+            "max_ram_mb": 32768,
+            "max_threads": 20,
+            "parallel": 2,
+            "no_time_limit": True,
+            "symmetric_hunt": True,
+            "custom_stages": "24",
+        }
+    )
+    assert (old.ram_gb, old.threads, old.parallel, old.time_limit_hours) == (
+        "",
+        "20",
+        "2",
+        "0",
+    )
+    assert (old.search, old.stages) == ("symmetric", "24")

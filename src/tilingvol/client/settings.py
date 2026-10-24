@@ -1,4 +1,8 @@
-"""User settings and results waiting to be sent, stored under ~/.fe70."""
+"""User settings and results waiting to be sent, stored under ~/.fe70.
+
+The window edits a Form: every field is text, and an empty field means "the default" (the server's
+choice for what to search, this computer's sensible share for RAM and threads). Form.resolve() turns it
+into Settings, the concrete values the searches run with."""
 
 import json
 import os
@@ -7,6 +11,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from tilingvol.client.memory_guard import installed_ram_mb
+from tilingvol.client.width_queue import parse_widths
 from tilingvol.shared.protocol import (
     SEARCH_SYMMETRIC,
     SEARCH_WIDTH,
@@ -30,7 +35,16 @@ def default_server_url() -> str:
 DEFAULT_RAM_FRACTION = 0.5
 MAX_NAME_LENGTH = 40
 MIN_SLOT_RAM_MB = 1024
+MAX_TIME_LIMIT_HOURS = 7 * 24
 _PENDING_LOCK = threading.RLock()  # parallel searches share one pending file
+
+
+def default_ram_mb() -> int:
+    return int(installed_ram_mb() * DEFAULT_RAM_FRACTION)
+
+
+def default_threads() -> int:
+    return max(1, (os.cpu_count() or 2) - 1)
 
 
 def app_dir() -> Path:
@@ -75,39 +89,34 @@ class Settings:
     access_token: str = ""
     # search every stage until it is decided instead of the server's time limit
     no_time_limit: bool = False
+    # own time limit per stage (at least the server's); None: the server's
+    time_limit_s: float | None = None
     # let half the threads do CP-SAT's tree search, which reports progress (may change the speed)
     tree_progress: bool = False
     # what to run: rectangle sizes ("board"), half-strip widths ("width"), or the symmetric hunt, which
     # searches only 180-degree symmetric tilings (its "impossible" rules out symmetric tilings only)
     search: str = SEARCH_WIDTH
-    # own border depths, e.g. "24, 28, 32"; the full search always follows. Empty: the server's stages
+    # own depths, e.g. "24, 28, 32": border depths (the full search follows) or strip depths. Empty: the
+    # server's
     custom_stages: str = ""
-
-    @staticmethod
-    def defaults() -> "Settings":
-        cores = os.cpu_count() or 2
-        return Settings(
-            max_ram_mb=int(installed_ram_mb() * DEFAULT_RAM_FRACTION),
-            max_threads=max(1, cores - 1),
-        )
 
     def validated(self) -> "Settings":
         total = installed_ram_mb()
         if not 256 <= self.max_ram_mb <= total:
             raise ValueError(
-                f"max RAM must be between 256 MB and the installed {total} MB"
+                f"RAM must be between 0.25 GB and the installed {total / 1024:.1f} GB"
             )
         cores = os.cpu_count() or 1
         if not 1 <= self.max_threads <= cores:
             raise ValueError(f"CPU threads must be between 1 and {cores}")
         if not 1 <= self.parallel <= self.max_threads:
             raise ValueError(
-                "parallel sizes must be between 1 and the number of CPU threads"
+                "parallel searches must be between 1 and the number of CPU threads"
             )
         if self.max_ram_mb // self.parallel < MIN_SLOT_RAM_MB:
             raise ValueError(
-                f"each parallel size needs at least {MIN_SLOT_RAM_MB // 1024} GB; raise Max RAM or "
-                f"lower Parallel sizes"
+                f"each parallel search needs at least {MIN_SLOT_RAM_MB // 1024} GB; raise RAM or "
+                f"lower Parallel searches"
             )
         token = self.access_token.strip()
         if token and not token.isprintable():
@@ -141,27 +150,136 @@ class Settings:
         )
 
 
+@dataclass(frozen=True)
+class Resolved:
+    settings: Settings
+    requested_size: tuple[int, int] | None  # a rectangle size (board or hunt)
+    requested_widths: tuple[int, ...]  # strip widths (width search)
+
+
+def parse_number(text: str, what: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"{what} must be a number") from None
+    if value < 0:
+        raise ValueError(f"{what} cannot be negative")
+    return value
+
+
+def parse_whole(text: str, what: str) -> int:
+    if not text.isdigit():
+        raise ValueError(f"{what} must be a whole number")
+    return int(text)
+
+
+def parse_size(text: str) -> tuple[int, int] | None:
+    """ "150 x 168", "150x168" or "150 168" -> (150, 168); empty -> None."""
+    parts = text.lower().replace("x", " ").replace(",", " ").split()
+    if not parts:
+        return None
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        raise ValueError("a rectangle size is width x height, like 150 x 168")
+    return int(parts[0]), int(parts[1])
+
+
+@dataclass(frozen=True)
+class Form:
+    """What the window shows; an empty field means the default."""
+
+    name: str = ""
+    search: str = SEARCH_WIDTH
+    request: str = ""  # widths "149, 150" (width search) or a size "150 x 168"; empty: server picks
+    stages: str = ""  # strip or border depths; empty: the server's
+    time_limit_hours: str = ""  # per stage; empty: the server's, 0: none
+    ram_gb: str = ""  # empty: half the installed RAM
+    threads: str = ""  # empty: all cores but one
+    parallel: str = ""  # empty: 1
+    tree_progress: bool = False
+    server_url: str = ""  # empty: the built-in server
+    access_token: str = ""
+
+    def resolve(self) -> Resolved:
+        ram_mb = (
+            int(parse_number(self.ram_gb.strip(), "RAM") * 1024)
+            if self.ram_gb.strip()
+            else default_ram_mb()
+        )
+        threads = (
+            parse_whole(self.threads.strip(), "CPU threads")
+            if self.threads.strip()
+            else default_threads()
+        )
+        parallel = (
+            parse_whole(self.parallel.strip(), "Parallel searches")
+            if self.parallel.strip()
+            else 1
+        )
+        hours = self.time_limit_hours.strip()
+        limit = parse_number(hours, "The time limit") if hours else None
+        if limit is not None and limit > MAX_TIME_LIMIT_HOURS:
+            raise ValueError(
+                f"the time limit can be at most {MAX_TIME_LIMIT_HOURS} hours"
+            )
+        settings = Settings(
+            name=self.name,
+            max_ram_mb=ram_mb,
+            max_threads=threads,
+            server_url=self.server_url.strip() or default_server_url(),
+            parallel=parallel,
+            access_token=self.access_token,
+            no_time_limit=limit == 0,
+            time_limit_s=limit * 3600 if limit else None,
+            tree_progress=self.tree_progress,
+            search=self.search,
+            custom_stages=self.stages,
+        ).validated()
+        if self.search == SEARCH_WIDTH:
+            return Resolved(settings, None, parse_widths(self.request))
+        return Resolved(settings, parse_size(self.request), ())
+
+
+def form_from_saved(data: dict) -> Form:
+    """Settings files written before 0.11 kept resolved numbers; defaults become empty fields."""
+    if "max_ram_mb" not in data:
+        known = {k: v for k, v in data.items() if k in Form.__dataclass_fields__}
+        return Form(**known)
+    ram = data.get("max_ram_mb", 0)
+    threads = data.get("max_threads", 0)
+    parallel = data.get("parallel", 1)
+    search = data.get("search") or (
+        SEARCH_SYMMETRIC if data.get("symmetric_hunt") else SEARCH_WIDTH
+    )
+    return Form(
+        name=data.get("name", ""),
+        search=search,
+        request=data.get("widths", "") if search == SEARCH_WIDTH else "",
+        stages=data.get("custom_stages", ""),
+        time_limit_hours="0" if data.get("no_time_limit") else "",
+        ram_gb="" if not ram or ram == default_ram_mb() else f"{ram / 1024:g}",
+        threads="" if not threads or threads == default_threads() else str(threads),
+        parallel="" if parallel == 1 else str(parallel),
+        tree_progress=bool(data.get("tree_progress", False)),
+        server_url=data.get("server_url", ""),
+        access_token=data.get("access_token", ""),
+    )
+
+
 class SettingsStore:
     def __init__(self, directory: Path) -> None:
         self.path = directory / "settings.json"
 
-    def load(self) -> Settings:
-        base = Settings.defaults()
+    def load(self) -> Form:
         if not self.path.exists():
-            return base
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        if (
-            data.get("symmetric_hunt") and "search" not in data
-        ):  # saved by version 0.9 or older
-            data["search"] = SEARCH_SYMMETRIC
-        known = {k: v for k, v in data.items() if k in Settings.__dataclass_fields__}
-        return replace(base, **known)
+            return Form()
+        return form_from_saved(json.loads(self.path.read_text(encoding="utf-8")))
 
-    def save(self, settings: Settings) -> None:
-        data = asdict(settings)
-        if data["server_url"] == default_server_url():
-            # follow the default, so a new build can move the server
-            del data["server_url"]
+    def save(self, form: Form) -> None:
+        data = asdict(form)
+        if data["server_url"].strip() == default_server_url():
+            data["server_url"] = (
+                ""  # follow the default, so a new build can move the server
+            )
         atomic_write_text(self.path, json.dumps(data, indent=2))
 
 

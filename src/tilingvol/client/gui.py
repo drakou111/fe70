@@ -1,5 +1,7 @@
-"""The fe70 window: enter a name, press Start. With "Parallel sizes" above 1 it runs that many searches at
-once, each with an equal share of the CPU threads and RAM; the buttons act on all of them."""
+"""The fe70 window: enter a name, press Start. Every other field may stay empty, which means the default:
+the server picks what to search, and this computer gives half its RAM and all but one CPU thread. With
+"Parallel searches" above 1 it runs that many searches at once, each with an equal share of the threads and
+RAM; the buttons act on all of them."""
 
 import logging
 import os
@@ -24,14 +26,21 @@ from tilingvol.client.controller import (
 from tilingvol.client.key import load_submit_key
 from tilingvol.client.memory_guard import installed_ram_mb
 from tilingvol.client.release_key import RELEASE_PUBLIC_KEY_HEX
-from tilingvol.client.settings import Settings, SettingsStore, app_dir
+from tilingvol.client.settings import (
+    Form,
+    SettingsStore,
+    app_dir,
+    default_ram_mb,
+    default_server_url,
+    default_threads,
+)
 from tilingvol.client.update import (
     UpdateError,
     Updater,
     installed_executable,
     remove_previous_version,
 )
-from tilingvol.client.width_queue import WidthQueue, parse_widths
+from tilingvol.client.width_queue import WidthQueue
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.pieces import piece_by_name
 from tilingvol.shared.protocol import SEARCH_BOARD, SEARCH_SYMMETRIC, SEARCH_WIDTH
@@ -53,12 +62,38 @@ SEARCH_LABELS = {
     SEARCH_SYMMETRIC: "Symmetric hunt",
 }
 SEARCH_HINTS = {
-    SEARCH_WIDTH: "Fill a half-strip of one width deeper and deeper. If a depth cannot be filled, no "
-    "rectangle has that side at any height, so a whole row and column of the board is ruled out.",
-    SEARCH_BOARD: "Search one rectangle size completely: impossible, or a tiling.",
-    SEARCH_SYMMETRIC: "Search only tilings that look the same after a half turn: much faster, and it "
-    "finds a tiling if a symmetric one exists; its 'impossible' rules out symmetric tilings only.",
+    SEARCH_WIDTH: "Fills one width's half-strip deeper and deeper; a depth that cannot be filled rules "
+    "out every rectangle with that side.",
+    SEARCH_BOARD: "Searches one rectangle size completely: impossible, or a tiling.",
+    SEARCH_SYMMETRIC: "Only tilings that look the same after a half turn: much faster; its 'impossible' "
+    "rules out symmetric tilings only.",
 }
+# per search: (request placeholder, request hint, depths placeholder, depths hint)
+SEARCH_FIELDS = {
+    SEARCH_WIDTH: (
+        "server picks",
+        "or widths, like 149, 150, 151",
+        "server's",
+        "or strip depths, like 48, 56, 64",
+    ),
+    SEARCH_BOARD: (
+        "server picks",
+        "or a size, like 150 x 168",
+        "server's",
+        "or border depths, like 24, 28; full search last",
+    ),
+    SEARCH_SYMMETRIC: (
+        "server picks",
+        "or a size, like 150 x 168",
+        "server's",
+        "or border depths, like 24, 28; full search last",
+    ),
+}
+MUTED = "#66706b"
+FIELD_WIDTH = 26
+LABEL_WIDTH_PX = 130
+SECTION_INDENT_PX = 12  # a section's border and padding
+CONTACT = "Drakou111 on Discord"
 BUTTON_HELP_DEFAULT = "Point at a button to see what it does."
 BUTTON_HELP = {
     "start": "Start: get a size from the server and search it, then the next one, until you stop.",
@@ -71,6 +106,77 @@ BUTTON_HELP = {
     "give_up": "Give back size: end the search and return the size to the server, so someone else "
     "can take it.",
 }
+
+
+class HintEntry(ttk.Entry):
+    """An entry that shows grey default text while it is empty and not being typed in."""
+
+    def __init__(self, master, placeholder: str, width: int, show: str = "") -> None:
+        super().__init__(master, width=width)
+        self._placeholder = placeholder
+        self._show = show
+        self._hinted = False
+        self._listeners: list = []
+        self.bind("<FocusIn>", lambda _e: self._unhint())
+        self.bind("<FocusOut>", lambda _e: self._refresh())
+        self.bind("<KeyRelease>", lambda _e: self._changed())
+        self._refresh()
+
+    @property
+    def value(self) -> str:
+        return "" if self._hinted else self.get()
+
+    def set_value(self, text: str) -> None:
+        with self._editable():
+            self.delete(0, "end")
+            self._hinted = False
+            self.configure(foreground="", show=self._show)
+            self.insert(0, text)
+        self._refresh()
+        self._changed()
+
+    def set_placeholder(self, text: str) -> None:
+        self._placeholder = text
+        if self._hinted:
+            with self._editable():
+                self.delete(0, "end")
+                self.insert(0, text)
+
+    def on_change(self, callback) -> None:
+        self._listeners.append(callback)
+
+    def _changed(self) -> None:
+        for callback in self._listeners:
+            callback()
+
+    def _unhint(self) -> None:
+        if self._hinted:
+            with self._editable():
+                self.delete(0, "end")
+                self.configure(foreground="", show=self._show)
+            self._hinted = False
+
+    def _refresh(self) -> None:
+        if self.get() or self.focus_get() is self:
+            return
+        with self._editable():
+            self.configure(foreground=MUTED, show="")
+            self.insert(0, self._placeholder)
+        self._hinted = True
+
+    def _editable(self):
+        """Changing the text of a disabled entry needs it enabled for a moment."""
+        entry = self
+
+        class Enabled:
+            def __enter__(self) -> None:
+                self.state = str(entry.cget("state"))
+                entry.configure(state="normal")
+
+            def __exit__(self, *exc) -> None:
+                entry.configure(state=self.state)
+
+        return Enabled()
 
 
 def combined_state(states: list[State]) -> State:
@@ -98,13 +204,13 @@ class App:
         self._key = load_submit_key()
         self.slots: list[Controller] = []
         self.slot_status: dict[int, Status] = {}
-        settings = self.store.load()
-        self._server_url = settings.server_url
+        form = self.store.load()
+        self._server_url = form.server_url.strip() or default_server_url()
         self._closing = threading.Event()
         self._ready_update: tuple[Updater, Path, str] | None = None
         self._update_key = bytes.fromhex(update_key_hex) if update_key_hex else b""
         self._install_path = install_path or installed_executable()
-        self._build(settings)
+        self._build(form)
         if self._update_key:
             remove_previous_version(self._install_path)
             threading.Thread(
@@ -113,162 +219,131 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(PUMP_MS, self._pump)
 
-    def _build(self, settings: Settings) -> None:
+    def _build(self, form: Form) -> None:
         root = self.root
         root.title(f"{APP_TITLE} {__version__}")
-        root.minsize(600, 560)
+        root.minsize(640, 600)
         main = ttk.Frame(root, padding=12)
         main.pack(fill="both", expand=True)
 
         self.update_bar = ttk.Frame(main)
         self.update_var = tk.StringVar()
-        ttk.Label(self.update_bar, textvariable=self.update_var, wraplength=420).pack(
+        ttk.Label(self.update_bar, textvariable=self.update_var, wraplength=480).pack(
             side="left"
         )
         self.update_button = ttk.Button(
             self.update_bar, text="Restart now", command=self.restart_clicked
         )
 
-        form = self.form = ttk.Frame(main)
-        form.pack(fill="x")
-        self.name_var = tk.StringVar(value=settings.name)
-        self.ram_var = tk.StringVar(value=f"{settings.max_ram_mb / 1024:.1f}")
-        self.threads_var = tk.StringVar(value=str(settings.max_threads))
-        self.parallel_var = tk.StringVar(value=str(settings.parallel))
-        self.url_var = tk.StringVar(value=settings.server_url)
-        self.token_var = tk.StringVar(value=settings.access_token)
-        self.no_limit_var = tk.BooleanVar(value=settings.no_time_limit)
-        self.tree_var = tk.BooleanVar(value=settings.tree_progress)
-        self.search_var = tk.StringVar(value=SEARCH_LABELS[settings.search])
-        self.search_hint_var = tk.StringVar()
-        self.stages_var = tk.StringVar(value=settings.custom_stages)
-        self.width_var = tk.StringVar()
-        self.height_var = tk.StringVar()
-        total_gb = installed_ram_mb() / 1024
-        cores = os.cpu_count() or 1
+        self.form = ttk.Frame(main)
+        self.form.pack(fill="x")
+        top = ttk.Frame(self.form)
+        top.pack(fill="x", pady=(0, 8))
+        top.columnconfigure(0, minsize=LABEL_WIDTH_PX + SECTION_INDENT_PX)
+        top.columnconfigure(2, weight=1)
+        ttk.Label(top, text="Your name").grid(row=0, column=0, sticky="w")
+        self.name_entry = HintEntry(
+            top, "shown next to your results", width=FIELD_WIDTH
+        )
+        self.name_entry.grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(top, text="Empty fields use the default.", foreground=MUTED).grid(
+            row=0, column=2, sticky="e"
+        )
 
-        ttk.Label(form, text="Your name").grid(row=0, column=0, sticky="w", pady=2)
-        self.name_entry = ttk.Entry(form, textvariable=self.name_var, width=30)
-        self.name_entry.grid(row=0, column=1, columnspan=2, sticky="we", pady=2)
-        ttk.Label(form, text="Max RAM (GB)").grid(row=1, column=0, sticky="w", pady=2)
-        self.ram_entry = ttk.Spinbox(
-            form,
-            textvariable=self.ram_var,
-            from_=0.5,
-            to=round(total_gb, 1),
-            increment=0.5,
-            width=8,
-        )
-        self.ram_entry.grid(row=1, column=1, sticky="w", pady=2)
-        ttk.Label(form, text=f"of {total_gb:.1f} GB installed").grid(
-            row=1, column=2, sticky="w"
-        )
-        ttk.Label(form, text="CPU threads").grid(row=2, column=0, sticky="w", pady=2)
-        self.threads_entry = ttk.Spinbox(
-            form, textvariable=self.threads_var, from_=1, to=cores, increment=1, width=8
-        )
-        self.threads_entry.grid(row=2, column=1, sticky="w", pady=2)
-        ttk.Label(form, text=f"of {cores}").grid(row=2, column=2, sticky="w")
-        ttk.Label(form, text="Parallel sizes").grid(row=3, column=0, sticky="w", pady=2)
-        self.parallel_entry = ttk.Spinbox(
-            form,
-            textvariable=self.parallel_var,
-            from_=1,
-            to=cores,
-            increment=1,
-            width=8,
-        )
-        self.parallel_entry.grid(row=3, column=1, sticky="w", pady=2)
-        self.share_var = tk.StringVar()
-        ttk.Label(form, textvariable=self.share_var).grid(row=3, column=2, sticky="w")
-        for var in (self.ram_var, self.threads_var, self.parallel_var):
-            var.trace_add("write", lambda *_: self._show_share())
-        self._show_share()
-        ttk.Label(form, text="Search").grid(row=4, column=0, sticky="w", pady=2)
+        search = ttk.LabelFrame(self.form, text="What to search", padding=(10, 6))
+        search.pack(fill="x")
+        search.columnconfigure(0, minsize=LABEL_WIDTH_PX)
+        search.columnconfigure(2, weight=1)
+        self.search_var = tk.StringVar(value=SEARCH_LABELS[form.search])
+        ttk.Label(search, text="Search").grid(row=0, column=0, sticky="w", pady=3)
         self.search_box = ttk.Combobox(
-            form,
+            search,
             textvariable=self.search_var,
             values=list(SEARCH_LABELS.values()),
             state="readonly",
-            width=26,
+            width=FIELD_WIDTH - 3,
         )
-        self.search_box.grid(row=4, column=1, columnspan=2, sticky="w", pady=2)
+        self.search_box.grid(row=0, column=1, sticky="w", padx=8, pady=3)
         self.search_box.bind("<<ComboboxSelected>>", lambda _e: self._apply_search())
+        self.search_hint_var = tk.StringVar()
         ttk.Label(
-            form,
+            search,
             textvariable=self.search_hint_var,
-            foreground="#66706b",
-            wraplength=520,
-        ).grid(row=5, column=0, columnspan=3, sticky="w")
-        ttk.Label(form, text="Request (optional)").grid(
-            row=6, column=0, sticky="w", pady=2
+            foreground=MUTED,
+            wraplength=480,
+        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=8, pady=(0, 4))
+        self.request_entry = self._row(search, 2, "Request", "")
+        self.stages_entry = self._row(search, 3, "Depths", "")
+        self.time_entry = self._row(
+            search, 4, "Time limit", "server's", "hours per stage; 0 = no limit"
         )
-        request = ttk.Frame(form)
-        request.grid(row=6, column=1, columnspan=2, sticky="w", pady=2)
-        self.width_entry = ttk.Entry(request, textvariable=self.width_var, width=24)
-        self.width_entry.pack(side="left")
-        ttk.Label(request, text=" x ").pack(side="left")
-        self.height_entry = ttk.Entry(request, textvariable=self.height_var, width=6)
-        self.height_entry.pack(side="left")
-        ttk.Label(
-            form,
-            text="Strip widths: one or more widths, like 149, 150, 151 (no height); each runs until it "
-            "is ruled out, then the server picks. Rectangle sizes and the hunt: width x height.",
-            foreground="#66706b",
-            wraplength=520,
-        ).grid(row=7, column=0, columnspan=3, sticky="w")
-        form.columnconfigure(2, weight=1)
+        self.request_hint_var = tk.StringVar()
+        self.stages_hint_var = tk.StringVar()
+        for row, var in ((2, self.request_hint_var), (3, self.stages_hint_var)):
+            search.grid_slaves(row=row, column=2)[0].configure(textvariable=var)
 
-        self.advanced_shown = tk.BooleanVar(value=False)
-        self.advanced_check = ttk.Checkbutton(
-            main,
-            text="Advanced",
-            variable=self.advanced_shown,
-            command=self._toggle_advanced,
+        computer = ttk.LabelFrame(self.form, text="This computer", padding=(10, 6))
+        computer.pack(fill="x", pady=(8, 0))
+        computer.columnconfigure(0, minsize=LABEL_WIDTH_PX)
+        computer.columnconfigure(2, weight=1)
+        total_gb = installed_ram_mb() / 1024
+        self.ram_entry = self._row(
+            computer,
+            0,
+            "RAM (GB)",
+            f"{default_ram_mb() / 1024:.1f}",
+            f"of {total_gb:.1f} GB installed",
         )
-        self.advanced_check.pack(anchor="w", pady=(6, 0))
-        self.advanced = ttk.Frame(main)
-        ttk.Label(self.advanced, text="Server").grid(
-            row=0, column=0, sticky="w", pady=2
+        self.threads_entry = self._row(
+            computer,
+            1,
+            "CPU threads",
+            str(default_threads()),
+            f"of {os.cpu_count() or 1}",
         )
-        self.url_entry = ttk.Entry(self.advanced, textvariable=self.url_var, width=40)
-        self.url_entry.grid(row=0, column=1, columnspan=3, sticky="we", pady=2)
-        ttk.Label(self.advanced, text="Access token").grid(
-            row=2, column=0, sticky="w", pady=2
-        )
-        self.token_entry = ttk.Entry(
-            self.advanced, textvariable=self.token_var, width=40, show="*"
-        )
-        self.token_entry.grid(row=2, column=1, columnspan=3, sticky="we", pady=2)
-        self.no_limit_check = ttk.Checkbutton(
-            self.advanced,
-            text="No time limit: search each size until it is decided (can take days)",
-            variable=self.no_limit_var,
-        )
-        self.no_limit_check.grid(row=3, column=0, columnspan=4, sticky="w", pady=2)
+        self.parallel_entry = self._row(computer, 2, "Parallel searches", "1", "")
+        self.share_var = tk.StringVar()
+        computer.grid_slaves(row=2, column=2)[0].configure(textvariable=self.share_var)
+        self.tree_var = tk.BooleanVar(value=form.tree_progress)
         self.tree_check = ttk.Checkbutton(
-            self.advanced,
-            text="Show tree progress (closed X/Y): half the threads use CP-SAT's tree search instead",
+            computer,
+            text="Show tree progress (closed X/Y); half the threads then use CP-SAT's tree search",
             variable=self.tree_var,
         )
-        self.tree_check.grid(row=4, column=0, columnspan=4, sticky="w", pady=2)
-        ttk.Label(self.advanced, text="Custom stages").grid(
-            row=6, column=0, sticky="w", pady=2
+        self.tree_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(3, 0))
+
+        connection = ttk.LabelFrame(self.form, text="Connection", padding=(10, 6))
+        connection.pack(fill="x", pady=(8, 0))
+        connection.columnconfigure(0, minsize=LABEL_WIDTH_PX)
+        connection.columnconfigure(2, weight=1)
+        self.url_entry = self._row(connection, 0, "Server", default_server_url(), "")
+        self.token_entry = self._row(
+            connection,
+            1,
+            "Access token",
+            "",
+            f"ask {CONTACT} for one",
+            show="*",
         )
-        self.stages_entry = ttk.Entry(
-            self.advanced, textvariable=self.stages_var, width=20
-        )
-        self.stages_entry.grid(row=6, column=1, columnspan=3, sticky="w", pady=2)
-        ttk.Label(
-            self.advanced,
-            text="Border depths to try in order, like 24, 28, 32; the full search always runs last. "
-            "Leave empty for the server's stages.",
-            foreground="#66706b",
-            wraplength=520,
-        ).grid(row=7, column=0, columnspan=4, sticky="w")
+
+        for entry, value in (
+            (self.name_entry, form.name),
+            (self.request_entry, form.request),
+            (self.stages_entry, form.stages),
+            (self.time_entry, form.time_limit_hours),
+            (self.ram_entry, form.ram_gb),
+            (self.threads_entry, form.threads),
+            (self.parallel_entry, form.parallel),
+            (self.url_entry, form.server_url),
+            (self.token_entry, form.access_token),
+        ):
+            entry.set_value(value)
+        for entry in (self.ram_entry, self.threads_entry, self.parallel_entry):
+            entry.on_change(self._show_share)
+        self._show_share()
 
         self.buttons = ttk.Frame(main)
-        self.buttons.pack(fill="x", pady=8)
+        self.buttons.pack(fill="x", pady=(10, 4))
         self.start_button = ttk.Button(
             self.buttons, text="Start", command=self.start_clicked
         )
@@ -294,15 +369,15 @@ class App:
             )
             button.bind("<Leave>", lambda _e: self.help_var.set(BUTTON_HELP_DEFAULT))
         ttk.Label(
-            main, textvariable=self.help_var, foreground="#66706b", wraplength=560
+            main, textvariable=self.help_var, foreground=MUTED, wraplength=600
         ).pack(anchor="w")
         self.error_var = tk.StringVar()
         ttk.Label(
-            main, textvariable=self.error_var, foreground="#c92a2a", wraplength=540
+            main, textvariable=self.error_var, foreground="#c92a2a", wraplength=600
         ).pack(anchor="w")
 
         status = ttk.LabelFrame(main, text="Status", padding=8)
-        status.pack(fill="x")
+        status.pack(fill="x", pady=(4, 0))
         self.summary_var = tk.StringVar(value="Idle. Finished sizes: 0")
         ttk.Label(status, textvariable=self.summary_var).pack(anchor="w")
         columns = ("size", "stage", "time", "progress", "ram")
@@ -330,16 +405,56 @@ class App:
         )
         self._picture_image: tk.PhotoImage | None = None
 
-        self.log = ScrolledText(main, height=10, state="disabled", wrap="word")
+        self.log = ScrolledText(main, height=8, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, pady=(8, 0))
         self._apply_state(State.IDLE)
+
+    @staticmethod
+    def _row(
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        placeholder: str,
+        hint: str = "",
+        show: str = "",
+    ) -> "HintEntry":
+        """label | entry (grey default text when empty) | grey hint."""
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
+        entry = HintEntry(parent, placeholder, width=FIELD_WIDTH, show=show)
+        entry.grid(row=row, column=1, sticky="w", padx=8, pady=3)
+        ttk.Label(parent, text=hint, foreground=MUTED).grid(
+            row=row, column=2, sticky="w"
+        )
+        return entry
 
     def _search(self) -> str:
         label = self.search_var.get()
         return next(k for k, v in SEARCH_LABELS.items() if v == label)
 
     def _apply_search(self) -> None:
-        self.search_hint_var.set(SEARCH_HINTS[self._search()])
+        """Only words change with the search; every field stays where it is."""
+        search = self._search()
+        self.search_hint_var.set(SEARCH_HINTS[search])
+        request, request_hint, stages, stages_hint = SEARCH_FIELDS[search]
+        self.request_entry.set_placeholder(request)
+        self.request_hint_var.set(request_hint)
+        self.stages_entry.set_placeholder(stages)
+        self.stages_hint_var.set(stages_hint)
+
+    def form_values(self) -> Form:
+        return Form(
+            name=self.name_entry.value,
+            search=self._search(),
+            request=self.request_entry.value,
+            stages=self.stages_entry.value,
+            time_limit_hours=self.time_entry.value,
+            ram_gb=self.ram_entry.value,
+            threads=self.threads_entry.value,
+            parallel=self.parallel_entry.value,
+            tree_progress=self.tree_var.get(),
+            server_url=self.url_entry.value,
+            access_token=self.token_entry.value,
+        )
 
     def _button_help(self, key: str) -> str:
         if key == "pause" and self.state == State.PAUSED:
@@ -348,17 +463,16 @@ class App:
             return BUTTON_HELP["start_again"]
         return BUTTON_HELP[key]
 
-    def _toggle_advanced(self) -> None:
-        if self.advanced_shown.get():
-            self.advanced.pack(after=self.advanced_check, fill="x")
-        else:
-            self.advanced.pack_forget()
-
     def _show_share(self) -> None:
+        form = self.form_values()
         try:
-            parallel = max(1, int(self.parallel_var.get()))
-            threads = int(self.threads_var.get()) // parallel
-            ram_gb = float(self.ram_var.get()) / parallel
+            parallel = int(form.parallel) if form.parallel.strip() else 1
+            threads = (
+                int(form.threads) if form.threads.strip() else default_threads()
+            ) // max(1, parallel)
+            ram_gb = (
+                float(form.ram_gb) if form.ram_gb.strip() else default_ram_mb() / 1024
+            ) / max(1, parallel)
         except ValueError:
             self.share_var.set("")
             return
@@ -367,31 +481,25 @@ class App:
     # buttons
     def start_clicked(self) -> None:
         self.error_var.set("")
+        form = self.form_values()
         try:
-            settings = Settings(
-                name=self.name_var.get(),
-                max_ram_mb=int(float(self.ram_var.get()) * 1024),
-                max_threads=int(self.threads_var.get()),
-                server_url=self.url_var.get(),
-                parallel=int(self.parallel_var.get()),
-                access_token=self.token_var.get(),
-                no_time_limit=self.no_limit_var.get(),
-                tree_progress=self.tree_var.get(),
-                search=self._search(),
-                custom_stages=self.stages_var.get(),
-            ).validated()
-            requested, widths = self._request()
+            resolved = form.resolve()
         except ValueError as error:
             self.error_var.set(str(error))
             return
-        self.store.save(settings)
-        self.stages_var.set(settings.custom_stages)
+        self.store.save(form)
+        settings = resolved.settings
+        widths = (
+            WidthQueue(resolved.requested_widths) if resolved.requested_widths else None
+        )
         self._server_url = settings.server_url
         if self.state == State.IDLE:
             self._set_slot_count(settings.parallel)
         for index, controller in enumerate(self.slots):
             controller.start(
-                settings.slot_settings(), requested if index == 0 else None, widths
+                settings.slot_settings(),
+                resolved.requested_size if index == 0 else None,
+                widths,
             )
 
     def pause_clicked(self) -> None:
@@ -402,8 +510,8 @@ class App:
             getattr(controller, command)()
 
     def _set_slot_count(self, count: int) -> None:
-        """Only while idle: rebuild the searches when the Parallel sizes setting changed (their log labels
-        depend on the count)."""
+        """Only while idle: rebuild the searches when the Parallel searches setting changed (their log
+        labels depend on the count)."""
         if len(self.slots) == count:
             return
         for controller in self.slots:
@@ -421,22 +529,6 @@ class App:
             )
             controller.launch()
             self.slots.append(controller)
-
-    def _request(self) -> tuple[tuple[int, int] | None, WidthQueue | None]:
-        """(a requested rectangle size, the requested strip widths); either may be None."""
-        w, h = self.width_var.get().strip(), self.height_var.get().strip()
-        if self._search() == SEARCH_WIDTH:
-            if h:
-                raise ValueError(
-                    "for strip widths, list widths only (like 149, 150, 151) and leave the height empty"
-                )
-            widths = parse_widths(w)
-            return None, WidthQueue(widths) if widths else None
-        if not w and not h:
-            return None, None
-        if not (w.isdigit() and h.isdigit()):
-            raise ValueError("a requested size needs a whole-number width and height")
-        return (int(w), int(h)), None
 
     def close(self) -> None:
         self._closing.set()
@@ -677,16 +769,15 @@ class App:
         field_state = "normal" if idle else "disabled"
         for entry in (
             self.name_entry,
+            self.request_entry,
+            self.stages_entry,
+            self.time_entry,
             self.ram_entry,
             self.threads_entry,
             self.parallel_entry,
+            self.tree_check,
             self.url_entry,
             self.token_entry,
-            self.no_limit_check,
-            self.tree_check,
-            self.stages_entry,
-            self.width_entry,
-            self.height_entry,
         ):
             entry.configure(state=field_state)
         self.search_box.configure(state="readonly" if idle else "disabled")
@@ -704,7 +795,7 @@ def main() -> None:
         messagebox.showerror(APP_TITLE, str(error))
         root.destroy()
         return
-    if os.environ.get("TILINGVOL_AUTOSTART") == "1" and app.name_var.get().strip():
+    if os.environ.get("TILINGVOL_AUTOSTART") == "1" and app.name_entry.value.strip():
         # e.g. for starting with the computer
         root.after(AUTOSTART_DELAY_MS, app.start_clicked)
     root.mainloop()

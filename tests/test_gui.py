@@ -62,36 +62,39 @@ def test_full_button_cycle(app, server):
     assert (
         app._install_path.parent / "fe70-9.9.9-windows.exe.download"
     ).read_bytes() == b"new app version"
-    app.name_var.set("  ")
+    # empty fields show grey defaults, but read as empty
+    assert app.request_entry.value == "" and app.request_entry.get() == "server picks"
+    assert app.ram_entry.get() == f"{gui.default_ram_mb() / 1024:.1f}"
+    app.name_entry.set_value("  ")
     app.start_clicked()
     assert "name" in app.error_var.get()
     assert app.state == State.IDLE
-    app.name_var.set("gui tester")
-    app.stages_var.set("28, 24")
+    app.name_entry.set_value("gui tester")
+    app.stages_entry.set_value("28, 24")
     app.start_clicked()
     assert "go up" in app.error_var.get()
-    assert app.state == State.IDLE
-    app.stages_var.set("")
+    app.stages_entry.set_value("")
     app.search_var.set(gui.SEARCH_LABELS["width"])
     app.search_box.event_generate("<<ComboboxSelected>>")
     assert "half-strip" in app.search_hint_var.get()
-    app.width_var.set("149, x")
+    assert "149, 150" in app.request_hint_var.get()
+    app.request_entry.set_value("149, x")
     app.start_clicked()
     assert "whole numbers" in app.error_var.get()
-    app.width_var.set("149, 150")
-    app.height_var.set("40")
-    app.start_clicked()
-    assert "leave the height empty" in app.error_var.get()
     app.search_var.set(gui.SEARCH_LABELS["board"])
     app.search_box.event_generate("<<ComboboxSelected>>")
+    assert "150 x 168" in app.request_hint_var.get()
+    app.request_entry.set_value("149, 150, 151")
     app.start_clicked()
-    assert "whole-number width and height" in app.error_var.get()
+    assert "width x height" in app.error_var.get()
+    app.ram_entry.set_value("lots")
+    app.start_clicked()
+    assert "RAM must be a number" in app.error_var.get()
     assert app.state == State.IDLE
-    app.ram_var.set("2")
-    app.threads_var.set("2")
-    app.url_var.set(live_server.url)
-    app.width_var.set("35")
-    app.height_var.set("40")
+    app.ram_entry.set_value("2")
+    app.threads_entry.set_value("2")
+    app.url_entry.set_value(live_server.url)
+    app.request_entry.set_value("35 x 40")
     app.start_clicked()
     pump_until(
         app,
@@ -121,12 +124,11 @@ def test_full_button_cycle(app, server):
     app.give_up_button.invoke()
     pump_until(app, lambda: app.state == State.IDLE, 10)
     assert not live_server.db.active_jobs()
-    app.width_var.set("")
-    app.height_var.set("")
-    app.threads_var.set("4")
-    app.parallel_var.set("2")
+    app.request_entry.set_value("")
+    app.threads_entry.set_value("4")
+    app.parallel_entry.set_value("2")
     assert app.share_var.get() == "each: 2 threads, 1.0 GB"
-    app.ram_var.set("4")
+    app.ram_entry.set_value("4")
     app.start_clicked()
     assert len(app.slots) == 2
     # two searches at once, on different sizes, both reporting results
@@ -152,5 +154,10 @@ def test_full_button_cycle(app, server):
     assert "[1] " in log_text and "[2] " in log_text
     app.close()
     assert not live_server.db.active_jobs()
-    assert app.store.load().name == "gui tester"
-    assert app.store.load().search == "board"
+    saved = app.store.load()
+    assert (saved.name, saved.search, saved.ram_gb, saved.time_limit_hours) == (
+        "gui tester",
+        "board",
+        "4",
+        "",
+    )

@@ -94,6 +94,7 @@ class ApiClient:
         no_time_limit: bool = False,
         search: str = SEARCH_BOARD,
         custom_borders: tuple[int, ...] = (),
+        time_limit_s: float | None = None,
     ) -> Job:
         body = {
             "name": name,
@@ -103,6 +104,7 @@ class ApiClient:
             "width": width,
             "height": height,
             "no_time_limit": no_time_limit,
+            "time_limit_s": time_limit_s,
             "search": search,
             "hunt": search
             == SEARCH_SYMMETRIC,  # servers before 0.10 only know this flag
