@@ -31,7 +31,7 @@ from tilingvol.client.update import (
     installed_executable,
     remove_previous_version,
 )
-from tilingvol.client.width_queue import WidthQueue
+from tilingvol.client.width_queue import WidthQueue, parse_widths
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.pieces import piece_by_name
 from tilingvol.shared.protocol import SEARCH_BOARD, SEARCH_SYMMETRIC, SEARCH_WIDTH
@@ -141,7 +141,6 @@ class App:
         self.tree_var = tk.BooleanVar(value=settings.tree_progress)
         self.search_var = tk.StringVar(value=SEARCH_LABELS[settings.search])
         self.search_hint_var = tk.StringVar()
-        self.widths_var = tk.StringVar(value=settings.widths)
         self.stages_var = tk.StringVar(value=settings.custom_stages)
         self.width_var = tk.StringVar()
         self.height_var = tk.StringVar()
@@ -201,17 +200,23 @@ class App:
             foreground="#66706b",
             wraplength=520,
         ).grid(row=5, column=0, columnspan=3, sticky="w")
-        self.widths_label = ttk.Label(form, text="Widths (optional)")
-        self.widths_label.grid(row=6, column=0, sticky="w", pady=2)
-        self.widths_entry = ttk.Entry(form, textvariable=self.widths_var, width=30)
-        self.widths_entry.grid(row=6, column=1, columnspan=2, sticky="w", pady=2)
-        self.widths_hint = ttk.Label(
+        ttk.Label(form, text="Request (optional)").grid(
+            row=6, column=0, sticky="w", pady=2
+        )
+        request = ttk.Frame(form)
+        request.grid(row=6, column=1, columnspan=2, sticky="w", pady=2)
+        self.width_entry = ttk.Entry(request, textvariable=self.width_var, width=24)
+        self.width_entry.pack(side="left")
+        ttk.Label(request, text=" x ").pack(side="left")
+        self.height_entry = ttk.Entry(request, textvariable=self.height_var, width=6)
+        self.height_entry.pack(side="left")
+        ttk.Label(
             form,
-            text="Like 149, 150, 151: these run first, each until it is ruled out; then the server picks.",
+            text="Strip widths: one or more widths, like 149, 150, 151 (no height); each runs until it "
+            "is ruled out, then the server picks. Rectangle sizes and the hunt: width x height.",
             foreground="#66706b",
             wraplength=520,
-        )
-        self.widths_hint.grid(row=7, column=0, columnspan=3, sticky="w")
+        ).grid(row=7, column=0, columnspan=3, sticky="w")
         form.columnconfigure(2, weight=1)
 
         self.advanced_shown = tk.BooleanVar(value=False)
@@ -261,18 +266,6 @@ class App:
             foreground="#66706b",
             wraplength=520,
         ).grid(row=7, column=0, columnspan=4, sticky="w")
-        ttk.Label(self.advanced, text="Request a size (optional)").grid(
-            row=1, column=0, sticky="w", pady=2
-        )
-        self.width_entry = ttk.Entry(
-            self.advanced, textvariable=self.width_var, width=6
-        )
-        self.width_entry.grid(row=1, column=1, sticky="w")
-        ttk.Label(self.advanced, text="x").grid(row=1, column=2)
-        self.height_entry = ttk.Entry(
-            self.advanced, textvariable=self.height_var, width=6
-        )
-        self.height_entry.grid(row=1, column=3, sticky="w")
 
         self.buttons = ttk.Frame(main)
         self.buttons.pack(fill="x", pady=8)
@@ -346,20 +339,7 @@ class App:
         return next(k for k, v in SEARCH_LABELS.items() if v == label)
 
     def _apply_search(self) -> None:
-        """Fields that mean nothing for the chosen search are greyed out (only while idle)."""
-        search = self._search()
-        self.search_hint_var.set(SEARCH_HINTS[search])
-        width = search == SEARCH_WIDTH
-        for widget in (self.widths_label, self.widths_entry, self.widths_hint):
-            if width:
-                widget.grid()
-            else:
-                widget.grid_remove()
-        if self.state != State.IDLE:
-            return
-        state = "disabled" if width else "normal"
-        for entry in (self.width_entry, self.height_entry, self.stages_entry):
-            entry.configure(state=state)
+        self.search_hint_var.set(SEARCH_HINTS[self._search()])
 
     def _button_help(self, key: str) -> str:
         if key == "pause" and self.state == State.PAUSED:
@@ -398,21 +378,14 @@ class App:
                 no_time_limit=self.no_limit_var.get(),
                 tree_progress=self.tree_var.get(),
                 search=self._search(),
-                widths=self.widths_var.get(),
                 custom_stages=self.stages_var.get(),
             ).validated()
-            requested = self._requested_size()
+            requested, widths = self._request()
         except ValueError as error:
             self.error_var.set(str(error))
             return
         self.store.save(settings)
         self.stages_var.set(settings.custom_stages)
-        self.widths_var.set(settings.widths)
-        widths = (
-            WidthQueue(settings.requested_widths)
-            if settings.search == SEARCH_WIDTH and settings.requested_widths
-            else None
-        )
         self._server_url = settings.server_url
         if self.state == State.IDLE:
             self._set_slot_count(settings.parallel)
@@ -449,15 +422,21 @@ class App:
             controller.launch()
             self.slots.append(controller)
 
-    def _requested_size(self) -> tuple[int, int] | None:
+    def _request(self) -> tuple[tuple[int, int] | None, WidthQueue | None]:
+        """(a requested rectangle size, the requested strip widths); either may be None."""
         w, h = self.width_var.get().strip(), self.height_var.get().strip()
         if self._search() == SEARCH_WIDTH:
-            return None  # widths come from the Widths field
+            if h:
+                raise ValueError(
+                    "for strip widths, list widths only (like 149, 150, 151) and leave the height empty"
+                )
+            widths = parse_widths(w)
+            return None, WidthQueue(widths) if widths else None
         if not w and not h:
-            return None
+            return None, None
         if not (w.isdigit() and h.isdigit()):
             raise ValueError("a requested size needs a whole-number width and height")
-        return int(w), int(h)
+        return (int(w), int(h)), None
 
     def close(self) -> None:
         self._closing.set()
@@ -705,7 +684,6 @@ class App:
             self.token_entry,
             self.no_limit_check,
             self.tree_check,
-            self.widths_entry,
             self.stages_entry,
             self.width_entry,
             self.height_entry,
