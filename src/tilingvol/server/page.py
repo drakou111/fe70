@@ -593,10 +593,15 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
             f"{PLATFORM_NAMES.get(key, escape(key))}</a>"
             for key, entry in sorted(manifest["platforms"].items())
         )
+        token_note = (
+            f" To run it you need an access token: ask <b>{escape(config.contact)}</b>."
+            if config.access_tokens and config.contact
+            else ""
+        )
         join_html = (
             f'<div class="card join"><div><h2>Join the search</h2><p>Download version '
             f"{escape(manifest['version'])}, enter a name and press Start. It uses only the RAM and "
-            f"CPU you allow, and can be paused any time.</p></div><div>{buttons}</div></div>"
+            f"CPU you allow, and can be paused any time.{token_note}</p></div><div>{buttons}</div></div>"
         )
 
     running_rows = "".join(
@@ -655,6 +660,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
     )
 
     hunt_html = render_hunt(db, scheduler, active)
+    contact_html = f" Contact: {escape(config.contact)}." if config.contact else ""
 
     recent = sorted(
         [r for r in results if r.source == "volunteer"]
@@ -711,5 +717,6 @@ checked by a complete computer search.</p>
 </div>
 <section class="card"><h2>Recent results</h2>{recent_html}</section>
 {hunt_html}
-<footer>Updated every 30 seconds. Raw data: <a href="/api/results">/api/results</a>.</footer>
+<footer>Updated every 30 seconds. Raw data: <a href="/api/results">/api/results</a> and
+<a href="/api/strips">/api/strips</a>.{contact_html}</footer>
 </main><script>{TOOLTIP_JS}</script></body></html>"""

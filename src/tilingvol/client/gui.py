@@ -31,6 +31,7 @@ from tilingvol.client.update import (
     installed_executable,
     remove_previous_version,
 )
+from tilingvol.client.width_queue import WidthQueue
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.pieces import piece_by_name
 from tilingvol.shared.protocol import SEARCH_BOARD, SEARCH_SYMMETRIC, SEARCH_WIDTH
@@ -140,7 +141,7 @@ class App:
         self.tree_var = tk.BooleanVar(value=settings.tree_progress)
         self.search_var = tk.StringVar(value=SEARCH_LABELS[settings.search])
         self.search_hint_var = tk.StringVar()
-        self.request_label_var = tk.StringVar()
+        self.widths_var = tk.StringVar(value=settings.widths)
         self.stages_var = tk.StringVar(value=settings.custom_stages)
         self.width_var = tk.StringVar()
         self.height_var = tk.StringVar()
@@ -200,6 +201,17 @@ class App:
             foreground="#66706b",
             wraplength=520,
         ).grid(row=5, column=0, columnspan=3, sticky="w")
+        self.widths_label = ttk.Label(form, text="Widths (optional)")
+        self.widths_label.grid(row=6, column=0, sticky="w", pady=2)
+        self.widths_entry = ttk.Entry(form, textvariable=self.widths_var, width=30)
+        self.widths_entry.grid(row=6, column=1, columnspan=2, sticky="w", pady=2)
+        self.widths_hint = ttk.Label(
+            form,
+            text="Like 149, 150, 151: these run first, each until it is ruled out; then the server picks.",
+            foreground="#66706b",
+            wraplength=520,
+        )
+        self.widths_hint.grid(row=7, column=0, columnspan=3, sticky="w")
         form.columnconfigure(2, weight=1)
 
         self.advanced_shown = tk.BooleanVar(value=False)
@@ -249,7 +261,7 @@ class App:
             foreground="#66706b",
             wraplength=520,
         ).grid(row=7, column=0, columnspan=4, sticky="w")
-        ttk.Label(self.advanced, textvariable=self.request_label_var).grid(
+        ttk.Label(self.advanced, text="Request a size (optional)").grid(
             row=1, column=0, sticky="w", pady=2
         )
         self.width_entry = ttk.Entry(
@@ -338,14 +350,16 @@ class App:
         search = self._search()
         self.search_hint_var.set(SEARCH_HINTS[search])
         width = search == SEARCH_WIDTH
-        self.request_label_var.set(
-            "Request a width (optional)" if width else "Request a size (optional)"
-        )
+        for widget in (self.widths_label, self.widths_entry, self.widths_hint):
+            if width:
+                widget.grid()
+            else:
+                widget.grid_remove()
         if self.state != State.IDLE:
             return
         state = "disabled" if width else "normal"
-        self.height_entry.configure(state=state)
-        self.stages_entry.configure(state=state)
+        for entry in (self.width_entry, self.height_entry, self.stages_entry):
+            entry.configure(state=state)
 
     def _button_help(self, key: str) -> str:
         if key == "pause" and self.state == State.PAUSED:
@@ -384,6 +398,7 @@ class App:
                 no_time_limit=self.no_limit_var.get(),
                 tree_progress=self.tree_var.get(),
                 search=self._search(),
+                widths=self.widths_var.get(),
                 custom_stages=self.stages_var.get(),
             ).validated()
             requested = self._requested_size()
@@ -392,12 +407,18 @@ class App:
             return
         self.store.save(settings)
         self.stages_var.set(settings.custom_stages)
+        self.widths_var.set(settings.widths)
+        widths = (
+            WidthQueue(settings.requested_widths)
+            if settings.search == SEARCH_WIDTH and settings.requested_widths
+            else None
+        )
         self._server_url = settings.server_url
         if self.state == State.IDLE:
             self._set_slot_count(settings.parallel)
         for index, controller in enumerate(self.slots):
             controller.start(
-                settings.slot_settings(), requested if index == 0 else None
+                settings.slot_settings(), requested if index == 0 else None, widths
             )
 
     def pause_clicked(self) -> None:
@@ -428,14 +449,10 @@ class App:
             controller.launch()
             self.slots.append(controller)
 
-    def _requested_size(self) -> tuple[int, int | None] | None:
+    def _requested_size(self) -> tuple[int, int] | None:
         w, h = self.width_var.get().strip(), self.height_var.get().strip()
         if self._search() == SEARCH_WIDTH:
-            if not w:
-                return None
-            if not w.isdigit():
-                raise ValueError("a requested width must be a whole number")
-            return int(w), None
+            return None  # widths come from the Widths field
         if not w and not h:
             return None
         if not (w.isdigit() and h.isdigit()):
@@ -688,6 +705,7 @@ class App:
             self.token_entry,
             self.no_limit_check,
             self.tree_check,
+            self.widths_entry,
             self.stages_entry,
             self.width_entry,
             self.height_entry,

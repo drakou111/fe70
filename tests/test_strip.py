@@ -292,3 +292,60 @@ def test_a_real_run_rules_out_widths_and_sends_pictures(
     fill = server.db.strip_fills()[0]
     png = urllib.request.urlopen(f"{server.url}/strip/{fill.fill_id}.png").read()
     assert png.startswith(PNG_MAGIC)
+
+
+def test_width_queue_shares_widths_between_searches():
+    from tilingvol.client.width_queue import WidthQueue, parse_widths
+
+    assert parse_widths("149, 150 151") == (149, 150, 151)
+    for bad in ("149, x", "149, 149", "0"):
+        with pytest.raises(ValueError):
+            parse_widths(bad)
+    queue = WidthQueue((149, 150))
+    first, second, third = object(), object(), object()
+    assert (queue.claim(first), queue.claim(second), queue.claim(third)) == (
+        149,
+        150,
+        None,
+    )
+    assert queue.claim(first) == 149  # kept while it fills deeper
+    queue.drop(first)  # ruled out
+    queue.release(second)  # e.g. the app was closed: someone may take it again
+    assert queue.remaining() == (150,)
+    assert queue.claim(third) == 150 and queue.claim(first) is None
+
+
+def test_listed_widths_run_first_until_ruled_out(
+    strip_config,
+    make_live_server,
+    controller,  # noqa: F811 - fixture
+):
+    server = make_live_server(strip_config)
+    c, _ = controller
+    from tilingvol.client.width_queue import WidthQueue
+
+    queue = WidthQueue((11, 20))
+    c.start(replace(settings(server.url), search="width"), widths=queue)
+    wait_for(lambda: len(server.db.strip_results()) >= 3, 120)
+    c.stop()
+    widths = [r.width for r in server.db.strip_results()]
+    # 11 dies at once and leaves the list; 20 is then kept while it fills deeper
+    assert widths[0] == 11 and set(widths[1:]) == {20}
+    assert queue.remaining() == (20,)
+
+
+def test_the_page_and_the_token_error_say_whom_to_ask(strip_config, tmp_path):
+    config = replace(
+        strip_config,
+        access_tokens=frozenset({"a" * 20}),
+        download_dir=tmp_path,
+        contact="Drakou111 on Discord",
+    )
+    (tmp_path / "latest.json").write_text(
+        '{"version": "0.10.2", "platforms": {"windows": {"filename": "fe70.exe"}}}'
+    )
+    with TestClient(create_app(config)) as client:
+        page = client.get("/").text
+        assert "ask <b>Drakou111 on Discord</b>" in page
+        refused = request(client)
+        assert refused.status_code == 401 and "Drakou111 on Discord" in refused.text

@@ -34,6 +34,7 @@ from tilingvol.client.solver_process import (
     SolverTask,
     run_task,
 )
+from tilingvol.client.width_queue import WidthQueue
 from tilingvol.shared import token
 from tilingvol.shared.pieces import piece_by_name
 from tilingvol.shared.protocol import (
@@ -268,9 +269,8 @@ class Controller:
         self._commands: queue.Queue = queue.Queue()
         self._state = State.IDLE
         self._settings: Settings | None = None
-        self._requested: tuple[int, int | None] | None = (
-            None  # (width, None): a strip width
-        )
+        self._requested: tuple[int, int | None] | None = None
+        self._widths: WidthQueue | None = None
         self._api: ApiClient | None = None
         self._job: Job | None = None
         self._filled_stage = (
@@ -302,9 +302,13 @@ class Controller:
 
     # commands, safe to call from any thread
     def start(
-        self, settings: Settings, requested: tuple[int, int | None] | None = None
+        self,
+        settings: Settings,
+        requested: tuple[int, int | None] | None = None,
+        widths: WidthQueue | None = None,
     ) -> None:
-        self._commands.put(("start", settings, requested))
+        """widths: the volunteer's own strip widths, shared by the parallel searches (width search only)."""
+        self._commands.put(("start", settings, requested, widths))
 
     def pause(self) -> None:
         self._commands.put(("pause",))
@@ -361,9 +365,10 @@ class Controller:
                 return
             if self._state == State.RUNNING:
                 return
-            _, settings, requested = command
+            _, settings, requested, widths = command
             if self._state == State.IDLE:
                 self._settings, self._requested = settings, requested
+                self._widths = widths
                 self._api = ApiClient(settings.server_url, settings.access_token)
                 self._next_request_at = 0.0
                 self._memory_failures = 0
@@ -421,6 +426,9 @@ class Controller:
     def _request_job(self) -> None:
         settings = self._settings
         width, height = self._requested or (None, None)
+        queued = None
+        if width is None and self._widths is not None:
+            queued = width = self._widths.claim(self)
         try:
             self._job = self._api.request_job(
                 settings.name,
@@ -444,6 +452,9 @@ class Controller:
                 # a requested size is kept: the retry asks for it again
                 self._log(f"{error}. Retrying in {UNREACHABLE_RETRY_S:.0f} s.")
                 self._next_request_at = time.monotonic() + UNREACHABLE_RETRY_S
+            elif queued is not None:
+                self._widths.drop(self)
+                self._log(f"Skipping width {queued} from your list: {error}")
             else:
                 self._log(f"The server refused the request: {error}")
                 self._state = State.IDLE
@@ -691,6 +702,11 @@ class Controller:
         message = f"{self._prefix}{text}, after {format_duration(duration)}."
         log.info(message)
         self._on_event(Event("result", message))
+        if self._widths is not None and self._widths.holds(self, job.width):
+            if verdict == VERDICT_FILLED:
+                self._log(f"Width {job.width} from your list: going on deeper.")
+            else:
+                self._widths.drop(self)
         self._job = None
         self._flush_pending()
 
@@ -735,6 +751,12 @@ class Controller:
         job, self._job = self._job, None
         if job is None:
             return
+        if self._widths is not None and self._widths.holds(self, job.width):
+            # given back or too big for this computer: leave it; otherwise someone may retry it later
+            if reason in (RELEASE_GAVE_UP, RELEASE_MEMORY):
+                self._widths.drop(self)
+            else:
+                self._widths.release(self)
         self._send_frame(job)
         self._unsent_frame = None
         try:
@@ -760,6 +782,7 @@ class Controller:
             if error.status in (404, 409, 410):
                 self._log(f"The server cancelled this size: {error}")
                 self._drop_runner()
+                self._forget_width(job)
                 self._job = None
             elif error.status == 0:
                 self._log(
@@ -769,7 +792,12 @@ class Controller:
         if reply.get("cancel"):
             self._log(f"The server cancelled this size: {reply.get('reason', '')}")
             self._drop_runner()
+            self._forget_width(job)
             self._job = None
+
+    def _forget_width(self, job: Job) -> None:
+        if self._widths is not None and self._widths.holds(self, job.width):
+            self._widths.drop(self)
 
     def _flush_pending(self) -> None:
         self._next_pending_at = time.monotonic() + PENDING_RETRY_S

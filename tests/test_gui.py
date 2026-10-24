@@ -75,10 +75,17 @@ def test_full_button_cycle(app, server):
     app.search_var.set(gui.SEARCH_LABELS["width"])
     app.search_box.event_generate("<<ComboboxSelected>>")
     assert str(app.height_entry.cget("state")) == "disabled"
-    assert "Request a width" in app.request_label_var.get()
+    app.root.update()
+    assert app.widths_entry.winfo_ismapped()
+    app.widths_var.set("149, x")
+    app.start_clicked()
+    assert "whole numbers" in app.error_var.get()
+    app.widths_var.set("")
     app.search_var.set(gui.SEARCH_LABELS["board"])
     app.search_box.event_generate("<<ComboboxSelected>>")
     assert str(app.height_entry.cget("state")) == "normal"
+    app.root.update()
+    assert not app.widths_entry.winfo_ismapped()
     app.ram_var.set("2")
     app.threads_var.set("2")
     app.url_var.set(live_server.url)

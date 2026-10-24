@@ -172,6 +172,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     return JSONResponse(
                         {
                             "detail": "this server needs a valid access token (Advanced > Access token)"
+                            + (
+                                f"; ask {config.contact} for one"
+                                if config.contact
+                                else ""
+                            )
                         },
                         status_code=401,
                     )

@@ -65,6 +65,8 @@ class ServerConfig:
     strip_step: int = 8
     strip_stages: int = 6
     strip_max_timeouts: int = 2
+    # who to ask for an access token, shown on the page and in the app's "needs a token" message
+    contact: str = "Drakou111 on Discord"
     # if not empty, every job request/heartbeat/release/result must carry one of these tokens
     access_tokens: frozenset[str] = frozenset()
 
@@ -122,5 +124,6 @@ class ServerConfig:
             strip_first_rows=int(os.environ.get("TILINGVOL_STRIP_FIRST_ROWS", "24")),
             strip_step=int(os.environ.get("TILINGVOL_STRIP_STEP", "8")),
             strip_stages=int(os.environ.get("TILINGVOL_STRIP_STAGES", "6")),
+            contact=os.environ.get("TILINGVOL_CONTACT", "Drakou111 on Discord"),
             access_tokens=tokens,
         )

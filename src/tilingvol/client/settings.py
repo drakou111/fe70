@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from tilingvol.client.memory_guard import installed_ram_mb
+from tilingvol.client.width_queue import parse_widths
 from tilingvol.shared.protocol import (
     SEARCH_SYMMETRIC,
     SEARCH_WIDTH,
@@ -82,6 +83,8 @@ class Settings:
     search: str = SEARCH_WIDTH
     # own border depths, e.g. "24, 28, 32"; the full search always follows. Empty: the server's stages
     custom_stages: str = ""
+    # strip widths to run first, e.g. "149, 150, 151" (width search only); then the server picks
+    widths: str = ""
 
     @staticmethod
     def defaults() -> "Settings":
@@ -115,17 +118,23 @@ class Settings:
         if self.search not in SEARCHES:
             raise ValueError(f"unknown search {self.search!r}")
         depths = parse_custom_stages(self.custom_stages)
+        widths = parse_widths(self.widths)
         return replace(
             self,
             name=validate_name(self.name),
             server_url=self.server_url.strip(),
             access_token=token,
             custom_stages=", ".join(str(d) for d in depths),
+            widths=", ".join(str(w) for w in widths),
         )
 
     @property
     def symmetric_hunt(self) -> bool:
         return self.search == SEARCH_SYMMETRIC
+
+    @property
+    def requested_widths(self) -> tuple[int, ...]:
+        return parse_widths(self.widths)
 
     @property
     def custom_borders(self) -> tuple[int, ...]:
