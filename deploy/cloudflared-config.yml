@@ -1,6 +1,10 @@
 # /etc/cloudflared/config.yml - only the web API goes through the tunnel; never add SSH here.
 tunnel: REPLACE_WITH_TUNNEL_ID
 credentials-file: /etc/cloudflared/REPLACE_WITH_TUNNEL_ID.json
+# HTTP/2 over TCP instead of the default QUIC (UDP): home routers drop idle UDP connections, which made
+# the tunnel's connections die a few times a day ("timeout: no recent network activity") and requests on
+# them hang until the app gave up ("the read operation timed out").
+protocol: http2
 
 ingress:
   - hostname: tiling.REPLACE_WITH_YOUR_DOMAIN
