@@ -29,6 +29,7 @@ from tilingvol.shared.protocol import (
     LANE_STRIP,
     MAX_BORDER,
     MAX_CUSTOM_STAGES,
+    MAX_PEAK_RAM_MB,
     NO_LIMIT,
     RELEASE_REASONS,
     SEARCH_SYMMETRIC,
@@ -95,7 +96,7 @@ class Heartbeat(BaseModel):
 class Release(BaseModel):
     nonce: str = Field(max_length=64)
     reason: str = Field(max_length=20)
-    peak_ram_mb: int = Field(default=0, ge=0, le=10_000_000)
+    peak_ram_mb: int = Field(default=0, ge=0, le=MAX_PEAK_RAM_MB)
     detail: str = Field(default="", max_length=200)
 
 
@@ -112,7 +113,7 @@ class Submission(BaseModel):
     verdict: str = Field(max_length=12)
     stage_index: int = Field(ge=0, le=64)
     duration_s: float = Field(ge=0, le=1e8)
-    peak_ram_mb: int = Field(ge=0, le=10_000_000)
+    peak_ram_mb: int = Field(ge=0, le=MAX_PEAK_RAM_MB)
     salt: str = Field(max_length=64)
     token: str = Field(max_length=64)
     client_version: str = Field(max_length=20)

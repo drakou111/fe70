@@ -9,6 +9,9 @@ VERDICT_POSSIBLE = "possible"
 VERDICT_FILLED = "filled"  # strip jobs only: every depth of the job could be filled
 VERDICTS = (VERDICT_IMPOSSIBLE, VERDICT_TIMED_OUT, VERDICT_POSSIBLE, VERDICT_FILLED)
 
+# the largest RAM figure the server stores; readings above it are measurement glitches
+MAX_PEAK_RAM_MB = 10_000_000
+
 RELEASE_GAVE_UP = "gave_up"
 RELEASE_MEMORY = "memory"
 RELEASE_CLOSED = "closed"
@@ -165,7 +168,9 @@ class ResultSubmission:
     frame_placements: list[list[int]] | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data["peak_ram_mb"] = min(max(self.peak_ram_mb, 0), MAX_PEAK_RAM_MB)
+        return data
 
     @staticmethod
     def from_dict(data: dict) -> "ResultSubmission":

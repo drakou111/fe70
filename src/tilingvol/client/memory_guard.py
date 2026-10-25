@@ -18,14 +18,23 @@ MB = 1024 * 1024
 class MemoryVerdict:
     kill: bool
     reason: str
-    used_mb: int
+    used_mb: int | None  # None: no believable reading this time
 
 
-def process_memory_mb(process: psutil.Process) -> int:
-    """Private (committed) memory on Windows, resident memory elsewhere."""
+def possible_memory_mb() -> int:
+    """No process can commit more than RAM plus swap; a reading above it is a glitch, not a real size."""
+    return int((psutil.virtual_memory().total + psutil.swap_memory().total) // MB)
+
+
+def process_memory_mb(process: psutil.Process) -> int | None:
+    """Private (committed) memory on Windows, resident memory elsewhere; None when the reading is
+    impossible (seen on a volunteer's Windows machine: 117449263 MB)."""
     info = process.memory_info()
-    used = getattr(info, "private", 0) or info.rss
-    return int(used // MB)
+    limit = possible_memory_mb()
+    for used in (getattr(info, "private", 0), info.rss):
+        if used and used // MB <= limit:
+            return int(used // MB)
+    return None
 
 
 def installed_ram_mb() -> int:
@@ -42,7 +51,7 @@ def solver_soft_limit_mb(cap_mb: int) -> int:
 
 def check(process: psutil.Process, cap_mb: int) -> MemoryVerdict:
     used = process_memory_mb(process)
-    if used >= cap_mb * WATCHDOG_FRACTION:
+    if used is not None and used >= cap_mb * WATCHDOG_FRACTION:
         return MemoryVerdict(
             True, f"solver used {used} MB, close to the {cap_mb} MB limit", used
         )

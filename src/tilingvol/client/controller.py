@@ -218,8 +218,9 @@ class SolverRunner:
                 verdict = memory_guard.check(self._handle, self.cap_mb)
             except psutil.NoSuchProcess:
                 return
-            self.used_mb = verdict.used_mb
-            self.peak_mb = max(self.peak_mb, verdict.used_mb)
+            if verdict.used_mb is not None:
+                self.used_mb = verdict.used_mb
+                self.peak_mb = max(self.peak_mb, verdict.used_mb)
             if verdict.kill:
                 self._kill_locked("memory: " + verdict.reason)
                 return

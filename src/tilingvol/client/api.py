@@ -10,6 +10,7 @@ from tilingvol import __version__
 from tilingvol.client import tls
 from tilingvol.shared.pieces import PIECES
 from tilingvol.shared.protocol import (
+    MAX_PEAK_RAM_MB,
     MAX_STRIP_ROWS,
     SEARCH_BOARD,
     SEARCH_SYMMETRIC,
@@ -147,7 +148,7 @@ class ApiClient:
             {
                 "nonce": job.nonce,
                 "reason": reason,
-                "peak_ram_mb": peak_ram_mb,
+                "peak_ram_mb": min(max(peak_ram_mb, 0), MAX_PEAK_RAM_MB),
                 "detail": detail,
             },
         )
