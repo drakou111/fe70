@@ -87,6 +87,9 @@ class Status:
     progress: tuple[int, int] | None = None  # CP-SAT tree: closed, total
     finished: int = 0
     waiting_until: float = 0.0
+    last_reached: float = (
+        0.0  # time.time() of the last answer from the server, 0 if none yet
+    )
 
 
 @dataclass(frozen=True)
@@ -858,6 +861,7 @@ class Controller:
                     progress=runner.progress if runner else None,
                     finished=self._finished,
                     waiting_until=self._next_request_at if self._job is None else 0.0,
+                    last_reached=self._api.last_reached if self._api else 0.0,
                 ),
             )
         )

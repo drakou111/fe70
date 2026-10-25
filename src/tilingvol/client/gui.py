@@ -9,6 +9,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
@@ -90,6 +91,7 @@ SEARCH_FIELDS = {
     ),
 }
 MUTED = "#66706b"
+SILENCE_WARNING_S = 180
 FIELD_WIDTH = 26
 LABEL_WIDTH_PX = 130
 SECTION_INDENT_PX = 12  # a section's border and padding
@@ -177,6 +179,22 @@ class HintEntry(ttk.Entry):
                 entry.configure(state=self.state)
 
         return Enabled()
+
+
+def since(timestamp: float) -> str:
+    """How long ago, for the status line; a long silence says the searches go on anyway."""
+    if not timestamp:
+        return "not yet"
+    seconds = max(0, int(time.time() - timestamp))
+    if seconds < 60:
+        text = f"{seconds} s ago"
+    elif seconds < 3600:
+        text = f"{seconds // 60} min ago"
+    else:
+        text = f"{seconds // 3600} h {seconds % 3600 // 60} min ago"
+    if seconds >= SILENCE_WARNING_S:
+        text += " (retrying; searches continue and results are kept)"
+    return text
 
 
 def combined_state(states: list[State]) -> State:
@@ -744,9 +762,10 @@ class App:
         self._apply_state(combined_state(states))
         finished = sum(s.finished for s in self.slot_status.values())
         running = sum(1 for s in states if s == State.RUNNING)
+        reached = max((s.last_reached for s in self.slot_status.values()), default=0.0)
         self.summary_var.set(
             f"{self.state.value.capitalize()}: {running} of {len(self.slots)} searches "
-            f"running. Finished sizes: {finished}"
+            f"running. Finished sizes: {finished}. Server last reached: {since(reached)}"
         )
         self.table.delete(*self.table.get_children())
         for row in self.slot_rows():

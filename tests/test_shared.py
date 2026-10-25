@@ -244,3 +244,15 @@ def test_empty_form_fields_mean_the_defaults(monkeypatch):
         "0",
     )
     assert (old.search, old.stages) == ("symmetric", "24")
+
+
+def test_last_reached_reads_as_time_ago():
+    import time
+
+    from tilingvol.client.gui import SILENCE_WARNING_S, since
+
+    assert since(0.0) == "not yet"
+    assert since(time.time() - 30) == "30 s ago"
+    assert since(time.time() - 600).startswith("10 min ago")
+    assert "retrying" in since(time.time() - SILENCE_WARNING_S - 1)
+    assert "retrying" not in since(time.time() - 30)

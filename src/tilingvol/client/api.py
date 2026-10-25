@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -83,6 +84,9 @@ class ApiClient:
             )
         self.base_url = base_url.rstrip("/")
         self.access_token = access_token
+        self.last_reached = (
+            0.0  # time.time() of the last answer from the server (errors count)
+        )
 
     def request_job(
         self,
@@ -181,7 +185,9 @@ class ApiClient:
         try:
             with tls.urlopen(request, timeout=TIMEOUT_S) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
+            self.last_reached = time.time()
         except urllib.error.HTTPError as error:
+            self.last_reached = time.time()
             try:
                 detail = json.loads(error.read(MAX_RESPONSE_BYTES)).get(
                     "detail", error.reason

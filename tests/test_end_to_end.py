@@ -69,6 +69,7 @@ def test_runs_jobs_continuously_and_reports_impossible(live_server, controller):
     assert all(r.verdict == "impossible" and r.name == NAME for r in rows)
     assert rows[0].width * rows[0].height <= rows[1].width * rows[1].height
     assert recorder.has("IMPOSSIBLE") and recorder.has("Result accepted")
+    assert time.time() - recorder.last_status().last_reached < 60
 
 
 def test_finds_and_uploads_a_tiling(live_server, controller):
