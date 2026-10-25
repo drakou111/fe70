@@ -1,0 +1,46 @@
+[Unit]
+Description=fe70 hourly database backup
+
+[Service]
+Type=oneshot
+User=tilingvol
+Group=tilingvol
+WorkingDirectory=/opt/tilingvol/app
+EnvironmentFile=/etc/tilingvol/tilingvol.env
+Environment=TILINGVOL_BACKUP_DIR=/var/backups/tilingvol
+ExecStart=/opt/tilingvol/app/.venv/bin/python -m tilingvol.server.backup
+Nice=10
+IOSchedulingClass=idle
+
+# Same sandbox as the server; writes only the database and backup folders.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tilingvol /var/backups/tilingvol
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+# copies are readable by the backup folder's group (your Pi login), so the PC can pull them
+UMask=0027
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @debug @obsolete
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+MemoryMax=1G
+TasksMax=8
+

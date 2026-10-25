@@ -190,4 +190,26 @@ Edit `/etc/tilingvol/tilingvol.env`, then `sudo systemctl restart tilingvol`:
 Repeat step 3's `git archive` / `scp` / `tar` (extract over the old code), run `uv sync` again, then
 `sudo systemctl restart tilingvol`. The database in `/var/lib/tilingvol` is untouched.
 
-Back up the database now and then: `sudo sqlite3 /var/lib/tilingvol/tilingvol.sqlite3 ".backup /home/<user>/tilingvol-backup.sqlite3"`.
+`scripts/deploy_server.py` does all of this, and also installs the backups below.
+
+## Backups
+
+`tilingvol-backup.timer` copies the database every hour into `/var/backups/tilingvol`
+(`tilingvol-YYYYMMDD-HH.sqlite3`, UTC). Each copy is a consistent SQLite online backup, checked with
+`PRAGMA integrity_check` before it is kept. It keeps the newest 48 hourly copies plus one per day for 30
+days. The job runs in the same sandbox as the server, with no network.
+
+- See the backups: `ls -lh /var/backups/tilingvol`, and the runs: `journalctl -u tilingvol-backup -n 20`.
+- Restore: `sudo systemctl stop tilingvol`, then
+  `sudo install -o tilingvol -g tilingvol -m 600 /var/backups/tilingvol/<copy> /var/lib/tilingvol/tilingvol.sqlite3`,
+  delete the old `tilingvol.sqlite3-wal` and `-shm` files next to it, and `sudo systemctl start tilingvol`.
+
+Copies on the Pi do not survive a dead SD card, so also pull them to your PC. On the PC:
+`uv run python scripts/pull_backup.py` copies the newest one to `output/backups` (keeps 72; log in `output/backups/pull.log`). It needs an
+SSH key that logs in without a prompt. To run it every hour, in a Windows terminal:
+
+```
+schtasks /Create /SC HOURLY /TN "fe70 backup pull" /TR "cmd /c cd /d D:\code\python\tiling-volunteer && uv run python scripts/pull_backup.py"
+```
+
+The PC connects to the Pi, never the other way round, and the copy is only read as data.
