@@ -7,6 +7,8 @@ from functools import cached_property
 Cell = tuple[int, int]
 Shape = tuple[Cell, ...]
 
+MAX_LIVE_WIDTH = 1000
+
 
 def normalize(cells) -> Shape:
     min_x = min(x for x, _ in cells)
@@ -34,6 +36,8 @@ class PieceSpec:
     use_wall_lemmas: bool
     # the gun's 20 | WH and odd-side rules; otherwise only area divisibility
     gun_coloring: bool
+    # half-strip widths known to fill forever; side by side, their sums fill forever too
+    live_bases: frozenset[int] = frozenset()
 
     @property
     def area(self) -> int:
@@ -57,6 +61,26 @@ class PieceSpec:
                 return False
             return not (height % 2 and width % 8)
         return (width * height) % self.area == 0
+
+    def live_parts(self, width: int) -> tuple[int, ...] | None:
+        """Known fill-forever widths that sum to `width` (largest first), or None if there are none.
+        Placing half-strip fillings side by side fills the wider half-strip, so a strip search at such a
+        width can never end in a death."""
+        return self._live_parts_table.get(width)
+
+    @cached_property
+    def _live_parts_table(self) -> dict[int, tuple[int, ...]]:
+        table: dict[int, tuple[int, ...]] = {}
+        for width in range(1, MAX_LIVE_WIDTH + 1):
+            for base in sorted(self.live_bases, reverse=True):
+                if base == width:
+                    table[width] = (base,)
+                    break
+                rest = table.get(width - base)
+                if rest is not None:
+                    table[width] = tuple(sorted((base, *rest), reverse=True))
+                    break
+        return table
 
     def exact_dead(self, width: int, height: int) -> bool:
         return any(
@@ -82,6 +106,9 @@ GUN = PieceSpec(
     dead_sides=frozenset(),  # widths ruled out by strip searches live in the server's database
     use_wall_lemmas=True,
     gun_coloring=True,
+    # exact hsw computation (research repo, output/halfstrip_widths.txt; periodic certificates in
+    # certificates/); 176, 184, 192 and 280 have their own certificates but are sums of these
+    live_bases=frozenset({88, 96, 128, 136}),
 )
 
 # the 7-cell sibling B(1.2^2.1^2); it does tile rectangles (smallest 19 x 28), so it exercises the "possible" path

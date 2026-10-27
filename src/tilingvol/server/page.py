@@ -12,6 +12,7 @@ from pathlib import Path
 from tilingvol.server.config import ServerConfig
 from tilingvol.server.db import Database, ResultRow, StripResultRow
 from tilingvol.server.scheduler import Scheduler, WidthState
+from tilingvol.shared.pieces import PieceSpec
 from tilingvol.shared.protocol import (
     LANE_HUNT,
     LANE_STRIP,
@@ -47,7 +48,7 @@ STYLE = """
 :root {
   --bg: #f6f7f5; --card: #ffffff; --fg: #1b1f1d; --muted: #66706b; --line: #e3e6e3;
   --todo: #e4e7e4; --timed: #f59f00; --run: #4263eb; --found: #fab005; --flag: #e8590c; --accent: #2b8a3e;
-  --sym: #b197fc; --alive: #74c0fc;
+  --sym: #b197fc; --alive: #74c0fc; --forever: #20c997;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #121514; --card: #1b1f1d; --fg: #e9ecea; --muted: #98a29d; --line: #2c322f; --todo: #2e3431; }
@@ -288,8 +289,35 @@ def render_hunt(db: Database, scheduler: Scheduler, active: list) -> str:
     )
 
 
-def width_text(w: int, s: WidthState | None, runner: str | None) -> str:
+def smallest_unmapped_size(
+    piece: PieceSpec, dead: set[int]
+) -> tuple[int, int, int] | None:
+    """(area, w, h) of the smallest admissible size with a side past piece.max_side and no ruled-out
+    side; every such size is open because the map never schedules it."""
+    best = None
+    for w in range(piece.min_side, piece.max_side + 1):
+        if w in dead:
+            continue
+        h = piece.max_side + 1
+        while h in dead or not piece.admissible(w, h):
+            h += 1
+        if best is None or w * h < best[0]:
+            best = (w * h, w, h)
+    return best
+
+
+def width_text(
+    w: int,
+    s: WidthState | None,
+    runner: str | None,
+    parts: tuple[int, ...] | None = None,
+) -> str:
     five = " (divisible by 5)" if w % 5 == 0 else ""
+    if parts is not None:
+        return (
+            f"width {w}{five}: FILLS FOREVER, side by side fillings of widths "
+            f"{' + '.join(map(str, parts))}; never searched"
+        )
     if s is not None and s.dead:
         return (
             f"width {w}{five}: RULED OUT, the first {s.dead_rows} rows cannot be covered "
@@ -314,7 +342,7 @@ def render_widths(
     active: list,
 ) -> str:
     """One bar per width: how deep its half-strip has been filled, or the depth where it died."""
-    widths = scheduler.strip_widths()
+    widths = scheduler.chart_widths()
     if not widths:
         return ""
     running = {j.width: j.name for j in active if j.lane == LANE_STRIP}
@@ -343,11 +371,14 @@ def render_widths(
         parts.append(
             f'<text x="{STRIP_LEFT - 6}" y="{y + 3.5:.1f}" text-anchor="end">{rows}</text>'
         )
-    counts = {"dead": 0, "alive": 0, "running": 0, "todo": 0}
+    counts = {"dead": 0, "forever": 0, "alive": 0, "running": 0, "todo": 0}
     for w in widths:
         s = states.get(w)
         x = px(w)
-        if s is not None and s.dead:
+        live = scheduler.piece.live_parts(w)
+        if live is not None:
+            status, fill, rows = "forever", "var(--forever)", top_rows
+        elif s is not None and s.dead:
             status, fill, rows = "dead", "var(--accent)", s.dead_rows
         elif w in running:
             status, fill, rows = "running", "var(--run)", s.filled_rows if s else 0
@@ -359,7 +390,7 @@ def render_widths(
         bar = max(rows * STRIP_BAR_PX, 3.0)
         parts.append(
             f'<rect x="{x}" y="{base - bar:.1f}" width="{STRIP_BAR}" height="{bar:.1f}" rx="1.6" '
-            f'fill="{fill}" data-t="{escape(width_text(w, s, running.get(w)))}"/>'
+            f'fill="{fill}" data-t="{escape(width_text(w, s, running.get(w), live))}"/>'
         )
         if w % 5 == 0:
             parts.append(
@@ -376,6 +407,16 @@ def render_widths(
         ("running", "var(--run)", "Running now"),
         ("todo", "var(--todo)", "Not searched yet"),
     ]
+    if scheduler.piece.live_bases:
+        bases = ", ".join(map(str, sorted(scheduler.piece.live_bases)))
+        legend_items.insert(
+            1,
+            (
+                "forever",
+                "var(--forever)",
+                f"Fills forever (a sum of {bases}); not searched",
+            ),
+        )
     legend = "".join(
         f'<li><i style="background:{color}"></i>{label}<b>{counts[status]:,}</b></li>'
         for status, color, label in legend_items
@@ -548,11 +589,17 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         if not (summaries.get((w, h)) and summaries[(w, h)].decided)
         and not scheduler.is_dead((w, h), dead)
     )
+    # sizes with a side past the map are never searched, so the smallest of those is open too
+    beyond = smallest_unmapped_size(piece, dead)
+    if beyond is not None:
+        open_sizes.append(beyond)
     bound_value, bound_note = "-", "every size is decided"
     if open_sizes:
-        area, w, h = open_sizes[0]
-        bound_value = f"{min(area, piece.min_side * (piece.max_side + 1)):,}"
+        area, w, h = min(open_sizes)
+        bound_value = f"{area:,}"
         bound_note = f"smallest open size: {w} x {h}"
+        if (area, w, h) == beyond:
+            bound_note += f" (past the map's {piece.max_side})"
 
     volunteer_names = {r.name for r in results if r.source == "volunteer"} | {
         j.name for j in active

@@ -262,12 +262,16 @@ class Scheduler:
         dead = self.dead_widths() if dead is None else dead
         return self.piece.exact_dead(*key) or key[0] in dead or key[1] in dead
 
-    def strip_widths(self) -> list[int]:
+    def chart_widths(self) -> list[int]:
         return [
             w
             for w in range(self.piece.min_side, self.piece.max_side + 1)
             if w not in self.piece.dead_sides
         ]
+
+    def strip_widths(self) -> list[int]:
+        """Widths a strip search can still rule out; known fill-forever widths never die."""
+        return [w for w in self.chart_widths() if self.piece.live_parts(w) is None]
 
     def strip_depths(self, state: WidthState | None) -> tuple[int, ...]:
         """The next depths to try: past the deepest filling and past every depth that timed out (a
@@ -323,6 +327,11 @@ class Scheduler:
                 )
             if w < self.piece.min_side or w in self.dead_widths(states):
                 raise RequestRefused(f"width {w} is already ruled out")
+            parts = self.piece.live_parts(w)
+            if parts is not None:
+                raise RequestRefused(
+                    f"width {w} fills forever ({' + '.join(map(str, parts))}), so it can never be ruled out"
+                )
             if w in leased:
                 raise RequestRefused(f"width {w} is being run by someone right now")
             depths = depths_for(state)

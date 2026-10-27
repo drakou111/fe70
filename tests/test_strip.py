@@ -372,3 +372,41 @@ def test_own_strip_depths_and_time_limits(strip_client, submit_key):
     post_result(strip_client, submission(submit_key, job, "filled", 1, 3.0))
     again = ask(width=job["width"], custom_stages=[12, 20, 28]).json()
     assert [s["strip_rows"] for s in again["stages"]] == [28]
+
+
+def test_sums_of_live_widths_fill_forever_and_are_never_scheduled(strip_config):
+    assert GUN.live_parts(176) == (88, 88)
+    assert GUN.live_parts(280) == (96, 96, 88)
+    assert GUN.live_parts(136) == (136,)
+    assert GUN.live_parts(140) is None and GUN.live_parts(137) is None
+    piece = replace(strip_config.piece, live_bases=frozenset({11}))
+    config = replace(strip_config, piece=piece)
+    with TestClient(create_app(config)) as client:
+        widths = [request(client).json()["width"] for _ in range(2)]
+        assert widths == [10, 12]  # 11 fills forever
+        refused = request(client, size=(22, None))
+        assert refused.status_code == 409 and "fills forever (11 + 11)" in refused.text
+        page = client.get("/").text
+        assert "FILLS FOREVER" in page and "Fills forever (a sum of 11)" in page
+
+
+def test_area_bound_matches_the_size_it_names(strip_config):
+    import re
+
+    with TestClient(create_app(strip_config)) as client:
+        page = client.get("/").text
+    match = re.search(
+        r"Area bound</span><b>([\d,]+)</b><span>smallest open size: (\d+) x (\d+)", page
+    )
+    assert match, "area bound stat missing"
+    area, w, h = int(match[1].replace(",", "")), int(match[2]), int(match[3])
+    assert area == w * h
+
+
+def test_unmapped_sizes_count_toward_the_area_bound():
+    from tilingvol.server.page import smallest_unmapped_size
+
+    piece = replace(GUN, min_side=137, max_side=140)
+    area, w, h = smallest_unmapped_size(piece, dead={141, 142, 143})
+    assert (w, h) == (140, 144) and area == 140 * 144
+    assert piece.admissible(w, h)
