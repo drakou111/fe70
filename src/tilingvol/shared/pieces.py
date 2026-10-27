@@ -8,6 +8,7 @@ Cell = tuple[int, int]
 Shape = tuple[Cell, ...]
 
 MAX_LIVE_WIDTH = 1000
+EXACT_CYLINDER_MAX_PERIOD = 54
 
 
 def normalize(cells) -> Shape:
@@ -86,6 +87,19 @@ class PieceSpec:
     @cached_property
     def _live_parts_table(self) -> dict[int, tuple[int, ...]]:
         return live_parts_table(self.live_bases)
+
+    def periodic_ruled_out(self, width: int, period: int) -> bool:
+        """A filling of the width-W half-strip repeating every P rows, with its block glued top to bottom, is
+        a cylinder of length W and circumference P between two walls. For the gun (research repo,
+        PROGRESS.md, walled cylinders): those exist only for P divisible by 10 and W even when P <= 54
+        (exact, every W), and an odd W needs 20 | P at any P (a column-parity weighting)."""
+        if (width * period) % self.area:
+            return True
+        if not self.gun_coloring:
+            return False
+        if period <= EXACT_CYLINDER_MAX_PERIOD:
+            return period % 10 != 0 or width % 2 == 1 or width < 8
+        return width % 2 == 1 and period % 20 != 0
 
     def exact_dead(self, width: int, height: int) -> bool:
         return any(

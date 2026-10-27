@@ -395,8 +395,9 @@ class Scheduler:
     def periodic_configs_left(
         self, width: int, rows: list[PeriodicResultRow], no_time_limit: bool
     ) -> list[tuple[int, int]]:
-        """The (start, period) settings still worth trying for a width: not yet shown to have no repeating
-        filling, and not timed out (unless this volunteer has no time limit)."""
+        """The (start, period) settings still worth trying for a width: not ruled out by the cylinder
+        theorems, not yet shown to have no repeating filling, and not timed out (unless this volunteer has no
+        time limit)."""
         done = {
             (r.start, r.period)
             for r in rows
@@ -409,7 +410,9 @@ class Scheduler:
         return [
             c
             for c in self.config.periodic_configs
-            if c not in done and c[0] >= self.piece.strip_reach
+            if c not in done
+            and c[0] >= self.piece.strip_reach
+            and not self.piece.periodic_ruled_out(width, c[1])
         ]
 
     def _pick_periodic(

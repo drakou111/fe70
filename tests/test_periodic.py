@@ -18,8 +18,8 @@ from tilingvol.shared.pieces import SIBLING
 from tilingvol.shared.protocol import PERIODIC_SINCE, Job, Stage
 from tilingvol.shared.verify import TilingError, verify_periodic
 
-# for the sibling piece, width 12 repeats every 7 rows from row 6, but not every 8
-WIDTH, START, PERIOD, NO_PERIOD = 12, 6, 7, 8
+# for the sibling piece, width 19 repeats every 14 rows from row 6, but not every 7
+WIDTH, START, PERIOD, NO_PERIOD = 19, 6, 14, 7
 
 
 def solve_periodic(width: int, start: int, period: int) -> list[list[int]] | None:
@@ -84,7 +84,7 @@ def test_the_client_rejects_malformed_periodic_jobs():
 def periodic_config(sib_config):
     return replace(
         sib_config,
-        periodic_configs=((START, NO_PERIOD), (START, PERIOD), (START, 9)),
+        periodic_configs=((START, NO_PERIOD), (START, PERIOD), (START, 21)),
         periodic_stages=2,
     )
 
@@ -104,7 +104,7 @@ def test_a_found_repeating_filling_settles_the_width(
             (START, NO_PERIOD),
             (START, PERIOD),
         ]
-        assert job["height"] == START + NO_PERIOD
+        assert job["height"] == START + max(PERIOD, NO_PERIOD)
         bad = submission(submit_key, job, "possible", 1, 3.0, certificate[1:])
         assert "not valid" in post_result(client, bad, 422)["detail"]
         post_result(
@@ -117,7 +117,7 @@ def test_a_found_repeating_filling_settles_the_width(
         ]
         assert client.get(found[0]["picture"]).content.startswith(PNG_MAGIC)
         page = client.get("/").text
-        assert "Widths that fill forever" in page and "repeating every 7 rows" in page
+        assert "Widths that fill forever" in page and "repeating every 14 rows" in page
         for width in (WIDTH, 2 * WIDTH):  # 24 is two width-12 fillings side by side
             refused = request(client, size=(width, None))
             assert refused.status_code == 409 and "fills forever" in refused.text
@@ -135,7 +135,7 @@ def test_settings_without_a_repeating_filling_are_not_tried_again(
         post_result(client, submission(submit_key, job, "impossible", 1, 3.0))
         job = forever(client, 13).json()
         assert [(s["periodic_start"], s["period"]) for s in job["stages"]] == [
-            (START, 9)
+            (START, 21)
         ]
         post_result(client, submission(submit_key, job, "impossible", 0, 3.0))
         done = forever(client, 13)
@@ -164,3 +164,30 @@ def test_a_real_run_proves_a_width_fills_forever(
     assert recorder.has("FILLS FOREVER")
     pictures = [e for e in recorder.events if e.kind == "picture"]
     assert pictures and pictures[0].picture[3] == 0 and pictures[0].strip
+
+
+def test_cylinder_theorems_rule_out_hopeless_periods():
+    from tilingvol.shared.pieces import GUN
+
+    assert not GUN.periodic_ruled_out(144, 10) and not GUN.periodic_ruled_out(144, 40)
+    for period in (10, 20, 40, 50):  # odd widths: no walled cylinder up to 54 at all
+        assert GUN.periodic_ruled_out(137, period)
+    assert GUN.periodic_ruled_out(144, 15) and GUN.periodic_ruled_out(137, 70)
+    assert not GUN.periodic_ruled_out(137, 60) and not GUN.periodic_ruled_out(137, 80)
+
+
+def test_odd_widths_get_only_possible_periods(sib_config):
+    from tilingvol.server.db import Database
+    from tilingvol.server.scheduler import Scheduler
+    from tilingvol.shared.pieces import GUN
+
+    config = replace(
+        sib_config, piece=GUN, periodic_configs=((60, 10), (110, 20), (60, 60))
+    )
+    scheduler = Scheduler(Database(config.db_path), config)
+    assert scheduler.periodic_configs_left(137, [], False) == [(60, 60)]
+    assert scheduler.periodic_configs_left(144, [], False) == [
+        (60, 10),
+        (110, 20),
+        (60, 60),
+    ]
