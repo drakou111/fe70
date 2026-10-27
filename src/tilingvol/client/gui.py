@@ -44,7 +44,12 @@ from tilingvol.client.update import (
 from tilingvol.client.width_queue import WidthQueue
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.pieces import piece_by_name
-from tilingvol.shared.protocol import SEARCH_BOARD, SEARCH_SYMMETRIC, SEARCH_WIDTH
+from tilingvol.shared.protocol import (
+    SEARCH_BOARD,
+    SEARCH_FOREVER,
+    SEARCH_SYMMETRIC,
+    SEARCH_WIDTH,
+)
 
 APP_TITLE = "fe70"
 PUMP_MS = 200
@@ -61,6 +66,7 @@ SEARCH_LABELS = {
     SEARCH_WIDTH: "Strip widths",
     SEARCH_BOARD: "Rectangle sizes (board)",
     SEARCH_SYMMETRIC: "Symmetric hunt",
+    SEARCH_FOREVER: "Fill widths forever",
 }
 SEARCH_HINTS = {
     SEARCH_WIDTH: "Fills one width's half-strip deeper and deeper; a depth that cannot be filled rules "
@@ -68,6 +74,8 @@ SEARCH_HINTS = {
     SEARCH_BOARD: "Searches one rectangle size completely: impossible, or a tiling.",
     SEARCH_SYMMETRIC: "Only tilings that look the same after a half turn: much faster; its 'impossible' "
     "rules out symmetric tilings only.",
+    SEARCH_FOREVER: "Looks for a half-strip filling that repeats; one found proves the width fills forever, "
+    "so it never needs a strip search again.",
 }
 # per search: (request placeholder, request hint, depths placeholder, depths hint)
 SEARCH_FIELDS = {
@@ -88,6 +96,12 @@ SEARCH_FIELDS = {
         "or a size, like 150 x 168",
         "server's",
         "or border depths, like 24, 28; full search last",
+    ),
+    SEARCH_FOREVER: (
+        "server picks",
+        "or widths, like 144, 138",
+        "server's",
+        "the server picks the repeat settings",
     ),
 }
 MUTED = "#66706b"
@@ -655,11 +669,10 @@ class App:
         piece, width, height, border, placements = picture
         kind = "tiling" if border == 0 else f"border{border}"
         prefix = HUNT_PICTURE_PREFIX if hunt else ""
-        name = (
-            f"{width}-strip{border}.png"
-            if strip
-            else f"{width}x{height}-{prefix}{kind}.png"
-        )
+        if strip:
+            name = f"{width}-strip{border}.png" if border else f"{width}-forever.png"
+        else:
+            name = f"{width}x{height}-{prefix}{kind}.png"
         path = self.pictures_dir() / name
         try:
             path.write_bytes(
@@ -681,7 +694,10 @@ class App:
         size, _, kind = path.stem.partition("-")
         hunt = kind.startswith(HUNT_PICTURE_PREFIX)
         kind = kind.removeprefix(HUNT_PICTURE_PREFIX)
-        if kind.startswith("strip"):
+        if kind == "forever":
+            what = "FILLS FOREVER (a repeating filling)"
+            size = f"width {size}"
+        elif kind.startswith("strip"):
             what = f"strip depth {kind.removeprefix('strip')} filled"
             size = f"width {size}"
         else:

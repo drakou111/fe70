@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tilingvol.shared.pieces import PieceSpec, piece_by_name
-from tilingvol.shared.protocol import Stage
+from tilingvol.shared.protocol import MAX_STRIP_ROWS, MIN_PERIOD, Stage
 
 MIN_TOKEN_LENGTH = 16
 DEFAULT_STAGES = (
@@ -26,6 +26,26 @@ def load_dotenv(path: Path) -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+DEFAULT_PERIODIC_CONFIGS = ((60, 10), (110, 10), (80, 20), (110, 20), (110, 40))
+
+
+def parse_periodic_configs(text: str) -> tuple[tuple[int, int], ...]:
+    """ "60:10, 110:20" -> ((60, 10), (110, 20)); empty -> the defaults."""
+    if not text.strip():
+        return DEFAULT_PERIODIC_CONFIGS
+    configs = []
+    for part in text.replace(",", " ").split():
+        start, _, period = part.partition(":")
+        if not (start.isdigit() and period.isdigit()):
+            raise RuntimeError(
+                f"periodic settings are start:period pairs, got {part!r}"
+            )
+        if int(period) < MIN_PERIOD or int(start) + int(period) > MAX_STRIP_ROWS:
+            raise RuntimeError(f"periodic setting {part!r} is out of range")
+        configs.append((int(start), int(period)))
+    return tuple(configs)
 
 
 @dataclass(frozen=True)
@@ -65,6 +85,10 @@ class ServerConfig:
     strip_step: int = 8
     strip_stages: int = 6
     strip_max_timeouts: int = 2
+    # fill-forever jobs: (first repeating row, period) settings tried in order per width, and how many one
+    # job tries; the widths 176, 184 and 280 repeat with period 10 from row 60 (research repo)
+    periodic_configs: tuple[tuple[int, int], ...] = DEFAULT_PERIODIC_CONFIGS
+    periodic_stages: int = 2
     # who to ask for an access token, shown on the page and in the app's "needs a token" message
     contact: str = "Drakou111 on Discord"
     # if not empty, every job request/heartbeat/release/result must carry one of these tokens
@@ -124,6 +148,10 @@ class ServerConfig:
             strip_first_rows=int(os.environ.get("TILINGVOL_STRIP_FIRST_ROWS", "24")),
             strip_step=int(os.environ.get("TILINGVOL_STRIP_STEP", "8")),
             strip_stages=int(os.environ.get("TILINGVOL_STRIP_STAGES", "6")),
+            periodic_configs=parse_periodic_configs(
+                os.environ.get("TILINGVOL_PERIODIC_CONFIGS", "")
+            ),
+            periodic_stages=int(os.environ.get("TILINGVOL_PERIODIC_STAGES", "2")),
             contact=os.environ.get("TILINGVOL_CONTACT", "Drakou111 on Discord"),
             access_tokens=tokens,
         )

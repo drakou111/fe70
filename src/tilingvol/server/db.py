@@ -98,6 +98,22 @@ CREATE TABLE IF NOT EXISTS strip_fills (     -- the deepest filling of each stri
     placements TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS strip_fills_width ON strip_fills(width);
+CREATE TABLE IF NOT EXISTS periodic_results (  -- fill-forever searches, one row per (start, period) tried
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT,
+    width INTEGER NOT NULL,
+    start INTEGER NOT NULL,
+    period INTEGER NOT NULL,
+    verdict TEXT NOT NULL,                    -- found (checked certificate), none, timed_out
+    duration_s REAL NOT NULL,
+    name TEXT NOT NULL,
+    ip TEXT,
+    client_version TEXT,
+    submitted REAL NOT NULL,
+    source TEXT NOT NULL,
+    placements TEXT                           -- the certificate, for 'found'
+);
+CREATE INDEX IF NOT EXISTS periodic_results_width ON periodic_results(width);
 """
 
 
@@ -150,6 +166,22 @@ class StripFillRow:
     rows: int
     name: str
     submitted: float
+
+
+@dataclass(frozen=True)
+class PeriodicResultRow:
+    result_id: int
+    width: int
+    start: int
+    period: int
+    verdict: str  # PERIODIC_FOUND, PERIODIC_NONE or PERIODIC_TIMED_OUT
+    name: str
+    submitted: float
+
+
+PERIODIC_FOUND = "found"
+PERIODIC_NONE = "none"
+PERIODIC_TIMED_OUT = "timed_out"
 
 
 @dataclass(frozen=True)
@@ -548,6 +580,57 @@ class Database:
                 (fill_id,),
             ).fetchone()
         return (row[0], row[1], json.loads(row[2])) if row else None
+
+    # fill-forever certificates
+    def add_periodic_result(
+        self,
+        *,
+        job_id: str,
+        width: int,
+        start: int,
+        period: int,
+        verdict: str,
+        duration_s: float,
+        name: str,
+        ip: str | None,
+        client_version: str | None,
+        placements: list | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO periodic_results (job_id, width, start, period, verdict, duration_s, name, ip,"
+                " client_version, submitted, source, placements) VALUES (?,?,?,?,?,?,?,?,?,?,'volunteer',?)",
+                (
+                    job_id,
+                    width,
+                    start,
+                    period,
+                    verdict,
+                    duration_s,
+                    name,
+                    ip,
+                    client_version,
+                    time.time(),
+                    None if placements is None else json.dumps(placements),
+                ),
+            )
+
+    def periodic_results(self) -> list[PeriodicResultRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, width, start, period, verdict, name, submitted FROM periodic_results ORDER BY id"
+            ).fetchall()
+        return [PeriodicResultRow(*r) for r in rows]
+
+    def periodic_certificate(self, result_id: int) -> tuple[int, int, int, list] | None:
+        """(width, start, period, placements) of a found repeating filling."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT width, start, period, placements FROM periodic_results"
+                " WHERE id = ? AND placements IS NOT NULL",
+                (result_id,),
+            ).fetchone()
+        return (row[0], row[1], row[2], json.loads(row[3])) if row else None
 
     def use_salt(self, salt: str) -> bool:
         """Record a salt; False if it was used before."""

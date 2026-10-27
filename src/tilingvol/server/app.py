@@ -20,18 +20,26 @@ from pydantic import BaseModel, Field
 
 from tilingvol.server import known_strips, page
 from tilingvol.server.config import ServerConfig
-from tilingvol.server.db import Database
+from tilingvol.server.db import (
+    PERIODIC_FOUND,
+    PERIODIC_NONE,
+    PERIODIC_TIMED_OUT,
+    Database,
+)
 from tilingvol.server.scheduler import NoAssignment, RequestRefused, Scheduler
 from tilingvol.shared import token
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.protocol import (
     LANE_HUNT,
+    LANE_PERIODIC,
     LANE_STRIP,
     MAX_BORDER,
     MAX_CUSTOM_STAGES,
     MAX_PEAK_RAM_MB,
     NO_LIMIT,
+    PERIODIC_SINCE,
     RELEASE_REASONS,
+    SEARCH_FOREVER,
     SEARCH_SYMMETRIC,
     SEARCH_WIDTH,
     SEARCHES,
@@ -47,6 +55,7 @@ from tilingvol.shared.protocol import (
 from tilingvol.shared.verify import (
     TilingError,
     verify_border,
+    verify_periodic,
     verify_strip,
     verify_symmetric,
     verify_tiling,
@@ -240,13 +249,20 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(422, f"search must be one of {', '.join(SEARCHES)}")
         hunt = body.hunt if body.search is None else body.search == SEARCH_SYMMETRIC
         strip = body.search == SEARCH_WIDTH
+        periodic = body.search == SEARCH_FOREVER
         if strip and version_tuple(body.client_version) < version_tuple(STRIP_SINCE):
             raise HTTPException(
                 426, f"strip widths need version {STRIP_SINCE} or newer"
             )
+        if periodic and version_tuple(body.client_version) < version_tuple(
+            PERIODIC_SINCE
+        ):
+            raise HTTPException(
+                426, f"fill-forever searches need version {PERIODIC_SINCE} or newer"
+            )
         requested = None
         requested_width = None
-        if strip:
+        if strip or periodic:
             requested_width = body.width
         elif body.width is not None or body.height is not None:
             if body.width is None or body.height is None:
@@ -265,6 +281,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     custom_borders=tuple(body.custom_stages),
                     strip=strip,
                     requested_width=requested_width,
+                    periodic=periodic,
                 )
             except NoAssignment as error:
                 raise HTTPException(404, str(error)) from error
@@ -278,6 +295,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "time_limit_s": stage_limit(s, body),
                     "symmetric": s.symmetric,
                     "strip_rows": s.strip_rows,
+                    "periodic_start": s.periodic_start,
+                    "period": s.period,
                 }
                 for s in assignment.stages
             ]
@@ -314,7 +333,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "lane": assignment.lane,
             "heartbeat_interval_s": config.heartbeat_interval_s,
             "filled_border": 0
-            if assignment.lane == LANE_STRIP
+            if assignment.lane in (LANE_STRIP, LANE_PERIODIC)
             else db.filled_border(assignment.width, assignment.height, symmetric=hunt),
         }
 
@@ -329,7 +348,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             db.end_job(job_id, "cancelled", "decided elsewhere")
             what = (
                 f"width {job.width}"
-                if job.lane == LANE_STRIP
+                if job.lane in (LANE_STRIP, LANE_PERIODIC)
                 else f"{job.width} x {job.height}"
             )
             return {"cancel": True, "reason": f"{what} was decided by someone else"}
@@ -340,6 +359,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         """Settled for the main search, or, for a hunt job, already searched by another hunt."""
         if job.lane == LANE_STRIP:
             return job.width in scheduler.dead_widths()
+        if job.lane == LANE_PERIODIC:
+            return (
+                job.width in scheduler.dead_widths()
+                or job.width in scheduler.live_table()
+            )
         key = (job.width, job.height)
         if scheduler.is_dead(key):
             return True
@@ -438,6 +462,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(422, "invalid salt or token format")
         stage = job.stages[body.stage_index]
         strip = job.lane == LANE_STRIP
+        periodic = job.lane == LANE_PERIODIC
+        if periodic and body.verdict == VERDICT_FILLED:
+            raise HTTPException(422, "a fill-forever search has no 'filled' verdict")
         if strip and body.verdict == VERDICT_POSSIBLE:
             raise HTTPException(422, "a strip search has no tiling to send")
         if (body.verdict == VERDICT_FILLED) and (
@@ -489,6 +516,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(422, "the reported duration exceeds the stage limits")
         if strip:
             return strip_result(job, body, stage)
+        if periodic:
+            return periodic_result(job, body)
         if body.verdict == VERDICT_POSSIBLE:
             try:
                 verify_tiling(config.piece, job.width, job.height, body.solution)
@@ -580,6 +609,61 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             )
         return {"ok": True, "message": "Thank you!"}
 
+    def periodic_result(job, body: Submission) -> dict:
+        """Every stage before the reported one found no repeating filling; the reported one found a
+        certificate (checked here cell by cell), found none, or timed out."""
+        index = body.stage_index
+        found = None
+        if body.verdict == VERDICT_POSSIBLE:
+            stage = job.stages[index]
+            try:
+                verify_periodic(
+                    config.piece,
+                    job.width,
+                    stage["periodic_start"],
+                    stage["period"],
+                    body.solution,
+                )
+            except TilingError as error:
+                log.warning("job %s: repeating filling rejected: %s", job.job_id, error)
+                raise HTTPException(
+                    422, f"the repeating filling is not valid: {error}"
+                ) from error
+            found = body.solution
+        outcomes = {
+            VERDICT_POSSIBLE: PERIODIC_FOUND,
+            VERDICT_IMPOSSIBLE: PERIODIC_NONE,
+            VERDICT_TIMED_OUT: PERIODIC_TIMED_OUT,
+        }
+        for i, stage in enumerate(job.stages[: index + 1]):
+            last = i == index
+            db.add_periodic_result(
+                job_id=job.job_id,
+                width=job.width,
+                start=stage["periodic_start"],
+                period=stage["period"],
+                verdict=outcomes[body.verdict] if last else PERIODIC_NONE,
+                duration_s=body.duration_s if last else 0.0,
+                name=job.name,
+                ip=job.ip,
+                client_version=body.client_version,
+                placements=found if last else None,
+            )
+        db.end_job(job.job_id, "done", body.verdict, body.peak_ram_mb)
+        page_cache["at"] = 0.0
+        log.info(
+            "job %s: width %d periodic %s at stage %d by %r (%.0f s)",
+            job.job_id,
+            job.width,
+            body.verdict,
+            index,
+            job.name,
+            body.duration_s,
+        )
+        if found is not None:
+            log.warning("WIDTH FILLS FOREVER: %d by %r", job.width, job.name)
+        return {"ok": True, "message": "Thank you!"}
+
     def picture_of(job, body: Submission) -> tuple[int | None, list | None]:
         """The tiling itself, or the deepest border filling if it is genuine (display only)."""
         if body.verdict == VERDICT_POSSIBLE:
@@ -651,6 +735,19 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         response.headers["Cache-Control"] = "public, max-age=300"
         return response
 
+    @app.get("/periodic/{result_id}.png")
+    def periodic_png(result_id: int) -> Response:
+        found = db.periodic_certificate(result_id)
+        if found is None:
+            raise HTTPException(404, "no picture")
+        width, start, period, placements = found
+        block = [p for p in placements if start <= p[2] < start + period]
+        unrolled = placements + [
+            [o, x, y + copy * period] for copy in (1, 2) for o, x, y in block
+        ]
+        height = start + 3 * period + config.piece.strip_reach
+        return png(("periodic", result_id), (width, height, unrolled))
+
     @app.get("/api/strips")
     def strips() -> dict:
         states = scheduler.width_states()
@@ -677,6 +774,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "source": r.source,
                 }
                 for r in db.strip_results()
+            ],
+            "forever": [
+                {
+                    "width": c.width,
+                    "start": c.start,
+                    "period": c.period,
+                    "by": c.name,
+                    "picture": f"/periodic/{c.result_id}.png",
+                }
+                for c in scheduler.certified_widths().values()
             ],
         }
 

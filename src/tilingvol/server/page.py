@@ -10,11 +10,12 @@ from html import escape
 from pathlib import Path
 
 from tilingvol.server.config import ServerConfig
-from tilingvol.server.db import Database, ResultRow, StripResultRow
+from tilingvol.server.db import Database, PeriodicResultRow, ResultRow, StripResultRow
 from tilingvol.server.scheduler import Scheduler, WidthState
 from tilingvol.shared.pieces import PieceSpec
 from tilingvol.shared.protocol import (
     LANE_HUNT,
+    LANE_PERIODIC,
     LANE_STRIP,
     VERDICT_FILLED,
     VERDICT_IMPOSSIBLE,
@@ -43,6 +44,7 @@ STRIP_BAR = 6.5
 STRIP_LEFT, STRIP_TOP, STRIP_BOTTOM = 36, 8, 30
 STRIP_TICK = 10
 STRIP_GALLERY = 6
+WIDTH_LANES = (LANE_STRIP, LANE_PERIODIC)
 
 STYLE = """
 :root {
@@ -311,8 +313,14 @@ def width_text(
     s: WidthState | None,
     runner: str | None,
     parts: tuple[int, ...] | None = None,
+    certificate: PeriodicResultRow | None = None,
 ) -> str:
     five = " (divisible by 5)" if w % 5 == 0 else ""
+    if certificate is not None:
+        return (
+            f"width {w}{five}: FILLS FOREVER, a filling repeating every {certificate.period} rows from row "
+            f"{certificate.start} ({certificate.name})"
+        )
     if parts is not None:
         return (
             f"width {w}{five}: FILLS FOREVER, side by side fillings of widths "
@@ -345,7 +353,7 @@ def render_widths(
     widths = scheduler.chart_widths()
     if not widths:
         return ""
-    running = {j.width: j.name for j in active if j.lane == LANE_STRIP}
+    running = {j.width: j.name for j in active if j.lane in WIDTH_LANES}
     deepest = max(
         (max(s.filled_rows, s.dead_rows or 0) for s in states.values()), default=0
     )
@@ -371,11 +379,13 @@ def render_widths(
         parts.append(
             f'<text x="{STRIP_LEFT - 6}" y="{y + 3.5:.1f}" text-anchor="end">{rows}</text>'
         )
+    live_table = scheduler.live_table()
+    certified = scheduler.certified_widths()
     counts = {"dead": 0, "forever": 0, "alive": 0, "running": 0, "todo": 0}
     for w in widths:
         s = states.get(w)
         x = px(w)
-        live = scheduler.piece.live_parts(w)
+        live = live_table.get(w)
         if live is not None:
             status, fill, rows = "forever", "var(--forever)", top_rows
         elif s is not None and s.dead:
@@ -390,7 +400,8 @@ def render_widths(
         bar = max(rows * STRIP_BAR_PX, 3.0)
         parts.append(
             f'<rect x="{x}" y="{base - bar:.1f}" width="{STRIP_BAR}" height="{bar:.1f}" rx="1.6" '
-            f'fill="{fill}" data-t="{escape(width_text(w, s, running.get(w), live))}"/>'
+            f'fill="{fill}" '
+            f'data-t="{escape(width_text(w, s, running.get(w), live, certified.get(w)))}"/>'
         )
         if w % 5 == 0:
             parts.append(
@@ -407,14 +418,14 @@ def render_widths(
         ("running", "var(--run)", "Running now"),
         ("todo", "var(--todo)", "Not searched yet"),
     ]
-    if scheduler.piece.live_bases:
-        bases = ", ".join(map(str, sorted(scheduler.piece.live_bases)))
+    if scheduler.piece.live_bases or certified:
+        bases = "".join(f"{b}, " for b in sorted(scheduler.piece.live_bases))
         legend_items.insert(
             1,
             (
                 "forever",
                 "var(--forever)",
-                f"Fills forever (a sum of {bases}); not searched",
+                f"Fills forever (a repeating filling, or a sum of {bases}such widths)",
             ),
         )
     legend = "".join(
@@ -434,6 +445,18 @@ def render_widths(
         if fills
         else ""
     )
+    if certified:
+        forever = "".join(
+            f'<figure><a href="/periodic/{c.result_id}.png"><img src="/periodic/{c.result_id}.png" '
+            f'loading="lazy" alt="width {c.width} repeating filling"></a><figcaption><b>width {c.width}'
+            f"</b><br>repeats every {c.period} rows<br>by {escape(c.name)}</figcaption></figure>"
+            for c in sorted(certified.values(), key=lambda c: c.width)
+        )
+        gallery += (
+            '<h2 style="margin-top:18px">Widths that fill forever</h2><p class="note" style="margin:0 0 '
+            '12px">The bottom rows, then the same block over and over: each picture shows three copies of '
+            f'the repeating block, checked cell by cell.</p><div class="gallery">{forever}</div>'
+        )
     return (
         '<section class="card"><h2>Widths</h2><p class="note" style="margin:0 0 12px">'
         "If a rectangle W x H exists, stacking copies of it fills the width-W half-strip (a floor and two "
@@ -462,7 +485,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
     running = {
         (min(j.width, j.height), max(j.width, j.height)): j
         for j in active
-        if j.lane != LANE_HUNT
+        if j.lane not in (LANE_HUNT, *WIDTH_LANES)
     }
     hunting = {
         (min(j.width, j.height), max(j.width, j.height)): j
@@ -652,7 +675,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
         )
 
     running_rows = "".join(
-        f"<tr><td>{f'width {j.width}' if j.lane == LANE_STRIP else f'{j.width} x {j.height}'}</td>"
+        f"<tr><td>{f'width {j.width}' if j.lane in WIDTH_LANES else f'{j.width} x {j.height}'}</td>"
         f"<td>{escape(j.name)}</td><td>"
         f"{HUNT_PILL if j.lane == LANE_HUNT else escape(j.lane)}</td>"
         f'<td class="num">{ago(j.created)}</td></tr>'

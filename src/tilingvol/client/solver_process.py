@@ -79,14 +79,22 @@ class TreeProgress:
 def _run_stages(task: SolverTask, queue) -> None:
     from ortools.sat.python import cp_model
 
-    from tilingvol.client.model import build_model, build_strip_model
+    from tilingvol.client.model import (
+        build_model,
+        build_periodic_model,
+        build_strip_model,
+    )
     from tilingvol.shared.pieces import piece_by_name
 
     piece = piece_by_name(task.piece)
     for index in range(task.first_stage, len(task.stages)):
         stage = task.stages[index]
         queue.put((MSG_STAGE_START, index))
-        if stage.strip_rows:
+        if stage.period:
+            built = build_periodic_model(
+                piece, task.width, stage.periodic_start, stage.period
+            )
+        elif stage.strip_rows:
             built = build_strip_model(piece, task.width, stage.strip_rows)
         else:
             built = build_model(
@@ -106,6 +114,9 @@ def _run_stages(task: SolverTask, queue) -> None:
         solver.parameters.log_to_stdout = False
         solver.log_callback = TreeProgress(index, queue).on_line
         status = solver.Solve(built.model)
+        if status == cp_model.INFEASIBLE and stage.period:
+            del built, solver
+            continue  # no repeating filling with this start and period; try the next one
         if status == cp_model.INFEASIBLE:
             queue.put((MSG_IMPOSSIBLE, index))
             return
@@ -120,12 +131,17 @@ def _run_stages(task: SolverTask, queue) -> None:
         # free this stage's model before the next one is built, so two never share the RAM
         del built, solver
         if stage.border == 0 and not stage.strip_rows:
+            # a rectangle tiling, or a repeating strip filling (the width fills forever)
             queue.put((MSG_POSSIBLE, index, placements))
             return
         # the filled border goes along: the app shows it, and the server's gallery too
         queue.put((MSG_FRAME_FEASIBLE, index, placements))
     if task.stages[-1].strip_rows:
         queue.put((MSG_FILLED, len(task.stages) - 1))
+        return
+    if task.stages[-1].period:
+        # every start and period of the job: no repeating filling (proves nothing about the width)
+        queue.put((MSG_IMPOSSIBLE, len(task.stages) - 1))
         return
     queue.put(
         (

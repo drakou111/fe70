@@ -11,7 +11,9 @@ from tilingvol.client import tls
 from tilingvol.shared.pieces import PIECES
 from tilingvol.shared.protocol import (
     MAX_PEAK_RAM_MB,
+    MAX_PERIOD,
     MAX_STRIP_ROWS,
+    MIN_PERIOD,
     SEARCH_BOARD,
     SEARCH_SYMMETRIC,
     Job,
@@ -60,6 +62,19 @@ def validate_job(job: Job, max_threads: int) -> Job:
             and not any(stage.border or stage.symmetric for stage in job.stages)
         ):
             problems.append("bad strip depths")
+    if job.periodic:
+        reach = PIECES[job.piece].strip_reach if job.piece in PIECES else MAX_STRIP_ROWS
+        if not (
+            all(
+                MIN_PERIOD <= s.period <= MAX_PERIOD
+                and reach <= s.periodic_start
+                and s.periodic_start + s.period <= MAX_STRIP_ROWS
+                and not (s.border or s.symmetric or s.strip_rows)
+                for s in job.stages
+            )
+            and job.height == max(s.periodic_start + s.period for s in job.stages)
+        ):
+            problems.append("bad periodic stages")
     for stage in job.stages:
         if not (
             0 <= stage.border <= min(job.width, job.height) // 2

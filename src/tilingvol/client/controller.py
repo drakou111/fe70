@@ -42,6 +42,7 @@ from tilingvol.shared.protocol import (
     RELEASE_ERROR,
     RELEASE_GAVE_UP,
     RELEASE_MEMORY,
+    SEARCH_FOREVER,
     SEARCH_WIDTH,
     VERDICT_FILLED,
     VERDICT_IMPOSSIBLE,
@@ -66,6 +67,15 @@ LOG_FILE_BYTES = 1 << 20
 MIN_TREE_THREADS = 4
 
 log = logging.getLogger("tilingvol.client")
+
+
+def unroll(placements: list, stage) -> list:
+    """A repeating filling with its block stacked twice more, for the picture."""
+    top = stage.periodic_start + stage.period
+    block = [p for p in placements if stage.periodic_start <= p[2] < top]
+    return list(placements) + [
+        [o, x, y + copy * stage.period] for copy in (1, 2) for o, x, y in block
+    ]
 
 
 class State(Enum):
@@ -475,6 +485,16 @@ class Controller:
             self._log(
                 "This server does not run the symmetric hunt yet, so this is an ordinary size."
             )
+        if settings.search == SEARCH_FOREVER and not job.periodic:
+            self._log(
+                "This server does not look for repeating fillings yet, so this is another kind of job."
+            )
+        if job.periodic:
+            self._log(
+                f"Got width {job.width} ({job.threads} threads, about {job.est_ram_mb / 1024:.1f} GB). "
+                f"Trying: {stages}. A repeating filling proves width {job.width} fills forever."
+            )
+            return
         if settings.search == SEARCH_WIDTH and not job.strip:
             self._log(
                 "This server does not hand out strip widths yet, so this is a rectangle size."
@@ -673,7 +693,22 @@ class Controller:
             ),
             frame_placements=frame[1] if frame else None,
         )
-        if solution is not None:
+        stage = job.stages[stage_index]
+        if solution is not None and job.periodic:
+            # border 0 on a strip picture: a repeating filling, drawn with two more copies of its block
+            rows = (
+                stage.periodic_start
+                + 3 * stage.period
+                + piece_by_name(job.piece).strip_reach
+            )
+            self._on_event(
+                Event(
+                    "picture",
+                    picture=(job.piece, job.width, rows, 0, unroll(solution, stage)),
+                    strip=True,
+                )
+            )
+        elif solution is not None:
             self._on_event(
                 Event(
                     "picture",
@@ -682,8 +717,16 @@ class Controller:
                 )
             )
         self._pending.add(submission.to_dict())
-        stage = job.stages[stage_index]
-        if job.strip and verdict == VERDICT_IMPOSSIBLE:
+        if job.periodic and verdict == VERDICT_POSSIBLE:
+            text = (
+                f"Width {job.width} FILLS FOREVER: a filling repeating every {stage.period} rows from row "
+                f"{stage.periodic_start} was found and is being sent"
+            )
+        elif job.periodic and verdict == VERDICT_IMPOSSIBLE:
+            text = f"Width {job.width}: no repeating filling with these settings (this proves nothing)"
+        elif job.periodic:
+            text = f"Width {job.width} timed out at {stage.describe()}"
+        elif job.strip and verdict == VERDICT_IMPOSSIBLE:
             text = (
                 f"Width {job.width} is RULED OUT: the first {stage.strip_rows} rows of its half-strip "
                 f"cannot be covered, so no rectangle has a side {job.width}"

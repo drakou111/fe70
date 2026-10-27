@@ -13,6 +13,7 @@ from pathlib import Path
 from tilingvol.client.memory_guard import installed_ram_mb
 from tilingvol.client.width_queue import parse_widths
 from tilingvol.shared.protocol import (
+    SEARCH_FOREVER,
     SEARCH_SYMMETRIC,
     SEARCH_WIDTH,
     SEARCHES,
@@ -154,7 +155,7 @@ class Settings:
 class Resolved:
     settings: Settings
     requested_size: tuple[int, int] | None  # a rectangle size (board or hunt)
-    requested_widths: tuple[int, ...]  # strip widths (width search)
+    requested_widths: tuple[int, ...]  # widths (width and fill-forever searches)
 
 
 def parse_number(text: str, what: str) -> float:
@@ -234,7 +235,11 @@ class Form:
             search=self.search,
             custom_stages=self.stages,
         ).validated()
-        if self.search == SEARCH_WIDTH:
+        if self.search == SEARCH_FOREVER and self.stages.strip():
+            raise ValueError(
+                "this search takes no depths; the server picks the repeat settings"
+            )
+        if self.search in (SEARCH_WIDTH, SEARCH_FOREVER):
             return Resolved(settings, None, parse_widths(self.request))
         return Resolved(settings, parse_size(self.request), ())
 

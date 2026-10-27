@@ -26,6 +26,21 @@ def all_orientations(cells) -> tuple[Shape, ...]:
     return tuple(sorted(found))
 
 
+def live_parts_table(bases, top: int = MAX_LIVE_WIDTH) -> dict[int, tuple[int, ...]]:
+    """width -> fill-forever widths from `bases` summing to it (largest first), for widths up to `top`."""
+    table: dict[int, tuple[int, ...]] = {}
+    for width in range(1, top + 1):
+        for base in sorted(bases, reverse=True):
+            if base == width:
+                table[width] = (base,)
+                break
+            rest = table.get(width - base)
+            if rest is not None:
+                table[width] = tuple(sorted((base, *rest), reverse=True))
+                break
+    return table
+
+
 @dataclass(frozen=True)
 class PieceSpec:
     name: str
@@ -70,17 +85,7 @@ class PieceSpec:
 
     @cached_property
     def _live_parts_table(self) -> dict[int, tuple[int, ...]]:
-        table: dict[int, tuple[int, ...]] = {}
-        for width in range(1, MAX_LIVE_WIDTH + 1):
-            for base in sorted(self.live_bases, reverse=True):
-                if base == width:
-                    table[width] = (base,)
-                    break
-                rest = table.get(width - base)
-                if rest is not None:
-                    table[width] = tuple(sorted((base, *rest), reverse=True))
-                    break
-        return table
+        return live_parts_table(self.live_bases)
 
     def exact_dead(self, width: int, height: int) -> bool:
         return any(

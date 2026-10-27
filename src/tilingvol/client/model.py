@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from ortools.sat.python import cp_model
 
 from tilingvol.shared.pieces import PieceSpec
+from tilingvol.shared.protocol import MIN_PERIOD
 
 GUN_BAR_LENGTH = 7
 WALLS = ("bottom", "top", "left", "right")
@@ -308,4 +309,48 @@ def build_strip_model(piece: PieceSpec, width: int, rows: int) -> BuiltModel:
                     model.AddBoolOr([])  # nothing can cover this cell
             elif len(options) > 1:
                 model.AddAtMostOne(options)
+    return BuiltModel(model, variables, placement_of)
+
+
+def build_periodic_model(
+    piece: PieceSpec, width: int, start: int, period: int
+) -> BuiltModel:
+    """A width-W half-strip filling whose rows from `start` on repeat every `period` rows: rows below
+    start + period are covered exactly once, and the pieces starting in the `reach` rows below `start`
+    equal those starting in the `reach` rows below start + period, moved down by `period`. The block of
+    pieces starting in [start, start + period) then sits on its own top as on the prefix, so stacking
+    copies of it fills the half-strip forever (research repo halfstrip_periodic.py)."""
+    reach = piece.strip_reach
+    if period < MIN_PERIOD or start < reach:
+        raise ValueError(f"need period >= {MIN_PERIOD} and start >= {reach}")
+    top = start + period
+    model = cp_model.CpModel()
+    variables: dict[frozenset, cp_model.IntVar] = {}
+    placement_of: dict[frozenset, tuple[int, int, int]] = {}
+    at: dict[tuple[int, int, int], cp_model.IntVar] = {}
+    covering: dict[tuple[int, int], list] = {}
+    for orientation, shape in enumerate(piece.orientations):
+        max_x = max(x for x, _ in shape)
+        for y0 in range(top):
+            for x0 in range(width - max_x):
+                cells = frozenset((x0 + dx, y0 + dy) for dx, dy in shape)
+                v = model.NewBoolVar("")
+                variables[cells] = v
+                placement_of[cells] = (orientation, x0, y0)
+                at[orientation, x0, y0] = v
+                for cell in cells:
+                    covering.setdefault(cell, []).append(v)
+    for y in range(top + reach):
+        for x in range(width):
+            options = covering.get((x, y), [])
+            if y < top:
+                if options:
+                    model.AddExactlyOne(options)
+                else:
+                    model.AddBoolOr([])
+            elif len(options) > 1:
+                model.AddAtMostOne(options)
+    for (orientation, x0, y0), v in at.items():
+        if start - reach <= y0 < start:
+            model.Add(v == at[orientation, x0, y0 + period])
     return BuiltModel(model, variables, placement_of)

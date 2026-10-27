@@ -25,12 +25,20 @@ LANE_HUNT = "hunt"  # 180-degree symmetric tilings only; its "impossible" proves
 # half-strip depth: can rows 0..h-1 of the width-W half-strip be covered? "impossible" rules out every
 # rectangle with a side W (research repo, FIVE_DIVISIBLE_SIDE.md); apps before STRIP_SINCE cannot run it
 LANE_STRIP = "strip"
+# fill-forever proof: a half-strip filling whose rows from `periodic_start` on repeat every `period` rows; a
+# found one is checked cell by cell (shared/verify.py), so it settles the width for good
+LANE_PERIODIC = "periodic"
 # what a volunteer chose to run (apps from STRIP_SINCE on send it; older ones send only the hunt flag)
 SEARCH_BOARD = "board"  # rectangle sizes
 SEARCH_WIDTH = "width"  # half-strip widths
 SEARCH_SYMMETRIC = "symmetric"  # the symmetric hunt
-SEARCHES = (SEARCH_BOARD, SEARCH_WIDTH, SEARCH_SYMMETRIC)
+SEARCH_FOREVER = "forever"  # repeating half-strip fillings
+SEARCHES = (SEARCH_BOARD, SEARCH_WIDTH, SEARCH_SYMMETRIC, SEARCH_FOREVER)
 STRIP_SINCE = "0.10.0"
+PERIODIC_SINCE = "0.12.0"
+# a piece spans at most 7 rows, so with period >= 7 each repeated block touches only its neighbours
+MIN_PERIOD = 7
+MAX_PERIOD = 200
 MAX_STRIP_ROWS = 1000
 SYMMETRIC_TAG_PREFIX = "sym"
 MAX_CUSTOM_STAGES = 8
@@ -64,6 +72,10 @@ class Stage:
         False  # only tilings unchanged by a 180-degree turn (the hunt lane)
     )
     strip_rows: int = 0  # > 0: cover the first strip_rows rows of the width-W half-strip (border is 0)
+    periodic_start: int = (
+        0  # with period > 0: a half-strip filling repeating from this row on
+    )
+    period: int = 0
 
     @property
     def unlimited(self) -> bool:
@@ -77,6 +89,8 @@ class Stage:
 
     @property
     def tag(self) -> str:
+        if self.period:
+            return f"periodic{self.periodic_start}p{self.period}"
         if self.strip_rows:
             return f"strip{self.strip_rows}"
         base = (
@@ -87,6 +101,8 @@ class Stage:
         return SYMMETRIC_TAG_PREFIX + base if self.symmetric else base
 
     def describe(self) -> str:
+        if self.period:
+            return f"repeating filling (rows from {self.periodic_start} repeat every {self.period})"
         if self.strip_rows:
             return f"strip depth {self.strip_rows}"
         text = "full search" if self.border == 0 else f"border depth {self.border}"
@@ -103,6 +119,8 @@ class Stage:
             float(data["time_limit_s"]),
             bool(data.get("symmetric", False)),
             int(data.get("strip_rows", 0)),
+            int(data.get("periodic_start", 0)),
+            int(data.get("period", 0)),
         )
 
 
@@ -128,6 +146,11 @@ class Job:
     def strip(self) -> bool:
         """A half-strip depth job of width `width`; `height` is its deepest depth."""
         return any(stage.strip_rows for stage in self.stages)
+
+    @property
+    def periodic(self) -> bool:
+        """A fill-forever job of width `width`; `height` is the most rows any of its stages builds."""
+        return any(stage.period for stage in self.stages)
 
     def to_dict(self) -> dict:
         return asdict(self)

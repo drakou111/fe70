@@ -6,7 +6,10 @@ Timed-out sizes do not steer the battle lane, so it cannot chase its own timeout
 
 A third lane, "strip", hands out half-strip depth searches: one width per searcher, at rising depths. A
 depth that cannot be covered rules out every rectangle with that side, so the width leaves the map. The
-cheapest width goes first: smallest width x next depth."""
+cheapest width goes first: smallest width x next depth.
+
+A fourth, "periodic", looks for half-strip fillings that repeat: a checked one proves its width fills
+forever, so the width leaves the strip lane (it can never die), and so does every sum of such widths."""
 
 import math
 import re
@@ -15,9 +18,20 @@ import time
 from dataclasses import dataclass, field, replace
 
 from tilingvol.server.config import ServerConfig
-from tilingvol.server.db import Database, ResultRow, StripFillRow, StripResultRow
+from tilingvol.server.db import (
+    PERIODIC_FOUND,
+    PERIODIC_NONE,
+    PERIODIC_TIMED_OUT,
+    Database,
+    PeriodicResultRow,
+    ResultRow,
+    StripFillRow,
+    StripResultRow,
+)
+from tilingvol.shared.pieces import live_parts_table
 from tilingvol.shared.protocol import (
     LANE_HUNT,
+    LANE_PERIODIC,
     LANE_STRIP,
     MAX_STRIP_ROWS,
     VERDICT_FILLED,
@@ -269,9 +283,25 @@ class Scheduler:
             if w not in self.piece.dead_sides
         ]
 
+    def certified_widths(self) -> dict[int, PeriodicResultRow]:
+        """Widths with a checked repeating filling (the first one found for each)."""
+        found: dict[int, PeriodicResultRow] = {}
+        for r in self.db.periodic_results():
+            if r.verdict == PERIODIC_FOUND:
+                found.setdefault(r.width, r)
+        return found
+
+    def live_table(self) -> dict[int, tuple[int, ...]]:
+        """width -> known fill-forever widths summing to it: the piece's bases plus certified widths."""
+        top = max(self.piece.max_side, self.config.request_max_side)
+        return live_parts_table(
+            self.piece.live_bases | set(self.certified_widths()), top
+        )
+
     def strip_widths(self) -> list[int]:
         """Widths a strip search can still rule out; known fill-forever widths never die."""
-        return [w for w in self.chart_widths() if self.piece.live_parts(w) is None]
+        live = self.live_table()
+        return [w for w in self.chart_widths() if w not in live]
 
     def strip_depths(self, state: WidthState | None) -> tuple[int, ...]:
         """The next depths to try: past the deepest filling and past every depth that timed out (a
@@ -327,7 +357,7 @@ class Scheduler:
                 )
             if w < self.piece.min_side or w in self.dead_widths(states):
                 raise RequestRefused(f"width {w} is already ruled out")
-            parts = self.piece.live_parts(w)
+            parts = self.live_table().get(w)
             if parts is not None:
                 raise RequestRefused(
                     f"width {w} fills forever ({' + '.join(map(str, parts))}), so it can never be ruled out"
@@ -361,6 +391,108 @@ class Scheduler:
         if candidates:
             raise NoAssignment(f"no open width fits in {max_ram_mb} MB")
         raise NoAssignment("every width in range is ruled out or running")
+
+    def periodic_configs_left(
+        self, width: int, rows: list[PeriodicResultRow], no_time_limit: bool
+    ) -> list[tuple[int, int]]:
+        """The (start, period) settings still worth trying for a width: not yet shown to have no repeating
+        filling, and not timed out (unless this volunteer has no time limit)."""
+        done = {
+            (r.start, r.period)
+            for r in rows
+            if r.width == width
+            and (
+                r.verdict == PERIODIC_NONE
+                or (r.verdict == PERIODIC_TIMED_OUT and not no_time_limit)
+            )
+        }
+        return [
+            c
+            for c in self.config.periodic_configs
+            if c not in done and c[0] >= self.piece.strip_reach
+        ]
+
+    def _pick_periodic(
+        self,
+        active,
+        max_ram_mb: int,
+        max_threads: int,
+        no_time_limit: bool,
+        requested_width: int | None,
+    ) -> Assignment:
+        """Widths whose half-strip filled deepest go first (the likeliest to fill forever), then narrow
+        ones; each job tries the next periodic_stages untried settings."""
+        states = self.width_states()
+        dead = self.dead_widths(states)
+        live = self.live_table()
+        rows = self.db.periodic_results()
+        leased = {j.width for j in active if j.lane == LANE_PERIODIC}
+        factor = self.ram_factor(self.db.results("all"))
+        failures = self.db.memory_failures()
+        reach = self.piece.strip_reach
+        limit = self.config.stage_time_limit_s
+
+        def plan(w: int):
+            configs = self.periodic_configs_left(w, rows, no_time_limit)[
+                : self.config.periodic_stages
+            ]
+            if not configs:
+                return None
+            height = max(s + p for s, p in configs)
+            fit = self.fit_threads(
+                w,
+                height + reach,
+                max_ram_mb,
+                max_threads,
+                factor,
+                failures.get((w, height), 0),
+            )
+            stages = tuple(
+                Stage(0, False, limit, periodic_start=s, period=p) for s, p in configs
+            )
+            return height, fit, stages
+
+        if requested_width is not None:
+            w = requested_width
+            if not 1 <= w <= self.config.request_max_side:
+                raise RequestRefused(
+                    f"widths are limited to {self.config.request_max_side}"
+                )
+            if w < self.piece.min_side or w in dead:
+                raise RequestRefused(f"width {w} is already ruled out")
+            if w in live:
+                raise RequestRefused(f"width {w} is already known to fill forever")
+            if w in leased:
+                raise RequestRefused(f"width {w} is being run by someone right now")
+            planned = plan(w)
+            if planned is None:
+                raise RequestRefused(
+                    f"every repeat setting was already tried for width {w}"
+                )
+            height, fit, stages = planned
+            if fit is None:
+                raise RequestRefused(f"width {w} needs more RAM than {max_ram_mb} MB")
+            return Assignment(w, height, LANE_PERIODIC, *fit, stages)
+
+        candidates = []
+        for w in self.chart_widths():
+            if w in dead or w in live or w in leased:
+                continue
+            state = states.get(w)
+            candidates.append((-(state.filled_rows if state else 0), w))
+        too_big = False
+        for _, w in sorted(candidates):
+            planned = plan(w)
+            if planned is None:
+                continue
+            height, fit, stages = planned
+            if fit is None:
+                too_big = True
+                continue
+            return Assignment(w, height, LANE_PERIODIC, *fit, stages)
+        if too_big:
+            raise NoAssignment(f"no open width fits in {max_ram_mb} MB")
+        raise NoAssignment("every open width has had every repeat setting tried")
 
     # stages
     def stages_for(
@@ -500,13 +632,18 @@ class Scheduler:
         custom_borders: tuple[int, ...] = (),
         strip: bool = False,
         requested_width: int | None = None,
+        periodic: bool = False,
     ) -> Assignment:
-        """strip: a half-strip width (requested_width, or the cheapest open one); otherwise a rectangle
-        size, or a size for the symmetric hunt."""
+        """strip: a half-strip width (requested_width, or the cheapest open one); periodic: a width to
+        prove fills forever; otherwise a rectangle size, or a size for the symmetric hunt."""
         self.expire_leases()
         active = self.db.active_jobs()
         if sum(1 for j in active if j.ip == ip) >= self.config.max_active_jobs_per_ip:
             raise RequestRefused("too many sizes are already running from your network")
+        if periodic:
+            return self._pick_periodic(
+                active, max_ram_mb, max_threads, no_time_limit, requested_width
+            )
         if strip:
             return self._pick_strip(
                 active,
@@ -528,7 +665,8 @@ class Scheduler:
         leased = {
             (min(j.width, j.height), max(j.width, j.height))
             for j in active
-            if (j.lane == LANE_HUNT) == hunt and j.lane != LANE_STRIP
+            if (j.lane == LANE_HUNT) == hunt
+            and j.lane not in (LANE_STRIP, LANE_PERIODIC)
         }
         factor = self.ram_factor(self.db.results("all"))
         failures = self.db.memory_failures()
