@@ -51,6 +51,7 @@ SIB_FOREVER = (12, 6, 13)
 SIB_FOREVER_NO_LOOKAHEAD = (12, 7, 14)
 SIB_RECTANGLE = (19, 28)
 SIB_CELLS = "0,0 1,0 2,0 3,0 4,0 1,1 2,1"
+GUN_CELLS = "0,0 1,0 2,0 3,0 4,0 5,0 6,0 1,1 2,1 3,1"
 LONG_RECTANGLE_WIDTH = 13  # 13 x 112 tiles; long enough to stop a run part way
 SLOW_WIDTH = 24  # lives long enough to be stopped part way
 TIMEOUT_S = 60
@@ -322,6 +323,46 @@ def test_a_repeat_across_a_resume_is_still_confirmed(use_binary, tmp_path):
     resumed = run_binary(use_binary, tmp_path, width, 3, checkpoint, threads=2)
     assert resumed[1] != "start 4"  # it did resume
     assert resumed[-1] == f"forever {earlier} {later}"
+
+
+def test_the_death_row_is_exact_at_every_lookahead(use_binary, tmp_path):
+    """A frontier pruned at row r can have fillings up to row r + lookahead - 1, so the death row must come
+    from stepping the unpruned language from lookahead rows back, not from the last kept row."""
+    for width in range(8, 19):
+        verdicts = {
+            k: run_binary(use_binary, tmp_path, width, k)[-1] for k in (0, 3, 6)
+        }
+        kinds = {v.split()[0] for v in verdicts.values()}
+        assert len(kinds) == 1, (width, verdicts)
+        if kinds != {
+            "forever"
+        }:  # pruned sets may repeat earlier; deaths and rectangles must match exactly
+            assert len(set(verdicts.values())) == 1, (width, verdicts)
+
+
+def test_a_deep_lookahead_keeps_the_gun_death_row(use_binary, tmp_path):
+    """Width 112 of the gun has no filling of 30 rows and fillings of 29 (unpruned decider). At lookahead 6
+    the last kept row empties earlier; versions before 0.14.3 stepped from it and reported dead 28."""
+    done = subprocess.run(
+        [
+            str(use_binary),
+            "--width",
+            "112",
+            "--cells",
+            GUN_CELLS,
+            "--scratch",
+            str(tmp_path / "scratch.raw"),
+            "--lookahead",
+            "6",
+            "--threads",
+            str(max(1, (os.cpu_count() or 1) // 2)),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=600,
+    )
+    assert done.stdout.strip().splitlines()[-1] == "dead 30"
 
 
 def test_a_resumed_run_keeps_its_checkpoints_lookahead(use_binary, tmp_path):

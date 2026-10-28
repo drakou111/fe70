@@ -62,6 +62,8 @@ constexpr int DEFAULT_START_ROW = 8;
 constexpr int MAX_THREADS = 256;
 // rows this small keep their canonical form, so a repeat of one is confirmed without recomputing it
 constexpr size_t SMALL_ROW_STATES = 1 << 15;
+// kept rows this small stay in memory for the last `lookahead` rows, to find the exact death row
+constexpr size_t RECENT_ROW_STATES = 1 << 22;
 
 [[noreturn]] void fail(const std::string& message) {
     std::cerr << "error: " << message << "\n" << std::flush;
@@ -1662,16 +1664,42 @@ int main(int argc, char** argv) {
     const Lookahead look(oris, lookahead);
     const std::string key = baseKey + (lookahead ? lookaheadMark + std::to_string(lookahead) : "");
     double before = 0;  // compute seconds of earlier runs (from the checkpoint)
-    // the full set's row, with every row up to the death as empty kept sets in the counts
-    auto deathFrom = [&](SDfa full, int row) {
+    std::map<int32_t, SDfa> recent;  // small kept rows of the last `lookahead` rows
+    // Row `row`'s kept set is empty: the width dies, and this finds the first row with no filling at all. A
+    // frontier pruned at row r has fillings up to row r + lookahead - 1 at most, so the unpruned language
+    // stepped from the kept row row - lookahead (or from the first row) reaches every filling that can outlive
+    // `row`. That kept row is in `recent`, or rebuilt from the start. Rows after `row` print as empty kept sets.
+    auto deathAt = [&](int row) {
+        int from = row - lookahead;
+        SDfa full;
+        int at;
+        if (from < c.startRow) {
+            auto [r0, first] = firstRow(oris, opt.startRow, W);
+            full = std::move(first);
+            at = r0;
+        } else {
+            SDfa e;
+            if (auto it = recent.find(from); it != recent.end()) {
+                e = std::move(it->second);
+            } else {
+                std::cerr << "    rebuilding the kept row " << from << " for the exact death row\n" << std::flush;
+                auto [r0, first] = firstRow(oris, opt.startRow, W);
+                e = look.keep(first, W, opt.scratch, workers);
+                for (int r = r0; r < from; r++) e = look.keep(advanceRow(oris, e, opt.scratch, workers), W, opt.scratch, workers);
+            }
+            full = advanceRow(oris, e, opt.scratch, workers);
+            at = from + 1;
+        }
         while (countWords(full, W) > 0) {
             full = advanceRow(oris, full, opt.scratch, workers);
-            row++;
+            at++;
+        }
+        for (int r = row + 1; r <= at; r++) {
             c.counts.push_back(1);
-            std::cout << "row " << row << " states 1 words 0 seconds " << (int64_t)(before + elapsed()) << "\n";
+            std::cout << "row " << r << " states 1 words 0 seconds " << (int64_t)(before + elapsed()) << "\n";
         }
         printCounts(c.counts);
-        std::cout << "dead " << row << "\n" << std::flush;
+        std::cout << "dead " << std::max(at, row) << "\n" << std::flush;
         std::exit(0);
     };
     // the kept part of a row's full set; an empty kept part ends the run with the exact death row
@@ -1684,7 +1712,8 @@ int main(int argc, char** argv) {
         if (countWords(k, W) > 0) return k;
         c.counts.push_back(1);
         std::cout << "row " << row << " states 1 words 0 seconds " << (int64_t)(before + elapsed()) << "\n";
-        deathFrom(std::move(full), row);
+        full.release();
+        deathAt(row);
         return k;
     };
     // the next row's kept set: pruned while it is built when the window filter applies; otherwise, or when
@@ -1760,6 +1789,10 @@ int main(int argc, char** argv) {
         seen.emplace(h, c.row);
         c.seen.push_back({c.row, h.first, h.second});
         if (d.size() <= SMALL_ROW_STATES) smallForms.emplace(c.row, canonicalForm(d));
+        if (lookahead > 0) {
+            recent.erase(recent.begin(), recent.lower_bound(c.row - lookahead + 1));
+            if (d.size() <= RECENT_ROW_STATES) recent.emplace(c.row, d);
+        }
         c.lang = keptNext(d, c.row + 1);
         c.row++;
         c.seconds = before + elapsed();
