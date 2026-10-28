@@ -13,6 +13,7 @@ from pathlib import Path
 from tilingvol.client.memory_guard import installed_ram_mb
 from tilingvol.client.width_queue import parse_widths
 from tilingvol.shared.protocol import (
+    SEARCH_EXACT,
     SEARCH_FOREVER,
     SEARCH_SYMMETRIC,
     SEARCH_WIDTH,
@@ -37,6 +38,7 @@ DEFAULT_RAM_FRACTION = 0.5
 MAX_NAME_LENGTH = 40
 MIN_SLOT_RAM_MB = 1024
 MAX_TIME_LIMIT_HOURS = 7 * 24
+EXACT_SUBDIR = "exact"
 _PENDING_LOCK = threading.RLock()  # parallel searches share one pending file
 
 
@@ -100,6 +102,15 @@ class Settings:
     # own depths, e.g. "24, 28, 32": border depths (the full search follows) or strip depths. Empty: the
     # server's
     custom_stages: str = ""
+    # where exact decisions keep their checkpoints (tens of GB); empty: the app folder
+    exact_folder: str = ""
+
+    def exact_dir(self, app_directory: Path) -> Path:
+        return (
+            Path(self.exact_folder)
+            if self.exact_folder
+            else app_directory / EXACT_SUBDIR
+        )
 
     def validated(self) -> "Settings":
         total = installed_ram_mb()
@@ -125,12 +136,20 @@ class Settings:
         if self.search not in SEARCHES:
             raise ValueError(f"unknown search {self.search!r}")
         depths = parse_custom_stages(self.custom_stages)
+        if self.search == SEARCH_EXACT and self.parallel != 1:
+            raise ValueError(
+                "exact decisions run one at a time (each needs tens of GB of RAM); set Parallel searches to 1"
+            )
+        folder = self.exact_folder.strip()
+        if folder and not Path(folder).is_absolute():
+            raise ValueError("the exact folder must be a full path, like D:\fe70-exact")
         return replace(
             self,
             name=validate_name(self.name),
             server_url=self.server_url.strip(),
             access_token=token,
             custom_stages=", ".join(str(d) for d in depths),
+            exact_folder=folder,
         )
 
     @property
@@ -199,6 +218,7 @@ class Form:
     tree_progress: bool = False
     server_url: str = ""  # empty: the built-in server
     access_token: str = ""
+    exact_folder: str = ""  # empty: inside the app folder
 
     def resolve(self) -> Resolved:
         ram_mb = (
@@ -234,12 +254,15 @@ class Form:
             tree_progress=self.tree_progress,
             search=self.search,
             custom_stages=self.stages,
+            exact_folder=self.exact_folder,
         ).validated()
         if self.search == SEARCH_FOREVER and self.stages.strip():
             raise ValueError(
                 "this search takes no depths; the server picks the repeat settings"
             )
-        if self.search in (SEARCH_WIDTH, SEARCH_FOREVER):
+        if self.search == SEARCH_EXACT and self.stages.strip():
+            raise ValueError("an exact decision takes no depths; it runs every row")
+        if self.search in (SEARCH_WIDTH, SEARCH_FOREVER, SEARCH_EXACT):
             return Resolved(settings, None, parse_widths(self.request))
         return Resolved(settings, parse_size(self.request), ())
 

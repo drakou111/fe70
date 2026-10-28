@@ -46,6 +46,7 @@ from tilingvol.shared.picture import render_png
 from tilingvol.shared.pieces import piece_by_name
 from tilingvol.shared.protocol import (
     SEARCH_BOARD,
+    SEARCH_EXACT,
     SEARCH_FOREVER,
     SEARCH_SYMMETRIC,
     SEARCH_WIDTH,
@@ -67,6 +68,7 @@ SEARCH_LABELS = {
     SEARCH_BOARD: "Rectangle sizes (board)",
     SEARCH_SYMMETRIC: "Symmetric hunt",
     SEARCH_FOREVER: "Fill widths forever",
+    SEARCH_EXACT: "Exact widths (big RAM)",
 }
 SEARCH_HINTS = {
     SEARCH_WIDTH: "Fills one width's half-strip deeper and deeper; a depth that cannot be filled rules "
@@ -76,6 +78,8 @@ SEARCH_HINTS = {
     "rules out symmetric tilings only.",
     SEARCH_FOREVER: "Looks for a half-strip filling that repeats; one found proves the width fills forever, "
     "so it never needs a strip search again.",
+    SEARCH_EXACT: "Decides one width for good: every row until it dies, tiles a rectangle or repeats. Needs "
+    "about 24 GB of RAM and 40 GB of disk, runs for hours, and saves a checkpoint after every row.",
 }
 # per search: (request placeholder, request hint, depths placeholder, depths hint)
 SEARCH_FIELDS = {
@@ -102,6 +106,12 @@ SEARCH_FIELDS = {
         "or widths, like 144, 138",
         "server's",
         "the server picks the repeat settings",
+    ),
+    SEARCH_EXACT: (
+        "server picks",
+        "or widths, like 145, 146",
+        "none",
+        "every row, until the width is decided",
     ),
 }
 MUTED = "#66706b"
@@ -343,6 +353,13 @@ class App:
             variable=self.tree_var,
         )
         self.tree_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        self.exact_entry = self._row(
+            computer,
+            4,
+            "Exact folder",
+            "inside the app folder",
+            "checkpoints of exact searches",
+        )
 
         connection = ttk.LabelFrame(self.form, text="Connection", padding=(10, 6))
         connection.pack(fill="x", pady=(8, 0))
@@ -368,6 +385,7 @@ class App:
             (self.parallel_entry, form.parallel),
             (self.url_entry, form.server_url),
             (self.token_entry, form.access_token),
+            (self.exact_entry, form.exact_folder),
         ):
             entry.set_value(value)
         for entry in (self.ram_entry, self.threads_entry, self.parallel_entry):
@@ -486,6 +504,7 @@ class App:
             tree_progress=self.tree_var.get(),
             server_url=self.url_entry.value,
             access_token=self.token_entry.value,
+            exact_folder=self.exact_entry.value,
         )
 
     def _button_help(self, key: str) -> str:
@@ -746,11 +765,12 @@ class App:
                 rows.append(("-", waiting, "-", "-", "-"))
                 continue
             kind = " symmetric" if job.hunt else ""
-            size = (
-                f"strip width {job.width} ({job.threads} threads)"
-                if job.strip
-                else f"{job.width} x {job.height}{kind} ({job.threads} threads)"
-            )
+            if job.exact:
+                size = f"exact width {job.width}"
+            elif job.strip:
+                size = f"strip width {job.width} ({job.threads} threads)"
+            else:
+                size = f"{job.width} x {job.height}{kind} ({job.threads} threads)"
             if status.stage_index >= 0:
                 stage = job.stages[status.stage_index]
                 stage_text = (
@@ -767,9 +787,12 @@ class App:
                 if status.ram_cap_mb
                 else "-"
             )
-            progress = (
-                f"{status.progress[0]}/{status.progress[1]}" if status.progress else "-"
-            )
+            if status.exact_row:
+                progress = f"row {status.exact_row[0]}"
+            elif status.progress:
+                progress = f"{status.progress[0]}/{status.progress[1]}"
+            else:
+                progress = "-"
             rows.append((size, stage_text, time_text, progress, ram))
         return rows
 

@@ -18,7 +18,8 @@ Create `.env` (git-ignored) with `TILINGVOL_SUBMIT_KEY=<64 hex digits>` and
 
 - Server (locally): `uv run uvicorn --factory tilingvol.server.app:create_app --host 127.0.0.1 --port 8000`
 - App from source: `uv run python -m tilingvol.client`
-- Build the app for this OS: `uv run python scripts/build_client.py` (output in `dist/`)
+- Build the app for this OS: `uv run python scripts/build_client.py` (output in `dist/`; needs `g++` for the
+  exact width program in `native/`, MinGW-w64 on Windows)
 - Publish a signed release (self-update): `uv run python scripts/release.py`, see `deploy/PI_SETUP.md` step 7
 - Tests: `uv run pytest`
 - Raspberry Pi deployment and hardening: `deploy/PI_SETUP.md`

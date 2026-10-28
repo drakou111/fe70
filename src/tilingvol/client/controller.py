@@ -7,6 +7,7 @@ import logging.handlers
 import multiprocessing
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -21,6 +22,15 @@ import psutil
 from tilingvol import __version__
 from tilingvol.client import memory_guard
 from tilingvol.client.api import ApiClient, NoJobAvailable, ServerError
+from tilingvol.client.exact_runner import (
+    MIN_FREE_DISK_MB,
+    MSG_EXACT_DONE,
+    MSG_EXACT_ROW,
+    ExactBinaryMissing,
+    ExactFiles,
+    ExactProcess,
+    checkpointed_widths,
+)
 from tilingvol.client.settings import PendingResults, Settings
 from tilingvol.client.solver_process import (
     MSG_ERROR,
@@ -42,12 +52,14 @@ from tilingvol.shared.protocol import (
     RELEASE_ERROR,
     RELEASE_GAVE_UP,
     RELEASE_MEMORY,
+    SEARCH_EXACT,
     SEARCH_FOREVER,
     SEARCH_WIDTH,
     VERDICT_FILLED,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
+    ExactOutcome,
     Job,
     ResultSubmission,
 )
@@ -65,6 +77,7 @@ CRASH_AS_MEMORY_FRACTION = 0.8
 KILL_JOIN_S = 10.0
 LOG_FILE_BYTES = 1 << 20
 MIN_TREE_THREADS = 4
+GONE = 410  # the server's answer to a requested width that is already decided
 
 log = logging.getLogger("tilingvol.client")
 
@@ -100,6 +113,7 @@ class Status:
     last_reached: float = (
         0.0  # time.time() of the last answer from the server, 0 if none yet
     )
+    exact_row: tuple[int, int] | None = None  # an exact decision: (row reached, states)
 
 
 @dataclass(frozen=True)
@@ -147,6 +161,7 @@ class SolverRunner:
     job: Job
     cap_mb: int
     tree_progress: bool = False
+    exact_dir: Path | None = None  # where an exact job keeps its checkpoint
     lock: threading.Lock = field(default_factory=threading.Lock)
     clock: ActiveClock = field(default_factory=ActiveClock)
     stage_index: int = -1
@@ -154,6 +169,7 @@ class SolverRunner:
     peak_mb: int = 0
     used_mb: int = 0
     progress: tuple[int, int] | None = None
+    exact_row: tuple[int, int] | None = None
     first_stage: int = 0
     kill_reason: str = ""  # "timeout" or "memory: ..."
     finished: bool = False
@@ -163,6 +179,14 @@ class SolverRunner:
     _job_limit: object = None
 
     def start(self) -> None:
+        if self.job.exact:
+            self._queue = queue.Queue()
+            files = ExactFiles(self.exact_dir, self.job.piece, self.job.width)
+            self._process = ExactProcess(
+                piece_by_name(self.job.piece), self.job.width, files, self._queue
+            )
+            self._watch_process()
+            return
         context = multiprocessing.get_context("spawn")
         self._queue = context.Queue()
         task = SolverTask(
@@ -180,6 +204,9 @@ class SolverRunner:
             target=run_task, args=(task, self._queue), daemon=True
         )
         self._process.start()
+        self._watch_process()
+
+    def _watch_process(self) -> None:
         self._handle = psutil.Process(self._process.pid)
         if sys.platform == "win32":
             self._job_limit = memory_guard.WindowsJobLimit(self.cap_mb)
@@ -293,6 +320,9 @@ class Controller:
         self._unsent_frame: tuple[int, list] | None = (
             None  # (stage index, placements) not yet saved
         )
+        self._resume_skipped: set[int] = (
+            set()
+        )  # checkpointed widths the server would not give back this session
         self._runner: SolverRunner | None = None
         self._runner_lock = threading.Lock()
         self._finished = 0
@@ -383,16 +413,18 @@ class Controller:
             if self._state == State.IDLE:
                 self._settings, self._requested = settings, requested
                 self._widths = widths
+                self._resume_skipped = set()
                 self._api = ApiClient(settings.server_url, settings.access_token)
                 self._next_request_at = 0.0
                 self._memory_failures = 0
                 self._crashes = 0
             self._state = State.RUNNING
-            self._log(
-                "Started."
-                if self._job is None
-                else "Restarting the current size from the beginning."
-            )
+            if self._job is None:
+                self._log("Started.")
+            elif self._job.exact:
+                self._log("Continuing the exact decision from its last checkpoint.")
+            else:
+                self._log("Restarting the current size from the beginning.")
         elif name == "pause" and self._state == State.RUNNING:
             # also valid between sizes or just as a search finishes: no new size is fetched while paused
             if self._runner:
@@ -440,7 +472,9 @@ class Controller:
     def _request_job(self) -> None:
         settings = self._settings
         width, height = self._requested or (None, None)
-        queued = None
+        queued = resumed = None
+        if width is None and settings.search == SEARCH_EXACT:
+            resumed = width = self._checkpoint_to_resume()
         if width is None and self._widths is not None:
             queued = width = self._widths.claim(self)
         try:
@@ -467,6 +501,15 @@ class Controller:
                 # a requested size is kept: the retry asks for it again
                 self._log(f"{error}. Retrying in {UNREACHABLE_RETRY_S:.0f} s.")
                 self._next_request_at = time.monotonic() + UNREACHABLE_RETRY_S
+            elif resumed is not None:
+                self._resume_skipped.add(resumed)
+                if error.status == GONE:
+                    self._drop_checkpoints(resumed)
+                    self._log(
+                        f"Width {resumed} was decided meanwhile ({error}); its checkpoint is deleted."
+                    )
+                else:
+                    self._log(f"Cannot resume width {resumed} now: {error}")
             elif queued is not None:
                 self._widths.drop(self)
                 self._log(f"Skipping width {queued} from your list: {error}")
@@ -489,6 +532,23 @@ class Controller:
             self._log(
                 "This server does not look for repeating fillings yet, so this is another kind of job."
             )
+        if settings.search == SEARCH_EXACT and not job.exact:
+            self._log(
+                "This server does not hand out exact width decisions yet, so this is another kind of job."
+            )
+        if job.exact:
+            files = ExactFiles(self._exact_dir(), job.piece, job.width)
+            again = (
+                "resuming from its checkpoint"
+                if files.checkpoint.exists()
+                else "from row 0"
+            )
+            self._log(
+                f"Got width {job.width} for an exact decision ({again}; about "
+                f"{job.est_ram_mb / 1024:.0f} GB of RAM, one thread). It runs until the width dies, tiles a "
+                f"rectangle or repeats; a checkpoint is saved after every row in {files.directory}."
+            )
+            return
         if job.periodic:
             self._log(
                 f"Got width {job.width} ({job.threads} threads, about {job.est_ram_mb / 1024:.1f} GB). "
@@ -521,7 +581,24 @@ class Controller:
                 f"thread). Raise Max RAM to allow more threads."
             )
 
+    def _exact_dir(self) -> Path:
+        return self._settings.exact_dir(self._directory)
+
+    def _checkpoint_to_resume(self) -> int | None:
+        for width in checkpointed_widths(self._exact_dir()):
+            if width not in self._resume_skipped:
+                return width
+        return None
+
+    def _drop_checkpoints(self, width: int) -> None:
+        for path in self._exact_dir().glob(f"*-{width}.ckpt"):
+            piece = path.name.split("-")[0]
+            ExactFiles(self._exact_dir(), piece, width).remove()
+
     def _start_runner(self) -> None:
+        if self._job.exact and not self._exact_ready():
+            self._state = State.STOPPED
+            return
         available = memory_guard.available_ram_mb()
         cap = self._settings.max_ram_mb
         if available < min(cap, self._job.est_ram_mb) + memory_guard.SYSTEM_FLOOR_MB:
@@ -535,6 +612,7 @@ class Controller:
             self._job,
             cap,
             self._settings.tree_progress,
+            exact_dir=self._exact_dir(),
             first_stage=self._filled_stage + 1,
         )
         if self._filled_stage >= 0:
@@ -546,6 +624,26 @@ class Controller:
         with self._runner_lock:
             self._runner = runner
 
+    def _exact_ready(self) -> bool:
+        directory = self._exact_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        free_mb = shutil.disk_usage(directory).free // (1 << 20)
+        if free_mb < MIN_FREE_DISK_MB:
+            self._log(
+                f"Only {free_mb / 1024:.0f} GB free in {directory}; an exact search needs about "
+                f"{MIN_FREE_DISK_MB // 1024} GB for its checkpoint and scratch row. Free some space or pick "
+                f"another Exact folder, then press Start."
+            )
+            return False
+        try:
+            from tilingvol.client.exact_runner import exact_binary
+
+            exact_binary()
+        except ExactBinaryMissing as error:
+            self._log(f"Cannot run exact searches: {error}")
+            return False
+        return True
+
     def _poll_runner(self) -> None:
         runner = self._runner
         for message in runner.drain():
@@ -554,6 +652,18 @@ class Controller:
                 if message[1] == runner.stage_index:
                     runner.progress = (message[2], message[3])
                 continue
+            if kind == MSG_EXACT_ROW:
+                _, row, states, seconds = message
+                runner.exact_row = (row, states)
+                self._log(
+                    f"Width {self._job.width}: row {row}, {states:,} states "
+                    f"({format_duration(seconds)} of compute so far)."
+                )
+                continue
+            if kind == MSG_EXACT_DONE:
+                outcome: ExactOutcome = message[1]
+                self._finish(outcome.verdict, 0, None, outcome)
+                return
             if kind == MSG_STAGE_START:
                 with runner.lock:
                     runner.progress = None
@@ -625,6 +735,9 @@ class Controller:
         elif not runner.alive() and runner.exit_code() is not None:
             # a final message may arrive just before exit
             for message in runner.drain():
+                if message[0] == MSG_EXACT_DONE:
+                    self._finish(message[1].verdict, 0, None, message[1])
+                    return
                 if message[0] in (MSG_IMPOSSIBLE, MSG_POSSIBLE, MSG_FILLED):
                     solution = message[2] if len(message) > 2 else None
                     self._finish(message[0], message[1], solution)
@@ -649,7 +762,13 @@ class Controller:
                 f"from {self._directory}."
             )
 
-    def _finish(self, verdict: str, stage_index: int, solution: list | None) -> None:
+    def _finish(
+        self,
+        verdict: str,
+        stage_index: int,
+        solution: list | None,
+        exact: ExactOutcome | None = None,
+    ) -> None:
         runner = self._runner
         duration = runner.clock.elapsed()
         peak = runner.peak_mb
@@ -670,6 +789,7 @@ class Controller:
             duration,
             salt,
             solution,
+            exact.to_dict() if exact else None,
         )
         # a border filling already saved on the server need not travel again
         frame = self._unsent_frame
@@ -692,6 +812,7 @@ class Controller:
                 else None
             ),
             frame_placements=frame[1] if frame else None,
+            exact=exact.to_dict() if exact else None,
         )
         stage = job.stages[stage_index]
         if solution is not None and job.periodic:
@@ -717,7 +838,24 @@ class Controller:
                 )
             )
         self._pending.add(submission.to_dict())
-        if job.periodic and verdict == VERDICT_POSSIBLE:
+        if exact is not None:
+            ExactFiles(self._exact_dir(), job.piece, job.width).remove()
+        if exact is not None and verdict == VERDICT_IMPOSSIBLE:
+            text = (
+                f"Width {job.width} is RULED OUT exactly: no filling of {exact.row} rows exists, so no "
+                f"rectangle has a side {job.width}"
+            )
+        elif exact is not None and verdict == VERDICT_POSSIBLE:
+            text = (
+                f"Width {job.width}: A {job.width} x {exact.row} RECTANGLE TILES (the flat frontier came "
+                f"back at row {exact.row})! This is being sent to the server"
+            )
+        elif exact is not None:
+            text = (
+                f"Width {job.width} FILLS FOREVER: row {exact.row} repeats row {exact.repeat_from} exactly, so "
+                f"this width never dies (a rectangle with this side is still possible)"
+            )
+        elif job.periodic and verdict == VERDICT_POSSIBLE:
             text = (
                 f"Width {job.width} FILLS FOREVER: a filling repeating every {stage.period} rows from row "
                 f"{stage.periodic_start} was found and is being sent"
@@ -747,6 +885,8 @@ class Controller:
         else:
             text = f"{job.width} x {job.height} timed out at {stage.describe()}"
         self._finished += 1
+        if exact is not None:
+            duration = exact.compute_s  # resumed runs included
         message = f"{self._prefix}{text}, after {format_duration(duration)}."
         log.info(message)
         self._on_event(Event("result", message))
@@ -825,6 +965,7 @@ class Controller:
                 self._state.value,
                 runner.stage_index if runner else -1,
                 runner.clock.elapsed() if runner else 0.0,
+                runner.exact_row if runner else None,
             )
         except ServerError as error:
             if error.status in (404, 409, 410):
@@ -903,6 +1044,7 @@ class Controller:
                     ram_used_mb=runner.used_mb if runner else 0,
                     ram_cap_mb=self._settings.max_ram_mb if self._settings else 0,
                     progress=runner.progress if runner else None,
+                    exact_row=runner.exact_row if runner else None,
                     finished=self._finished,
                     waiting_until=self._next_request_at if self._job is None else 0.0,
                     last_reached=self._api.last_reached if self._api else 0.0,

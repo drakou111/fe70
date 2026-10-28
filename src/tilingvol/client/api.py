@@ -47,7 +47,8 @@ def validate_job(job: Job, max_threads: int) -> Job:
     problems = []
     if job.piece not in PIECES:
         problems.append(f"unknown piece {job.piece!r}")
-    if not (1 <= job.width <= MAX_SIDE and 1 <= job.height <= MAX_SIDE):
+    min_height = 0 if job.exact else 1  # an exact decision has no height
+    if not (1 <= job.width <= MAX_SIDE and min_height <= job.height <= MAX_SIDE):
         problems.append("size out of range")
     if not 1 <= job.threads <= max_threads:
         problems.append(f"{job.threads} threads is more than the {max_threads} allowed")
@@ -75,6 +76,16 @@ def validate_job(job: Job, max_threads: int) -> Job:
             and job.height == max(s.periodic_start + s.period for s in job.stages)
         ):
             problems.append("bad periodic stages")
+    if job.exact and not (
+        len(job.stages) == 1
+        and job.stages[0].unlimited
+        and job.height == 0
+        and job.threads == 1
+        and not (
+            job.stages[0].symmetric or job.stages[0].strip_rows or job.stages[0].period
+        )
+    ):
+        problems.append("bad exact stage")
     for stage in job.stages:
         if not (
             0 <= stage.border <= min(job.width, job.height) // 2
@@ -143,17 +154,23 @@ class ApiClient:
         return validate_job(job, max_threads)
 
     def heartbeat(
-        self, job: Job, state: str, stage_index: int, active_s: float
+        self,
+        job: Job,
+        state: str,
+        stage_index: int,
+        active_s: float,
+        exact_row: tuple[int, int] | None = None,
     ) -> dict:
-        return self._post(
-            f"/api/jobs/{job.job_id}/heartbeat",
-            {
-                "nonce": job.nonce,
-                "state": state,
-                "stage_index": stage_index,
-                "active_s": active_s,
-            },
-        )
+        """exact_row: (row, states) an exact decision has reached, shown on the server's page."""
+        body = {
+            "nonce": job.nonce,
+            "state": state,
+            "stage_index": stage_index,
+            "active_s": active_s,
+        }
+        if exact_row is not None:
+            body["exact_row"], body["exact_states"] = exact_row
+        return self._post(f"/api/jobs/{job.job_id}/heartbeat", body)
 
     def release(
         self, job: Job, reason: str, peak_ram_mb: int = 0, detail: str = ""

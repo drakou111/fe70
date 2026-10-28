@@ -26,19 +26,30 @@ from tilingvol.server.db import (
     PERIODIC_TIMED_OUT,
     Database,
 )
-from tilingvol.server.scheduler import NoAssignment, RequestRefused, Scheduler
+from tilingvol.server.scheduler import (
+    AlreadyDecided,
+    NoAssignment,
+    RequestRefused,
+    Scheduler,
+)
 from tilingvol.shared import token
 from tilingvol.shared.picture import render_png
 from tilingvol.shared.protocol import (
+    EXACT_DEAD,
+    EXACT_RECTANGLE,
+    EXACT_SINCE,
+    LANE_EXACT,
     LANE_HUNT,
     LANE_PERIODIC,
     LANE_STRIP,
     MAX_BORDER,
     MAX_CUSTOM_STAGES,
+    MAX_EXACT_ROW,
     MAX_PEAK_RAM_MB,
     NO_LIMIT,
     PERIODIC_SINCE,
     RELEASE_REASONS,
+    SEARCH_EXACT,
     SEARCH_FOREVER,
     SEARCH_SYMMETRIC,
     SEARCH_WIDTH,
@@ -50,6 +61,7 @@ from tilingvol.shared.protocol import (
     VERDICT_POSSIBLE,
     VERDICT_TIMED_OUT,
     VERDICTS,
+    ExactOutcome,
     Stage,
 )
 from tilingvol.shared.verify import (
@@ -75,6 +87,7 @@ PAGE_CACHE_S = 30.0
 HEX = re.compile(r"[0-9a-f]{32}")
 TOKEN_HEX = re.compile(r"[0-9a-f]{64}")
 CLIENT_STATES = ("running", "paused", "stopped")
+MAX_EXACT_STATES = 1 << 40
 
 
 class JobRequest(BaseModel):
@@ -100,6 +113,9 @@ class Heartbeat(BaseModel):
     state: str = Field(max_length=10)
     stage_index: int = Field(ge=-1, le=64)
     active_s: float = Field(ge=0, le=1e8)
+    # an exact decision: the row it reached and its state count (shown on the page)
+    exact_row: int | None = Field(default=None, ge=0, le=MAX_EXACT_ROW)
+    exact_states: int | None = Field(default=None, ge=0, le=MAX_EXACT_STATES)
 
 
 class Release(BaseModel):
@@ -113,6 +129,15 @@ class Frame(BaseModel):
     nonce: str = Field(max_length=64)
     stage_index: int = Field(ge=0, le=64)
     placements: list[list[int]] = Field(max_length=100_000)
+
+
+class ExactBody(BaseModel):
+    outcome: str = Field(max_length=12)
+    row: int = Field(ge=0, le=MAX_EXACT_ROW)
+    repeat_from: int = Field(ge=0, le=MAX_EXACT_ROW)
+    first_row: int = Field(ge=0, le=MAX_EXACT_ROW)
+    counts: list[int] = Field(max_length=MAX_EXACT_ROW + 1)
+    compute_s: float = Field(ge=0, le=1e9)
 
 
 class Submission(BaseModel):
@@ -129,6 +154,7 @@ class Submission(BaseModel):
     solution: list[list[int]] | None = Field(default=None, max_length=200_000)
     frame_border: int | None = Field(default=None, ge=1, le=1000)
     frame_placements: list[list[int]] | None = Field(default=None, max_length=100_000)
+    exact: ExactBody | None = None
 
 
 def version_tuple(version: str) -> tuple[int, ...]:
@@ -250,6 +276,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         hunt = body.hunt if body.search is None else body.search == SEARCH_SYMMETRIC
         strip = body.search == SEARCH_WIDTH
         periodic = body.search == SEARCH_FOREVER
+        exact = body.search == SEARCH_EXACT
+        if exact and version_tuple(body.client_version) < version_tuple(EXACT_SINCE):
+            raise HTTPException(
+                426, f"exact width decisions need version {EXACT_SINCE} or newer"
+            )
         if strip and version_tuple(body.client_version) < version_tuple(STRIP_SINCE):
             raise HTTPException(
                 426, f"strip widths need version {STRIP_SINCE} or newer"
@@ -262,7 +293,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             )
         requested = None
         requested_width = None
-        if strip or periodic:
+        if strip or periodic or exact:
             requested_width = body.width
         elif body.width is not None or body.height is not None:
             if body.width is None or body.height is None:
@@ -282,9 +313,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     strip=strip,
                     requested_width=requested_width,
                     periodic=periodic,
+                    exact=exact,
                 )
             except NoAssignment as error:
                 raise HTTPException(404, str(error)) from error
+            except AlreadyDecided as error:
+                raise HTTPException(410, str(error)) from error
             except RequestRefused as error:
                 raise HTTPException(409, str(error)) from error
             job_id, nonce = secrets.token_hex(16), secrets.token_hex(16)
@@ -297,6 +331,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "strip_rows": s.strip_rows,
                     "periodic_start": s.periodic_start,
                     "period": s.period,
+                    "exact": s.exact,
                 }
                 for s in assignment.stages
             ]
@@ -333,7 +368,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "lane": assignment.lane,
             "heartbeat_interval_s": config.heartbeat_interval_s,
             "filled_border": 0
-            if assignment.lane in (LANE_STRIP, LANE_PERIODIC)
+            if assignment.lane in (LANE_STRIP, LANE_PERIODIC, LANE_EXACT)
             else db.filled_border(assignment.width, assignment.height, symmetric=hunt),
         }
 
@@ -348,11 +383,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             db.end_job(job_id, "cancelled", "decided elsewhere")
             what = (
                 f"width {job.width}"
-                if job.lane in (LANE_STRIP, LANE_PERIODIC)
+                if job.lane in (LANE_STRIP, LANE_PERIODIC, LANE_EXACT)
                 else f"{job.width} x {job.height}"
             )
             return {"cancel": True, "reason": f"{what} was decided by someone else"}
         db.touch_job(job_id, body.state)
+        if job.lane == LANE_EXACT and body.exact_row is not None:
+            db.set_exact_progress(
+                job.width, job.name, job_id, body.exact_row, body.exact_states or 0
+            )
+            page_cache["at"] = 0.0
         return {"ok": True}
 
     def size_closed(job) -> bool:
@@ -363,6 +403,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             return (
                 job.width in scheduler.dead_widths()
                 or job.width in scheduler.live_table()
+            )
+        if job.lane == LANE_EXACT:
+            return (
+                job.width in scheduler.dead_widths()
+                or job.width in scheduler.live_table()
+                or job.width in scheduler.exact_decided()
             )
         key = (job.width, job.height)
         if scheduler.is_dead(key):
@@ -461,6 +507,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if not (HEX.fullmatch(body.salt) and TOKEN_HEX.fullmatch(body.token)):
             raise HTTPException(422, "invalid salt or token format")
         stage = job.stages[body.stage_index]
+        if (job.lane == LANE_EXACT) != (body.exact is not None):
+            raise HTTPException(
+                422, "an exact outcome goes with, and only with, an exact job"
+            )
+        if job.lane == LANE_EXACT:
+            return exact_result(job, body, request)
         strip = job.lane == LANE_STRIP
         periodic = job.lane == LANE_PERIODIC
         if periodic and body.verdict == VERDICT_FILLED:
@@ -664,6 +716,88 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             log.warning("WIDTH FILLS FOREVER: %d by %r", job.width, job.name)
         return {"ok": True, "message": "Thank you!"}
 
+    def exact_result(job, body: Submission, request: Request) -> dict:
+        """The outcome is checked for consistency and its signature, not recomputed: an exact decision
+        takes hours. Its per-row state counts let a second run of the width confirm it exactly."""
+        try:
+            outcome = ExactOutcome.from_dict(body.exact.model_dump())
+        except ValueError as error:
+            raise HTTPException(422, f"invalid exact outcome: {error}") from error
+        if body.verdict != outcome.verdict or body.stage_index != 0:
+            raise HTTPException(422, "the verdict does not match the exact outcome")
+        if body.solution is not None:
+            raise HTTPException(422, "an exact decision sends no tiling")
+        payload = token.signing_payload(
+            job.job_id,
+            job.nonce,
+            job.name,
+            job.width,
+            job.height,
+            body.verdict,
+            body.stage_index,
+            body.duration_s,
+            body.salt,
+            None,
+            outcome.to_dict(),
+        )
+        if not token.check(config.submit_key, payload, body.token):
+            log.warning("job %s: bad token from %s", job.job_id, client_ip(request))
+            raise HTTPException(403, "result signature is not valid")
+        if not db.use_salt(body.salt):
+            raise HTTPException(409, "this result number was already used")
+        if body.duration_s > time.time() - job.created + DURATION_SLACK_S:
+            raise HTTPException(
+                422, "the reported duration is longer than the job has existed"
+            )
+        db.add_exact_result(
+            job_id=job.job_id,
+            width=job.width,
+            outcome=outcome.outcome,
+            row=outcome.row,
+            repeat_from=outcome.repeat_from,
+            first_row=outcome.first_row,
+            counts=outcome.counts,
+            compute_s=outcome.compute_s,
+            name=job.name,
+            ip=job.ip,
+            peak_ram_mb=body.peak_ram_mb,
+            client_version=body.client_version,
+        )
+        if outcome.outcome == EXACT_DEAD:
+            # the same fact a strip search proves: no filling of `row` rows, so the width leaves the map
+            db.add_strip_result(
+                job_id=job.job_id,
+                width=job.width,
+                rows=outcome.row,
+                verdict=VERDICT_IMPOSSIBLE,
+                duration_s=outcome.compute_s,
+                name=job.name,
+                ip=job.ip,
+                threads=job.threads,
+                peak_ram_mb=body.peak_ram_mb,
+                client_version=body.client_version,
+                source="exact",
+            )
+        db.end_job(job.job_id, "done", body.verdict, body.peak_ram_mb)
+        page_cache["at"] = 0.0
+        log.info(
+            "job %s: width %d exact %s at row %d by %r (%.0f s of compute)",
+            job.job_id,
+            job.width,
+            outcome.outcome,
+            outcome.row,
+            job.name,
+            outcome.compute_s,
+        )
+        if outcome.outcome == EXACT_RECTANGLE:
+            log.warning(
+                "RECTANGLE CLAIMED by an exact decision: %d x %d by %r; check it with a board search",
+                job.width,
+                outcome.row,
+                job.name,
+            )
+        return {"ok": True, "message": "Thank you!"}
+
     def picture_of(job, body: Submission) -> tuple[int | None, list | None]:
         """The tiling itself, or the deepest border filling if it is genuine (display only)."""
         if body.verdict == VERDICT_POSSIBLE:
@@ -784,6 +918,30 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "picture": f"/periodic/{c.result_id}.png",
                 }
                 for c in scheduler.certified_widths().values()
+            ],
+            "exact": [
+                {
+                    "width": r.width,
+                    "outcome": r.outcome,
+                    "row": r.row,
+                    "repeat_from": r.repeat_from,
+                    "first_row": r.first_row,
+                    "counts": list(r.counts),
+                    "compute_s": r.compute_s,
+                    "by": r.name,
+                    "submitted": r.submitted,
+                }
+                for r in db.exact_results()
+            ],
+            "exact_running": [
+                {
+                    "width": p.width,
+                    "by": p.name,
+                    "row": p.row,
+                    "states": p.states,
+                    "updated": p.updated,
+                }
+                for p in db.exact_progress().values()
             ],
         }
 

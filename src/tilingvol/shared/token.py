@@ -33,6 +33,7 @@ def signing_payload(
     duration_s: float,
     salt: str,
     solution: list[list[int]] | None,
+    exact: dict | None = None,
 ) -> bytes:
     fields = {
         "job_id": job_id,
@@ -46,6 +47,10 @@ def signing_payload(
         "salt": salt,
         "solution": solution_digest(solution),
     }
+    if exact is not None:  # older results sign exactly what they did before
+        fields["exact"] = hashlib.sha256(
+            json.dumps(exact, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
     return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
 
 

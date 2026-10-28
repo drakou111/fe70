@@ -9,7 +9,11 @@ depth that cannot be covered rules out every rectangle with that side, so the wi
 cheapest width goes first: smallest width x next depth.
 
 A fourth, "periodic", looks for half-strip fillings that repeat: a checked one proves its width fills
-forever, so the width leaves the strip lane (it can never die), and so does every sum of such widths."""
+forever, so the width leaves the strip lane (it can never die), and so does every sum of such widths.
+
+A fifth, "exact", decides one width for good on one big computer (smallest open width first). The
+volunteer's checkpoint makes the run resumable, so a width whose run reported a row stays with that
+volunteer for exact_reserve_s after their last heartbeat."""
 
 import math
 import re
@@ -23,6 +27,7 @@ from tilingvol.server.db import (
     PERIODIC_NONE,
     PERIODIC_TIMED_OUT,
     Database,
+    ExactResultRow,
     PeriodicResultRow,
     ResultRow,
     StripFillRow,
@@ -30,10 +35,13 @@ from tilingvol.server.db import (
 )
 from tilingvol.shared.pieces import live_parts_table
 from tilingvol.shared.protocol import (
+    EXACT_FOREVER,
+    LANE_EXACT,
     LANE_HUNT,
     LANE_PERIODIC,
     LANE_STRIP,
     MAX_STRIP_ROWS,
+    NO_LIMIT,
     VERDICT_FILLED,
     VERDICT_IMPOSSIBLE,
     VERDICT_POSSIBLE,
@@ -68,6 +76,10 @@ class NoAssignment(Exception):
 
 class RequestRefused(Exception):
     """The request itself is unacceptable (HTTP 409)."""
+
+
+class AlreadyDecided(RequestRefused):
+    """A requested exact width is settled already (HTTP 410): the client's checkpoint of it is useless."""
 
 
 @dataclass(frozen=True)
@@ -291,11 +303,22 @@ class Scheduler:
                 found.setdefault(r.width, r)
         return found
 
+    def exact_decided(self) -> dict[int, ExactResultRow]:
+        """Widths an exact decision settled (the first result for each)."""
+        found: dict[int, ExactResultRow] = {}
+        for r in self.db.exact_results():
+            found.setdefault(r.width, r)
+        return found
+
     def live_table(self) -> dict[int, tuple[int, ...]]:
-        """width -> known fill-forever widths summing to it: the piece's bases plus certified widths."""
+        """width -> known fill-forever widths summing to it: the piece's bases, certified widths and widths
+        an exact decision found repeating."""
         top = max(self.piece.max_side, self.config.request_max_side)
+        exact_live = {
+            w for w, r in self.exact_decided().items() if r.outcome == EXACT_FOREVER
+        }
         return live_parts_table(
-            self.piece.live_bases | set(self.certified_widths()), top
+            self.piece.live_bases | set(self.certified_widths()) | exact_live, top
         )
 
     def strip_widths(self) -> list[int]:
@@ -497,6 +520,60 @@ class Scheduler:
             raise NoAssignment(f"no open width fits in {max_ram_mb} MB")
         raise NoAssignment("every open width has had every repeat setting tried")
 
+    def exact_reserved(self, name: str, now: float | None = None) -> dict[int, str]:
+        """Widths whose exact run (by someone other than `name`) reported a row recently: width -> name."""
+        now = now or time.time()
+        return {
+            w: p.name
+            for w, p in self.db.exact_progress().items()
+            if p.name != name and now - p.updated < self.config.exact_reserve_s
+        }
+
+    def _pick_exact(
+        self, active, name: str, max_ram_mb: int, requested_width: int | None
+    ) -> Assignment:
+        """The smallest width that is neither ruled out, known to fill forever, decided exactly, running,
+        nor reserved by someone else's checkpoint; a volunteer's own checkpointed width comes back to them."""
+        need = self.config.exact_ram_mb
+        dead = self.dead_widths()
+        live = self.live_table()
+        decided = self.exact_decided()
+        leased = {j.width for j in active if j.lane == LANE_EXACT}
+        reserved = self.exact_reserved(name)
+        stage = Stage(0, False, NO_LIMIT, exact=True)
+
+        def assignment(w: int) -> Assignment:
+            return Assignment(w, 0, LANE_EXACT, 1, need, (stage,))
+
+        if max_ram_mb < need:
+            raise (RequestRefused if requested_width is not None else NoAssignment)(
+                f"an exact decision needs about {need / 1024:.0f} GB of RAM; raise Max RAM"
+            )
+        if requested_width is not None:
+            w = requested_width
+            if not 1 <= w <= self.config.request_max_side:
+                raise RequestRefused(
+                    f"widths are limited to {self.config.request_max_side}"
+                )
+            if w < self.piece.min_side or w in dead:
+                raise AlreadyDecided(f"width {w} is already ruled out")
+            if w in decided:
+                raise AlreadyDecided(f"width {w} was already decided exactly")
+            if w in live:
+                raise AlreadyDecided(f"width {w} is already known to fill forever")
+            if w in leased:
+                raise RequestRefused(f"width {w} is being run by someone right now")
+            if w in reserved:
+                raise RequestRefused(
+                    f"width {w} is being decided by {reserved[w]} (they can resume it)"
+                )
+            return assignment(w)
+        for w in self.chart_widths():
+            if w in dead or w in live or w in decided or w in leased or w in reserved:
+                continue
+            return assignment(w)
+        raise NoAssignment("every width in range is decided, running or reserved")
+
     # stages
     def stages_for(
         self,
@@ -636,6 +713,7 @@ class Scheduler:
         strip: bool = False,
         requested_width: int | None = None,
         periodic: bool = False,
+        exact: bool = False,
     ) -> Assignment:
         """strip: a half-strip width (requested_width, or the cheapest open one); periodic: a width to
         prove fills forever; otherwise a rectangle size, or a size for the symmetric hunt."""
@@ -643,6 +721,8 @@ class Scheduler:
         active = self.db.active_jobs()
         if sum(1 for j in active if j.ip == ip) >= self.config.max_active_jobs_per_ip:
             raise RequestRefused("too many sizes are already running from your network")
+        if exact:
+            return self._pick_exact(active, name, max_ram_mb, requested_width)
         if periodic:
             return self._pick_periodic(
                 active, max_ram_mb, max_threads, no_time_limit, requested_width
@@ -669,7 +749,7 @@ class Scheduler:
             (min(j.width, j.height), max(j.width, j.height))
             for j in active
             if (j.lane == LANE_HUNT) == hunt
-            and j.lane not in (LANE_STRIP, LANE_PERIODIC)
+            and j.lane not in (LANE_STRIP, LANE_PERIODIC, LANE_EXACT)
         }
         factor = self.ram_factor(self.db.results("all"))
         failures = self.db.memory_failures()

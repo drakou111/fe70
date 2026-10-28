@@ -89,6 +89,10 @@ class ServerConfig:
     # job tries; the widths 176, 184 and 280 repeat with period 10 from row 60 (research repo)
     periodic_configs: tuple[tuple[int, int], ...] = DEFAULT_PERIODIC_CONFIGS
     periodic_stages: int = 2
+    # exact width decisions: the RAM a volunteer must allow (width 137 peaked at 16.3 GB), and how long a
+    # width stays with the volunteer whose checkpoint reached a row, after their last heartbeat
+    exact_ram_mb: int = 24 * 1024
+    exact_reserve_s: float = 3 * 86400.0
     # who to ask for an access token, shown on the page and in the app's "needs a token" message
     contact: str = "Drakou111 on Discord"
     # if not empty, every job request/heartbeat/release/result must carry one of these tokens
@@ -152,6 +156,10 @@ class ServerConfig:
                 os.environ.get("TILINGVOL_PERIODIC_CONFIGS", "")
             ),
             periodic_stages=int(os.environ.get("TILINGVOL_PERIODIC_STAGES", "2")),
+            exact_ram_mb=int(os.environ.get("TILINGVOL_EXACT_RAM_MB", str(24 * 1024))),
+            exact_reserve_s=float(
+                os.environ.get("TILINGVOL_EXACT_RESERVE_S", str(3 * 86400))
+            ),
             contact=os.environ.get("TILINGVOL_CONTACT", "Drakou111 on Discord"),
             access_tokens=tokens,
         )

@@ -114,6 +114,31 @@ CREATE TABLE IF NOT EXISTS periodic_results (  -- fill-forever searches, one row
     placements TEXT                           -- the certificate, for 'found'
 );
 CREATE INDEX IF NOT EXISTS periodic_results_width ON periodic_results(width);
+CREATE TABLE IF NOT EXISTS exact_results (   -- exact width decisions (the client's exact_width program)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    width INTEGER NOT NULL,
+    outcome TEXT NOT NULL,                    -- dead, rectangle or forever
+    row INTEGER NOT NULL,                     -- the row that decided it
+    repeat_from INTEGER NOT NULL,             -- forever: the earlier row it repeats
+    first_row INTEGER NOT NULL,
+    counts TEXT NOT NULL,                     -- JSON: minimal DFA states per row from first_row
+    compute_s REAL NOT NULL,                  -- every run of the width on that computer
+    name TEXT NOT NULL,
+    ip TEXT,
+    peak_ram_mb INTEGER,
+    client_version TEXT,
+    submitted REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS exact_results_width ON exact_results(width);
+CREATE TABLE IF NOT EXISTS exact_progress (  -- the row each running exact decision has reached
+    width INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    row INTEGER NOT NULL,
+    states INTEGER NOT NULL,
+    updated REAL NOT NULL
+);
 """
 
 
@@ -177,6 +202,30 @@ class PeriodicResultRow:
     verdict: str  # PERIODIC_FOUND, PERIODIC_NONE or PERIODIC_TIMED_OUT
     name: str
     submitted: float
+
+
+@dataclass(frozen=True)
+class ExactResultRow:
+    result_id: int
+    width: int
+    outcome: str
+    row: int
+    repeat_from: int
+    first_row: int
+    counts: tuple[int, ...]
+    compute_s: float
+    name: str
+    submitted: float
+
+
+@dataclass(frozen=True)
+class ExactProgressRow:
+    width: int
+    name: str
+    job_id: str
+    row: int
+    states: int
+    updated: float
 
 
 PERIODIC_FOUND = "found"
@@ -631,6 +680,71 @@ class Database:
                 (result_id,),
             ).fetchone()
         return (row[0], row[1], row[2], json.loads(row[3])) if row else None
+
+    def add_exact_result(
+        self,
+        *,
+        job_id: str,
+        width: int,
+        outcome: str,
+        row: int,
+        repeat_from: int,
+        first_row: int,
+        counts: tuple[int, ...],
+        compute_s: float,
+        name: str,
+        ip: str | None,
+        peak_ram_mb: int | None,
+        client_version: str | None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO exact_results (job_id, width, outcome, row, repeat_from, first_row, counts,"
+                " compute_s, name, ip, peak_ram_mb, client_version, submitted)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    width,
+                    outcome,
+                    row,
+                    repeat_from,
+                    first_row,
+                    json.dumps(list(counts)),
+                    compute_s,
+                    name,
+                    ip,
+                    peak_ram_mb,
+                    client_version,
+                    time.time(),
+                ),
+            )
+            self._conn.execute("DELETE FROM exact_progress WHERE width = ?", (width,))
+
+    def exact_results(self) -> list[ExactResultRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, width, outcome, row, repeat_from, first_row, counts, compute_s, name, submitted"
+                " FROM exact_results ORDER BY id"
+            ).fetchall()
+        return [ExactResultRow(*r[:6], tuple(json.loads(r[6])), *r[7:]) for r in rows]
+
+    def set_exact_progress(
+        self, width: int, name: str, job_id: str, row: int, states: int
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO exact_progress (width, name, job_id, row, states, updated) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(width) DO UPDATE SET name = excluded.name, job_id = excluded.job_id,"
+                " row = excluded.row, states = excluded.states, updated = excluded.updated",
+                (width, name, job_id, row, states, time.time()),
+            )
+
+    def exact_progress(self) -> dict[int, ExactProgressRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT width, name, job_id, row, states, updated FROM exact_progress"
+            ).fetchall()
+        return {r[0]: ExactProgressRow(*r) for r in rows}
 
     def use_salt(self, salt: str) -> bool:
         """Record a salt; False if it was used before."""

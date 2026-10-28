@@ -2,11 +2,13 @@
 
 Reads TILINGVOL_SUBMIT_KEY (hex, the same value as on the server) and TILINGVOL_SERVER_URL from the
 environment or from .env, writes them into the git-ignored module src/tilingvol/client/_k.py with the key
-lightly scrambled, then builds dist/fe70(.exe). Run: uv run python scripts/build_client.py"""
+lightly scrambled, compiles the exact width program (native/exact_width.cpp, needs g++) into build/native,
+then builds dist/fe70(.exe) with that program inside. Run: uv run python scripts/build_client.py"""
 
 import ast
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +18,17 @@ GENERATED = ROOT / "src" / "tilingvol" / "client" / "_k.py"
 ENTRY = ROOT / "scripts" / "entry.py"
 APP_NAME = "fe70"
 SCRAMBLE_STEP = 73
+EXACT_SOURCE = ROOT / "native" / "exact_width.cpp"
+EXACT_BINARY = (
+    ROOT
+    / "build"
+    / "native"
+    / ("exact_width.exe" if sys.platform == "win32" else "exact_width")
+)
+# MinGW's runtime DLLs would otherwise have to ship next to the program
+STATIC_FLAGS = (
+    ["-static"] if sys.platform == "win32" else ["-static-libstdc++", "-static-libgcc"]
+)
 RUNTIME_DLLS = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "concrt140.dll")
 # the server needs none of these, and the client never imports them
 EXCLUDES = [
@@ -66,12 +79,34 @@ def main() -> None:
     if not server_url.startswith(("https://", "http://")):
         raise SystemExit("TILINGVOL_SERVER_URL must start with https://")
     key = bytes.fromhex(key_hex)
+    build_exact_binary()
     GENERATED.write_text(generated_module(key, server_url), encoding="utf-8")
     try:
         build()
     finally:
         GENERATED.unlink()  # keep the key out of the source tree; dev runs use the environment
     print(f"built {ROOT / 'dist' / APP_NAME}")
+
+
+def build_exact_binary() -> None:
+    compiler = shutil.which("g++")
+    if compiler is None:
+        raise SystemExit(
+            "g++ is needed to build the exact width program (MinGW-w64 on Windows)"
+        )
+    EXACT_BINARY.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            compiler,
+            "-O2",
+            "-std=c++20",
+            *STATIC_FLAGS,
+            "-o",
+            str(EXACT_BINARY),
+            str(EXACT_SOURCE),
+        ],
+        check=True,
+    )
 
 
 def build() -> None:
@@ -95,6 +130,8 @@ def build() -> None:
         "certifi",  # the root list the app checks HTTPS against (tilingvol/client/tls.py)
         "--hidden-import",
         "tilingvol.client._k",
+        "--add-binary",
+        f"{EXACT_BINARY}{os.pathsep}.",
     ]
     for module in EXCLUDES:
         command += ["--exclude-module", module]

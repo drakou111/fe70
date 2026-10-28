@@ -54,6 +54,9 @@ class PieceSpec:
     gun_coloring: bool
     # half-strip widths known to fill forever; side by side, their sums fill forever too
     live_bases: frozenset[int] = frozenset()
+    # rows the exact decider builds for all widths at once before it turns to one width (cheap for the
+    # gun up to 8; a piece with more frontier shapes needs fewer)
+    exact_start_row: int = 8
 
     @property
     def area(self) -> int:
@@ -139,6 +142,7 @@ SIBLING = PieceSpec(
     dead_sides=frozenset(),
     use_wall_lemmas=False,
     gun_coloring=False,
+    exact_start_row=4,
 )
 
 PIECES = {piece.name: piece for piece in (GUN, SIBLING)}

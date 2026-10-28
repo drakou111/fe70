@@ -14,6 +14,9 @@ from tilingvol.server.db import Database, PeriodicResultRow, ResultRow, StripRes
 from tilingvol.server.scheduler import Scheduler, WidthState
 from tilingvol.shared.pieces import PieceSpec
 from tilingvol.shared.protocol import (
+    EXACT_DEAD,
+    EXACT_FOREVER,
+    LANE_EXACT,
     LANE_HUNT,
     LANE_PERIODIC,
     LANE_STRIP,
@@ -44,7 +47,7 @@ STRIP_BAR = 6.5
 STRIP_LEFT, STRIP_TOP, STRIP_BOTTOM = 36, 8, 30
 STRIP_TICK = 10
 STRIP_GALLERY = 6
-WIDTH_LANES = (LANE_STRIP, LANE_PERIODIC)
+WIDTH_LANES = (LANE_STRIP, LANE_PERIODIC, LANE_EXACT)
 
 STYLE = """
 :root {
@@ -469,6 +472,43 @@ def render_widths(
     )
 
 
+def exact_outcome_text(outcome: str, row: int, repeat_from: int, width: int) -> str:
+    if outcome == EXACT_DEAD:
+        return f"ruled out: no filling of {row} rows"
+    if outcome == EXACT_FOREVER:
+        return f"fills forever: row {row} repeats row {repeat_from}"
+    return f"a {width} x {row} rectangle tiles (being checked)"
+
+
+def render_exact(db: Database) -> str:
+    """Exact width decisions, finished and running."""
+    results = db.exact_results()[::-1]
+    running = sorted(db.exact_progress().values(), key=lambda p: p.width)
+    rows = "".join(
+        f"<tr><td>width {r.width}</td><td>{escape(exact_outcome_text(r.outcome, r.row, r.repeat_from, r.width))}"
+        f'</td><td>{escape(r.name)}</td><td class="num">{hours(r.compute_s)}</td>'
+        f'<td class="num">{ago(r.submitted)}</td></tr>'
+        for r in results
+    ) + "".join(
+        f"<tr><td>width {p.width}</td><td>running: row {p.row} reached ({p.states:,} states)</td>"
+        f'<td>{escape(p.name)}</td><td class="num">-</td><td class="num">{ago(p.updated)}</td></tr>'
+        for p in running
+    )
+    table = (
+        f'<div class="scroll"><table><tr><th>Width</th><th>Outcome</th><th>Volunteer</th>'
+        f'<th class="num">Compute</th><th class="num">When</th></tr>{rows}</table></div>'
+        if rows
+        else '<p class="empty">No exact decisions yet.</p>'
+    )
+    return (
+        '<section class="card"><h2>Exact width decisions</h2><p class="note" style="margin:0 0 12px">'
+        "An exact decision follows every way to fill a width's half-strip, row by row, as one compressed "
+        "automaton, until no filling is left (no rectangle has that side), a rectangle closes, or a row "
+        "repeats an earlier one exactly (the width fills forever). It needs a big computer, but nothing is "
+        f"left to guess.</p>{table}</section>"
+    )
+
+
 def strip_size(r: StripResultRow) -> str:
     return f"width {r.width}, {r.rows} rows"
 
@@ -734,7 +774,7 @@ def render(db: Database, scheduler: Scheduler, config: ServerConfig) -> str:
 
     recent = sorted(
         [r for r in results if r.source == "volunteer"]
-        + [r for r in strip_results if r.source == "volunteer"],
+        + [r for r in strip_results if r.source in ("volunteer", "exact")],
         key=lambda r: r.submitted,
     )[-RECENT:][::-1]
 
@@ -780,6 +820,7 @@ checked by a complete computer search.</p>
 <div class="map">{"".join(parts)}<div class="tip" hidden></div></div>
 <p class="note">{map_note(piece, dead)}</p></section>
 {render_widths(db, scheduler, states, active)}
+{render_exact(db)}
 {gallery_html}
 <div class="two">
 <section class="card"><h2>Running now</h2>{running_html}</section>

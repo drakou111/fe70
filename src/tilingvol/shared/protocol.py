@@ -28,14 +28,30 @@ LANE_STRIP = "strip"
 # fill-forever proof: a half-strip filling whose rows from `periodic_start` on repeat every `period` rows; a
 # found one is checked cell by cell (shared/verify.py), so it settles the width for good
 LANE_PERIODIC = "periodic"
+# exact width decision (native/exact_width.cpp): every row of the width-W half-strip until it dies (no
+# rectangle has a side W), tiles a rectangle, or repeats an earlier row exactly (the width fills forever)
+LANE_EXACT = "exact"
 # what a volunteer chose to run (apps from STRIP_SINCE on send it; older ones send only the hunt flag)
 SEARCH_BOARD = "board"  # rectangle sizes
 SEARCH_WIDTH = "width"  # half-strip widths
 SEARCH_SYMMETRIC = "symmetric"  # the symmetric hunt
 SEARCH_FOREVER = "forever"  # repeating half-strip fillings
-SEARCHES = (SEARCH_BOARD, SEARCH_WIDTH, SEARCH_SYMMETRIC, SEARCH_FOREVER)
+SEARCH_EXACT = "exact"  # exact width decisions
+SEARCHES = (SEARCH_BOARD, SEARCH_WIDTH, SEARCH_SYMMETRIC, SEARCH_FOREVER, SEARCH_EXACT)
 STRIP_SINCE = "0.10.0"
 PERIODIC_SINCE = "0.12.0"
+EXACT_SINCE = "0.13.0"
+EXACT_DEAD = "dead"  # no filling of `row` rows: no rectangle has a side W
+EXACT_RECTANGLE = "rectangle"  # the flat frontier at `row`: a W x row rectangle tiles
+EXACT_FOREVER = (
+    "forever"  # row `row` repeats row `repeat_from` exactly: the width fills forever
+)
+EXACT_VERDICTS = {
+    EXACT_DEAD: VERDICT_IMPOSSIBLE,
+    EXACT_RECTANGLE: VERDICT_POSSIBLE,
+    EXACT_FOREVER: VERDICT_FILLED,
+}
+MAX_EXACT_ROW = 100_000
 # a piece spans at most 7 rows, so with period >= 7 each repeated block touches only its neighbours
 MIN_PERIOD = 7
 MAX_PERIOD = 200
@@ -76,6 +92,7 @@ class Stage:
         0  # with period > 0: a half-strip filling repeating from this row on
     )
     period: int = 0
+    exact: bool = False  # an exact width decision (no time limit, no CP-SAT)
 
     @property
     def unlimited(self) -> bool:
@@ -89,6 +106,8 @@ class Stage:
 
     @property
     def tag(self) -> str:
+        if self.exact:
+            return "exact"
         if self.period:
             return f"periodic{self.periodic_start}p{self.period}"
         if self.strip_rows:
@@ -101,6 +120,8 @@ class Stage:
         return SYMMETRIC_TAG_PREFIX + base if self.symmetric else base
 
     def describe(self) -> str:
+        if self.exact:
+            return "exact decision (row by row until it dies, tiles or repeats)"
         if self.period:
             return f"repeating filling (rows from {self.periodic_start} repeat every {self.period})"
         if self.strip_rows:
@@ -121,6 +142,7 @@ class Stage:
             int(data.get("strip_rows", 0)),
             int(data.get("periodic_start", 0)),
             int(data.get("period", 0)),
+            bool(data.get("exact", False)),
         )
 
 
@@ -152,6 +174,11 @@ class Job:
         """A fill-forever job of width `width`; `height` is the most rows any of its stages builds."""
         return any(stage.period for stage in self.stages)
 
+    @property
+    def exact(self) -> bool:
+        """An exact decision of width `width`; `height` is unused (0)."""
+        return any(stage.exact for stage in self.stages)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -174,6 +201,52 @@ class Job:
 
 
 @dataclass(frozen=True)
+class ExactOutcome:
+    """How an exact decision ended. counts: the minimal DFA's state count of every row from the first one
+    the tool computed (equal runs give equal counts, so two volunteers' runs can be compared)."""
+
+    outcome: str
+    row: int
+    repeat_from: int  # EXACT_FOREVER only, else 0
+    first_row: int
+    counts: tuple[int, ...]
+    compute_s: float  # every run of this width on this computer, resumed ones included
+
+    def __post_init__(self) -> None:
+        if self.outcome not in EXACT_VERDICTS:
+            raise ValueError(f"unknown exact outcome {self.outcome!r}")
+        if not 0 <= self.first_row <= self.row <= MAX_EXACT_ROW:
+            raise ValueError("exact rows out of range")
+        if len(self.counts) != self.row - self.first_row + 1:
+            raise ValueError("one state count per row is expected")
+        repeats = self.first_row <= self.repeat_from < self.row
+        if self.outcome == EXACT_FOREVER and not repeats:
+            raise ValueError("a repeating row must repeat an earlier row")
+        if self.outcome != EXACT_FOREVER and self.repeat_from != 0:
+            raise ValueError("repeat_from goes only with a repeating row")
+
+    @property
+    def verdict(self) -> str:
+        return EXACT_VERDICTS[self.outcome]
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["counts"] = list(self.counts)
+        return data
+
+    @staticmethod
+    def from_dict(data: dict) -> "ExactOutcome":
+        return ExactOutcome(
+            str(data["outcome"]),
+            int(data["row"]),
+            int(data["repeat_from"]),
+            int(data["first_row"]),
+            tuple(int(c) for c in data["counts"]),
+            float(data["compute_s"]),
+        )
+
+
+@dataclass(frozen=True)
 class ResultSubmission:
     job_id: str
     nonce: str
@@ -189,6 +262,9 @@ class ResultSubmission:
     # the deepest border filling found on the way (display only; not part of the signature)
     frame_border: int | None = None
     frame_placements: list[list[int]] | None = None
+    exact: dict | None = (
+        None  # ExactOutcome.to_dict() of an exact job (signed with the result)
+    )
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -214,4 +290,5 @@ class ResultSubmission:
             else None,
             frame_border=data.get("frame_border"),
             frame_placements=data.get("frame_placements"),
+            exact=data.get("exact"),
         )
