@@ -41,10 +41,14 @@ from tilingvol.shared.protocol import (
 
 ROOT = Path(__file__).resolve().parents[1]
 # the sibling piece, start row 4: width 10 dies at row 2 (CP-SAT: 1 row fills, 2 do not), width 12's row 14
-# repeats row 7, and 19 x 28 is its smallest rectangle of width 19
+# repeats row 7 (with the app's lookahead, row 13 repeats row 6), and 19 x 28 is its smallest rectangle of
+# width 19
 SIB_DEAD = (10, 2)
-SIB_FOREVER = (12, 7, 14)
+SIB_FOREVER = (12, 6, 13)
+SIB_FOREVER_NO_LOOKAHEAD = (12, 7, 14)
 SIB_RECTANGLE = (19, 28)
+SIB_CELLS = "0,0 1,0 2,0 3,0 4,0 1,1 2,1"
+LONG_RECTANGLE_WIDTH = 13  # 13 x 112 tiles; long enough to stop a run part way
 SLOW_WIDTH = 24  # lives long enough to be stopped part way
 TIMEOUT_S = 60
 
@@ -216,13 +220,89 @@ def test_outcome_lines_are_parsed_and_checked():
         "dead 5",
     ]
     assert parse_outcome(lines) == ExactOutcome(EXACT_DEAD, 5, 0, 4, (9, 1), 7.0)
+    assert parse_outcome(["lookahead 3", *lines]).lookahead == 3
     assert parse_outcome(lines[:-1]) is None
+    # a lookahead of 0 is left out, so 0.13.0 and 0.13.1 results keep their signatures
+    assert "lookahead" not in parse_outcome(lines).to_dict()
+    assert (
+        ExactOutcome.from_dict(
+            parse_outcome(["lookahead 3", *lines]).to_dict()
+        ).lookahead
+        == 3
+    )
     with pytest.raises(ValueError):
         ExactOutcome(EXACT_DEAD, 5, 0, 4, (9,), 7.0)  # one count per row
     with pytest.raises(ValueError):
         ExactOutcome(
             EXACT_FOREVER, 5, 5, 4, (9, 1), 7.0
         )  # it must repeat an earlier row
+
+
+def run_binary(
+    binary: Path,
+    tmp_path: Path,
+    width: int,
+    lookahead: int,
+    checkpoint: Path | None = None,
+    stop_after_row: int | None = None,
+) -> list[str]:
+    """The program's output lines; with stop_after_row, killed once that row is printed."""
+    command = [
+        str(binary),
+        "--width",
+        str(width),
+        "--cells",
+        SIB_CELLS,
+        "--start-row",
+        "4",
+        "--scratch",
+        str(tmp_path / "scratch.raw"),
+        "--lookahead",
+        str(lookahead),
+    ]
+    if checkpoint is not None:
+        command += ["--checkpoint", str(checkpoint)]
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+    )
+    lines = []
+    for line in process.stdout:
+        lines.append(line.strip())
+        if stop_after_row is not None and line.startswith(f"row {stop_after_row} "):
+            process.kill()
+            break
+    process.wait(TIMEOUT_S)
+    return lines
+
+
+def test_every_lookahead_gives_the_same_verdicts(use_binary, tmp_path):
+    for width in (SIB_DEAD[0], SIB_FOREVER[0], SIB_RECTANGLE[0]):
+        verdicts = {
+            k: run_binary(use_binary, tmp_path, width, k)[-1].split()[0]
+            for k in (0, 1, 3)
+        }
+        assert len(set(verdicts.values())) == 1, (width, verdicts)
+    assert run_binary(use_binary, tmp_path, SIB_FOREVER[0], 0)[
+        -1
+    ] == "forever {1} {2}".format(*SIB_FOREVER_NO_LOOKAHEAD)
+    dead = run_binary(use_binary, tmp_path, SIB_DEAD[0], 3)
+    assert (
+        dead[0] == "lookahead 3" and dead[-1] == f"dead {SIB_DEAD[1]}"
+    )  # the exact death row
+
+
+def test_a_resumed_run_keeps_its_checkpoints_lookahead(use_binary, tmp_path):
+    width = LONG_RECTANGLE_WIDTH
+    whole = run_binary(use_binary, tmp_path, width, 0)
+    checkpoint = ExactFiles(tmp_path, "sib", width).checkpoint
+    run_binary(use_binary, tmp_path, width, 0, checkpoint, stop_after_row=20)
+    assert checkpoint.exists()
+    resumed = outcome_of(
+        run_width(tmp_path, width)
+    )  # the app asks for its own lookahead
+    assert resumed.lookahead == 0 and parse_outcome(whole) == replace(
+        resumed, compute_s=parse_outcome(whole).compute_s
+    )
 
 
 # the server's side
@@ -330,9 +410,11 @@ def test_forever_and_rectangle_outcomes(exact_config, submit_key):
         width, earlier, later = SIB_FOREVER
         job = ask(client, width=width).json()
         forever = ExactOutcome(
-            EXACT_FOREVER, later, earlier, 4, tuple(range(later - 3)), 9.0
+            EXACT_FOREVER, later, earlier, 4, tuple(range(later - 3)), 9.0, 3
         )
         post_result(client, exact_submission(submit_key, job, forever))
+        stored = client.get("/api/strips").json()["exact"]
+        assert [(r["width"], r["lookahead"]) for r in stored] == [(width, 3)]
         refused = client.post(
             "/api/jobs/request",
             json={

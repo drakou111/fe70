@@ -8,6 +8,7 @@
 // exactly (the half-strip fills forever, so this run can never end in a death).
 //
 // Output on stdout, one line each, flushed:
+//   lookahead <k>                                   rows ahead a kept frontier must be fillable (0: all kept)
 //   start <row>                                     first row of this run (resumed or fresh)
 //   row <r> states <n> words <x> seconds <s>        row r's language; seconds count every run so far
 //   counts <n_start> <n_start+1> ...                state counts of every row, just before the verdict
@@ -635,12 +636,20 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
 // The next row's minimal DFA without holding the raw one in memory. Every accepted word has length W, so
 // states of different layers are never equivalent: minimizing each layer against the already minimized
 // next layer, last layer first, gives exactly the minimal DFA.
+SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch);
+
 SDfa advanceRow(const std::vector<Orientation>& oris, SDfa& in, const std::string& scratch) {
     DiskSink sink;
     sink.f = fopen(scratch.c_str(), "w+b");
     if (!sink.f) fail("cannot open scratch file " + scratch);
     transduceLayered(oris, in, sink);
     in.release();
+    return minimizeFromDisk(sink, scratch);
+}
+
+// The minimal DFA of the layers in a scratch file (each layer's targets are local ids in the next layer),
+// minimized last layer first; deletes the file.
+SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch) {
     if (sink.isEmpty) { fclose(sink.f); std::remove(scratch.c_str()); return SDfa::emptyLanguage(); }
     size_t L = sink.layerPos.size();
     struct MinLayer { std::vector<uint8_t> acc, sym; std::vector<uint32_t> off{0}; std::vector<int32_t> tgt; };
@@ -778,6 +787,114 @@ std::vector<uint64_t> canonicalForm(const SDfa& d) {
     return enc;
 }
 
+// --lookahead k: drop frontiers containing a window of WINDOW_COLS columns whose cells of the next k rows
+// cannot be covered even with every cell around the window empty (the most room pieces can get), with the
+// real wall where the window touches one. Such a frontier has no k-row continuation, so the kept set's
+// descendants are exactly the full set's: repeats and rectangles are found as before, and an empty kept
+// set means the width dies within k rows (the exact death row is then found by stepping the full set).
+// On small widths 7-column windows catch 99-100% of the frontiers that die within 1-3 rows.
+constexpr int WINDOW_COLS = 7;
+constexpr int WINDOW_MARGIN = 6;  // a piece reaches at most 6 columns from any of its cells
+
+class Lookahead {
+public:
+    Lookahead(const std::vector<Orientation>& oris, int rows) : rows(rows) {
+        for (auto& o : oris) {
+            std::vector<Cell> shape;
+            for (auto& c : o.cells) shape.push_back(c);
+            shapes.push_back(shape);
+        }
+    }
+
+    int depth() const { return rows; }
+
+    // the frontiers of d with no bad window (d is a layered DFA of width-W words)
+    // The product of d with the last w-1 columns read is built one column position at a time and written
+    // to the scratch file, then minimized last layer first, so only one layer of it is ever in memory.
+    SDfa keep(const SDfa& d, int W, const std::string& scratch) const {
+        if (rows == 0) return d;
+        const int w = std::min(WINDOW_COLS, W);
+        const uint64_t mask = w > 1 ? (1ULL << (6 * (w - 1))) - 1 : 0;
+        struct Key { int32_t v; uint64_t hist; bool operator==(const Key& o) const { return v == o.v && hist == o.hist; } };
+        struct KeyHash { size_t operator()(const Key& k) const { return (size_t)((uint64_t)(uint32_t)k.v * 0x9E3779B97F4A7C15ULL ^ k.hist * 0xBF58476D1CE4E5B9ULL); } };
+        DiskSink sink;
+        sink.f = fopen(scratch.c_str(), "w+b");
+        if (!sink.f) fail("cannot open scratch file " + scratch);
+        std::vector<Key> layer{{d.start, 0}}, next;
+        std::unordered_map<Key, int32_t, KeyHash> nextId;
+        uint8_t syms[SYMBOLS];
+        int32_t tgts[SYMBOLS];
+        for (int pos = 0; pos <= W && !layer.empty(); pos++) {
+            sink.beginLayer();
+            next.clear();
+            nextId.clear();
+            for (const Key& key : layer) {
+                int k = 0;
+                for (uint64_t e = d.off[key.v]; e < d.off[key.v + 1]; e++) {
+                    uint64_t window = key.hist << 6 | d.sym[e];
+                    // the window of columns pos-w+1..pos, complete once w columns are read
+                    if (pos + 1 >= w && bad(window, w, pos + 1 == w, pos + 1 == W)) continue;
+                    Key to{d.tgt[e], window & mask};
+                    auto [it, added] = nextId.try_emplace(to, (int32_t)next.size());
+                    if (added) next.push_back(to);
+                    syms[k] = d.sym[e];
+                    tgts[k++] = it->second;
+                }
+                sink.state(d.acc[key.v], syms, tgts, k);
+            }
+            sink.endLayer();
+            peakLayer = std::max(peakLayer, layer.size());
+            layer.swap(next);
+        }
+        return minimizeFromDisk(sink, scratch);
+    }
+
+    size_t peak() const { return peakLayer; }  // the largest layer of a window product
+
+private:
+    int rows;
+    std::vector<std::vector<Cell>> shapes;  // (dr, dc) from the first row-major cell
+    mutable std::unordered_map<uint64_t, bool> memo;
+    mutable size_t peakLayer = 0;
+
+    // window: w columns of 6 bits, oldest in the highest bits
+    bool bad(uint64_t window, int w, bool leftWall, bool rightWall) const {
+        uint64_t key = window << 3 | (uint64_t)leftWall << 1 | (uint64_t)rightWall;
+        auto it = memo.find(key);
+        if (it != memo.end()) return it->second;
+        int left = leftWall ? 0 : WINDOW_MARGIN, right = rightWall ? 0 : WINDOW_MARGIN;
+        int width = left + w + right;
+        std::vector<uint32_t> cols(width, 0);
+        for (int c = 0; c < w; c++) cols[left + c] = (window >> (6 * (w - 1 - c))) & 63;
+        const int height = 6 + rows;  // cells above the k rows can hold the pieces that cover them
+        std::function<bool()> fill = [&]() -> bool {
+            int r0 = -1, c0 = -1;
+            for (int r = 0; r < rows && r0 < 0; r++)
+                for (int c = left; c < left + w; c++)
+                    if (!(cols[c] >> r & 1)) { r0 = r; c0 = c; break; }
+            if (r0 < 0) return true;
+            for (auto& shape : shapes) {
+                for (auto& anchor : shape) {
+                    bool ok = true;
+                    for (auto& cell : shape) {
+                        int r = r0 + cell.first - anchor.first, c = c0 + cell.second - anchor.second;
+                        if (r < 0 || r >= height || c < 0 || c >= width || (cols[c] >> r & 1)) { ok = false; break; }
+                    }
+                    if (!ok) continue;
+                    for (auto& cell : shape) cols[c0 + cell.second - anchor.second] |= 1u << (r0 + cell.first - anchor.first);
+                    bool done = fill();
+                    for (auto& cell : shape) cols[c0 + cell.second - anchor.second] &= ~(1u << (r0 + cell.first - anchor.first));
+                    if (done) return true;
+                }
+            }
+            return false;
+        };
+        bool result = !fill();
+        memo.emplace(key, result);
+        return result;
+    }
+};
+
 struct SeenRow { int32_t row; uint64_t h1, h2; };
 
 // Everything needed to continue a run: row `row`'s language, the hashes and state counts of the rows before.
@@ -881,14 +998,16 @@ struct Options {
     int startRow = DEFAULT_START_ROW;
     std::vector<Cell> cells;
     std::string cellsText, checkpoint, scratch, dumpDir;
+    int lookahead = 0;
 };
 
 const char* USAGE =
     "usage: exact_width --width W --cells \"x,y x,y ...\" --scratch FILE [--checkpoint FILE] [--start-row R]\n"
-    "                   [--dump DIR]\n"
+    "                   [--dump DIR] [--lookahead K]\n"
     "Decides exactly whether the piece's width-W half-strip dies, tiles a rectangle or fills forever.\n"
     "With --checkpoint, resumes from FILE if it exists and rewrites it after every row. The scratch file\n"
-    "holds one raw row. --dump writes every row's minimal automaton to DIR/row<r>.dfa.\n";
+    "holds one raw row. --dump writes every row's minimal automaton to DIR/row<r>.dfa. --lookahead K keeps only\n"
+    "frontiers that can fill K more rows (same verdicts; the state counts are of the kept sets).\n";
 
 int parseInt(const std::string& text, const char* what) {
     try {
@@ -929,10 +1048,12 @@ Options parseOptions(int argc, char** argv) {
         else if (a == "--checkpoint") o.checkpoint = v;
         else if (a == "--scratch") o.scratch = v;
         else if (a == "--dump") o.dumpDir = v;
+        else if (a == "--lookahead") o.lookahead = parseInt(v, "--lookahead");
         else fail("unknown option " + a + "\n" + USAGE);
     }
     if (o.width < 1 || o.width > 2000) fail("--width must be between 1 and 2000");
     if (o.startRow < 0 || o.startRow > 12) fail("--start-row must be between 0 and 12");
+    if (o.lookahead < 0 || o.lookahead > 6) fail("--lookahead must be between 0 and 6");
     if (o.cells.empty() || o.scratch.empty()) fail(std::string("--width, --cells and --scratch are required\n") + USAGE);
     return o;
 }
@@ -979,22 +1100,64 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
 
+    // Runs with different lookaheads keep different sets, so a checkpoint records its lookahead in the piece
+    // key, and a resumed run goes on with the checkpoint's lookahead whatever --lookahead says.
+    const std::string baseKey = pieceKeyOf(oris);
+    const std::string lookaheadMark = "lookahead=";
     Checkpoint c;
     const bool keepCheckpoints = !opt.checkpoint.empty();
-    if (keepCheckpoints && std::filesystem::exists(opt.checkpoint)) {
+    const bool resuming = keepCheckpoints && std::filesystem::exists(opt.checkpoint);
+    int lookahead = opt.lookahead;
+    if (resuming) {
         c = loadCheckpoint(opt.checkpoint);
-        if (c.width != W || c.startRow != opt.startRow || c.pieceKey != pieceKeyOf(oris))
+        bool samePiece = c.pieceKey.compare(0, baseKey.size(), baseKey) == 0;
+        std::string rest = samePiece ? c.pieceKey.substr(baseKey.size()) : "";
+        if (c.width != W || c.startRow != opt.startRow || !samePiece ||
+            !(rest.empty() || rest.compare(0, lookaheadMark.size(), lookaheadMark) == 0))
             fail(opt.checkpoint + " belongs to another width or piece");
+        lookahead = rest.empty() ? 0 : parseInt(rest.substr(lookaheadMark.size()), "the checkpoint's lookahead");
+    }
+    const Lookahead look(oris, lookahead);
+    const std::string key = baseKey + (lookahead ? lookaheadMark + std::to_string(lookahead) : "");
+    double before = 0;  // compute seconds of earlier runs (from the checkpoint)
+    // the full set's row, with every row up to the death as empty kept sets in the counts
+    auto deathFrom = [&](SDfa full, int row) {
+        while (countWords(full, W) > 0) {
+            full = advanceRow(oris, full, opt.scratch);
+            row++;
+            c.counts.push_back(1);
+            std::cout << "row " << row << " states 1 words 0 seconds " << (int64_t)(before + elapsed()) << "\n";
+        }
+        printCounts(c.counts);
+        std::cout << "dead " << row << "\n" << std::flush;
+        std::exit(0);
+    };
+    // the kept part of a row's full set; an empty kept part ends the run with the exact death row
+    auto kept = [&](SDfa full, int row) -> SDfa {
+        if (look.depth() == 0 || countWords(full, W) == 0) return full;
+        SDfa k = look.keep(full, W, opt.scratch);
+        std::cerr << "    kept " << k.size() << " of " << full.size() << " states (largest window layer " << look.peak() << ")\n" << std::flush;
+        if (countWords(k, W) > 0) return k;
+        c.counts.push_back(1);
+        std::cout << "row " << row << " states 1 words 0 seconds " << (int64_t)(before + elapsed()) << "\n";
+        deathFrom(std::move(full), row);
+        return k;
+    };
+    std::cout << "lookahead " << lookahead << "\n";
+    if (resuming) {
+        before = c.seconds;
+        std::cout << "start " << c.row << "\n" << std::flush;
     } else {
         c.width = W;
         c.startRow = opt.startRow;
-        c.pieceKey = pieceKeyOf(oris);
-        std::tie(c.row, c.lang) = firstRow(oris, opt.startRow, W);
+        c.pieceKey = key;
+        auto [row, full] = firstRow(oris, opt.startRow, W);
+        c.row = row;
+        std::cout << "start " << c.row << "\n" << std::flush;
+        c.lang = kept(std::move(full), row);
     }
-    double before = c.seconds;
     std::map<std::pair<uint64_t, uint64_t>, int32_t> seen;
     for (auto& s : c.seen) seen.emplace(std::make_pair(s.h1, s.h2), s.row);
-    std::cout << "start " << c.row << "\n" << std::flush;
 
     while (true) {
         SDfa& d = c.lang;
@@ -1019,8 +1182,9 @@ int main(int argc, char** argv) {
             // a hash match is confirmed by rebuilding the earlier row and comparing exactly
             int32_t earlier = it->second;
             auto now = canonicalForm(d);
-            auto [r0, e] = firstRow(oris, opt.startRow, W);
-            for (int r = r0; r < earlier; r++) e = advanceRow(oris, e, opt.scratch);
+            auto [r0, first] = firstRow(oris, opt.startRow, W);
+            SDfa e = look.keep(first, W, opt.scratch);
+            for (int r = r0; r < earlier; r++) e = look.keep(advanceRow(oris, e, opt.scratch), W, opt.scratch);
             if (canonicalForm(e) == now) {
                 printCounts(c.counts);
                 std::cout << "forever " << earlier << " " << c.row << "\n" << std::flush;
@@ -1030,7 +1194,7 @@ int main(int argc, char** argv) {
         }
         seen.emplace(h, c.row);
         c.seen.push_back({c.row, h.first, h.second});
-        c.lang = advanceRow(oris, d, opt.scratch);
+        c.lang = kept(advanceRow(oris, d, opt.scratch), c.row + 1);
         c.row++;
         c.seconds = before + elapsed();
         if (keepCheckpoints) saveCheckpoint(c, opt.checkpoint);

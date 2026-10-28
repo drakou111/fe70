@@ -44,6 +44,7 @@ from tilingvol.shared.protocol import (
     LANE_STRIP,
     MAX_BORDER,
     MAX_CUSTOM_STAGES,
+    MAX_EXACT_LOOKAHEAD,
     MAX_EXACT_ROW,
     MAX_PEAK_RAM_MB,
     NO_LIMIT,
@@ -140,6 +141,7 @@ class ExactBody(BaseModel):
     first_row: int = Field(ge=0, le=MAX_EXACT_ROW)
     counts: list[int] = Field(max_length=MAX_EXACT_ROW + 1)
     compute_s: float = Field(ge=0, le=1e9)
+    lookahead: int = Field(default=0, ge=0, le=MAX_EXACT_LOOKAHEAD)
 
 
 class Submission(BaseModel):
@@ -765,6 +767,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             first_row=outcome.first_row,
             counts=outcome.counts,
             compute_s=outcome.compute_s,
+            lookahead=outcome.lookahead,
             name=job.name,
             ip=job.ip,
             peak_ram_mb=body.peak_ram_mb,
@@ -935,6 +938,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "first_row": r.first_row,
                     "counts": list(r.counts),
                     "compute_s": r.compute_s,
+                    "lookahead": r.lookahead,
                     "by": r.name,
                     "submitted": r.submitted,
                 }

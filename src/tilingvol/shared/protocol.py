@@ -52,6 +52,10 @@ EXACT_VERDICTS = {
     EXACT_FOREVER: VERDICT_FILLED,
 }
 MAX_EXACT_ROW = 100_000
+# exact_width --lookahead: rows ahead a frontier must stay fillable to be kept (0 = keep every frontier);
+# verdicts are the same for every lookahead, state counts are comparable only between equal ones
+EXACT_LOOKAHEAD = 3
+MAX_EXACT_LOOKAHEAD = 6
 # a piece spans at most 7 rows, so with period >= 7 each repeated block touches only its neighbours
 MIN_PERIOD = 7
 MAX_PERIOD = 200
@@ -211,6 +215,7 @@ class ExactOutcome:
     first_row: int
     counts: tuple[int, ...]
     compute_s: float  # every run of this width on this computer, resumed ones included
+    lookahead: int = 0  # the run's --lookahead (a resumed run keeps its checkpoint's)
 
     def __post_init__(self) -> None:
         if self.outcome not in EXACT_VERDICTS:
@@ -224,6 +229,8 @@ class ExactOutcome:
             raise ValueError("a repeating row must repeat an earlier row")
         if self.outcome != EXACT_FOREVER and self.repeat_from != 0:
             raise ValueError("repeat_from goes only with a repeating row")
+        if not 0 <= self.lookahead <= MAX_EXACT_LOOKAHEAD:
+            raise ValueError("exact lookahead out of range")
 
     @property
     def verdict(self) -> str:
@@ -232,6 +239,8 @@ class ExactOutcome:
     def to_dict(self) -> dict:
         data = asdict(self)
         data["counts"] = list(self.counts)
+        if not self.lookahead:
+            del data["lookahead"]  # what 0.13.0 and 0.13.1 apps sign
         return data
 
     @staticmethod
@@ -243,6 +252,7 @@ class ExactOutcome:
             int(data["first_row"]),
             tuple(int(c) for c in data["counts"]),
             float(data["compute_s"]),
+            int(data.get("lookahead", 0)),
         )
 
 

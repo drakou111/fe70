@@ -14,7 +14,7 @@ from pathlib import Path
 
 from tilingvol.client.solver_process import MSG_ERROR, MSG_STAGE_START
 from tilingvol.shared.pieces import PieceSpec
-from tilingvol.shared.protocol import ExactOutcome
+from tilingvol.shared.protocol import EXACT_LOOKAHEAD, ExactOutcome
 
 MSG_EXACT_ROW = "exact_row"  # (row, states, compute seconds so far)
 MSG_EXACT_DONE = "exact_done"  # (ExactOutcome)
@@ -29,6 +29,7 @@ MIN_FREE_SCRATCH_MB = 20 * 1024  # without checkpoints
 EXIT_FAILED = 2  # the program's own errors (disk full, damaged checkpoint), explained on its last stderr line
 CHECKPOINT_NAME = re.compile(r"(?P<piece>[a-z]+)-(?P<width>\d+)\.ckpt")
 ROW_LINE = re.compile(r"row (\d+) states (\d+) words \S+ seconds (\d+)")
+LOOKAHEAD_LINE = re.compile(r"lookahead (\d+)")
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -117,8 +118,9 @@ def parse_outcome(lines: list[str]) -> ExactOutcome | None:
             break
     row = int(words[-1])
     repeat_from = int(words[1]) if words[0] == "forever" else 0
+    lookahead = next((int(m[1]) for m in map(LOOKAHEAD_LINE.fullmatch, lines) if m), 0)
     return ExactOutcome(
-        words[0], row, repeat_from, row - len(counts) + 1, counts, seconds
+        words[0], row, repeat_from, row - len(counts) + 1, counts, seconds, lookahead
     )
 
 
@@ -144,6 +146,10 @@ class ExactProcess:
             str(piece.exact_start_row),
             "--scratch",
             str(files.scratch),
+            "--lookahead",
+            str(
+                EXACT_LOOKAHEAD
+            ),  # a resumed run keeps its checkpoint's lookahead instead
         ]
         if keep_checkpoint:
             command += ["--checkpoint", str(files.checkpoint)]
@@ -203,7 +209,7 @@ class ExactProcess:
                     (MSG_EXACT_ROW, int(match[1]), int(match[2]), float(match[3]))
                 )
                 continue
-            if line.startswith("counts "):
+            if line.startswith("counts ") or LOOKAHEAD_LINE.fullmatch(line):
                 continue
             try:
                 outcome = parse_outcome(lines)

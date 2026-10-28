@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS exact_results (   -- exact width decisions (the clien
     first_row INTEGER NOT NULL,
     counts TEXT NOT NULL,                     -- JSON: minimal DFA states per row from first_row
     compute_s REAL NOT NULL,                  -- every run of the width on that computer
+    lookahead INTEGER NOT NULL DEFAULT 0,     -- the run's --lookahead; counts compare only between equal ones
     name TEXT NOT NULL,
     ip TEXT,
     peak_ram_mb INTEGER,
@@ -215,6 +216,7 @@ class ExactResultRow:
     first_row: int
     counts: tuple[int, ...]
     compute_s: float
+    lookahead: int
     name: str
     submitted: float
 
@@ -274,6 +276,13 @@ class Database:
         progress_columns = {
             r[1] for r in self._conn.execute("PRAGMA table_info(exact_progress)")
         }
+        result_columns = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(exact_results)")
+        }
+        if "lookahead" not in result_columns:  # created by version 0.13.0 or 0.13.1
+            self._conn.execute(
+                "ALTER TABLE exact_results ADD COLUMN lookahead INTEGER NOT NULL DEFAULT 0"
+            )
         if (
             "resumable" not in progress_columns
         ):  # created by version 0.13.0, whose apps always resume
@@ -707,12 +716,13 @@ class Database:
         ip: str | None,
         peak_ram_mb: int | None,
         client_version: str | None,
+        lookahead: int = 0,
     ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO exact_results (job_id, width, outcome, row, repeat_from, first_row, counts,"
-                " compute_s, name, ip, peak_ram_mb, client_version, submitted)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " compute_s, lookahead, name, ip, peak_ram_mb, client_version, submitted)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
                     width,
@@ -722,6 +732,7 @@ class Database:
                     first_row,
                     json.dumps(list(counts)),
                     compute_s,
+                    lookahead,
                     name,
                     ip,
                     peak_ram_mb,
@@ -734,8 +745,8 @@ class Database:
     def exact_results(self) -> list[ExactResultRow]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, width, outcome, row, repeat_from, first_row, counts, compute_s, name, submitted"
-                " FROM exact_results ORDER BY id"
+                "SELECT id, width, outcome, row, repeat_from, first_row, counts, compute_s, lookahead, name,"
+                " submitted FROM exact_results ORDER BY id"
             ).fetchall()
         return [ExactResultRow(*r[:6], tuple(json.loads(r[6])), *r[7:]) for r in rows]
 
