@@ -761,10 +761,23 @@ struct DiskSink {
     }
 };
 
+// The words Lookahead::keep() keeps, as a minimal DFA over a small frontier alphabet (Lookahead::buildFilter).
+struct WindowFilter {
+    std::array<int8_t, 64> index;  // symbol -> letter, -1 outside the alphabet
+    int m = 0;
+    std::vector<int32_t> next;  // state * m + letter
+    std::vector<uint8_t> acc;
+    int32_t start = 0, dead = 0;
+    size_t states = 0;
+};
+
 // One row of the transducer over a layered DFA, layer by layer into the sink. Each layer is a subset
 // construction: every transducer state of the layer is expanded once (in parallel), then every subset state
 // collects its successor sets per output symbol (in parallel); new states and sets of the next layer go to
-// sharded tables and are numbered densely once the layer is done.
+// sharded tables and are numbered densely once the layer is done. With a window filter each subset state also
+// carries the filter's state (as a last, negative element -(state + 1) of its set), and an edge that completes a
+// bad window is never made: the row comes out already pruned. A symbol outside the filter's alphabet sets
+// *uncovered (the caller then builds the row without the filter).
 constexpr size_t EXPAND_CHUNK = 1 << 12;  // transducer states per task
 constexpr size_t SUBSET_CHUNK = 1 << 10;  // subset states per task
 constexpr size_t MINIMIZE_CHUNK = 1 << 14;  // raw states per task when minimizing
@@ -790,7 +803,8 @@ void writeLayer(std::vector<LayerOutput>& parts, const ShardOffsets& next, DiskS
     sink.endLayer();
 }
 
-void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, DiskSink& sink, Workers& workers) {
+void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, DiskSink& sink, Workers& workers,
+                      const WindowFilter* filter, std::atomic<bool>& uncovered) {
     auto expand = [&](const NState& s, std::vector<std::pair<int, NState>>& buf) {
         buf.clear();
         if (s.q >= 0)
@@ -818,7 +832,8 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
     std::vector<NState> nstates = std::move(cur);
     std::vector<int32_t> setPool(nstates.size());
     for (size_t i = 0; i < nstates.size(); i++) setPool[i] = (int32_t)i;
-    std::vector<uint64_t> setStart{0, nstates.size()};
+    if (filter) setPool.push_back(-(filter->start + 1));
+    std::vector<uint64_t> setStart{0, setPool.size()};
 
     while (true) {
         // every transducer state's moves, with targets as ids of the next layer
@@ -863,7 +878,10 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
                 for (size_t d = p * SUBSET_CHUNK; d < std::min(sets, (p + 1) * SUBSET_CHUNK); d++) {
                     bool acc = false;
                     for (auto& v : succ) v.clear();
-                    for (uint64_t i = setStart[d]; i < setStart[d + 1]; i++) {
+                    uint64_t end = setStart[d + 1];
+                    int32_t state = 0;  // the filter's
+                    if (filter) state = -setPool[--end] - 1;
+                    for (uint64_t i = setStart[d]; i < end; i++) {
                         int32_t id = setPool[i];
                         if (accepting[id]) acc = true;
                         const size_t c = id / EXPAND_CHUNK;
@@ -875,11 +893,18 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
                         if (succ[a].empty()) continue;
                         std::sort(succ[a].begin(), succ[a].end());
                         succ[a].erase(std::unique(succ[a].begin(), succ[a].end()), succ[a].end());
+                        if (filter) {
+                            int letter = filter->index[a];
+                            if (letter < 0) { uncovered = true; continue; }
+                            int32_t next = filter->next[(size_t)state * filter->m + letter];
+                            if (next == filter->dead) continue;
+                            succ[a].push_back(-(next + 1));
+                        }
                         o.sym.push_back((uint8_t)a);
                         o.tgt.push_back(nextSets->intern(succ[a]));
                         degree++;
                     }
-                    o.acc.push_back(acc);
+                    o.acc.push_back(acc && (!filter || filter->acc[state]));
                     o.degree.push_back(degree);
                 }
             }
@@ -901,13 +926,16 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
 // next layer, last layer first, gives exactly the minimal DFA.
 SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& workers);
 
-SDfa advanceRow(const std::vector<Orientation>& oris, SDfa& in, const std::string& scratch, Workers& workers) {
+SDfa advanceRow(const std::vector<Orientation>& oris, SDfa& in, const std::string& scratch, Workers& workers,
+                const WindowFilter* filter = nullptr, bool* uncovered = nullptr) {
     DiskSink sink;
     sink.f = fopen(scratch.c_str(), "w+b");
     if (!sink.f) fail("cannot open scratch file " + scratch);
     auto t0 = std::chrono::steady_clock::now();
-    transduceLayered(oris, in, sink, workers);
-    in.release();
+    std::atomic<bool> missed{false};
+    transduceLayered(oris, in, sink, workers, filter, missed);
+    if (uncovered) *uncovered = missed;
+    if (!filter) in.release();  // a pruned row may still need its input, to rebuild it in full
     auto t1 = std::chrono::steady_clock::now();
     SDfa out = minimizeFromDisk(sink, scratch, workers);
     auto t2 = std::chrono::steady_clock::now();
@@ -1204,17 +1232,17 @@ public:
 
     size_t peak() const { return peakLayer; }  // the largest layer of a window product
 
+    // the filter for building d's next row already pruned, or null (no lookahead, a narrow width, or too many
+    // symbols)
+    const WindowFilter* onlineFilter(const SDfa& d, int W, Workers& workers) const {
+        if (rows == 0 || W <= WINDOW_COLS || !filterCovers(d, workers)) return nullptr;
+        return filter.get();
+    }
+
 private:
     static constexpr size_t MAX_FILTER_ALPHABET = 12;  // 12^7 windows, three tests each
     static constexpr size_t FILTER_CHUNK = 1 << 14;
-    struct Filter {
-        std::array<int8_t, 64> index;  // symbol -> letter, -1 outside the alphabet
-        int m = 0;
-        std::vector<int32_t> next;  // state * m + letter
-        std::vector<uint8_t> acc;
-        int32_t start = 0, dead = 0;
-        size_t states = 0;
-    };
+    using Filter = WindowFilter;
     mutable std::unique_ptr<Filter> filter;
 
     // Whether a filter covering d's symbols exists, building (or widening) it when that alphabet is small
@@ -1659,6 +1687,20 @@ int main(int argc, char** argv) {
         deathFrom(std::move(full), row);
         return k;
     };
+    // the next row's kept set: pruned while it is built when the window filter applies; otherwise, or when
+    // nothing is kept or a symbol is outside the filter's alphabet, built in full and pruned afterwards
+    auto keptNext = [&](SDfa& d, int row) -> SDfa {
+        if (const WindowFilter* f = look.onlineFilter(d, W, workers)) {
+            bool uncovered = false;
+            SDfa k = advanceRow(oris, d, opt.scratch, workers, f, &uncovered);
+            if (!uncovered && countWords(k, W) > 0) {
+                d.release();
+                std::cerr << "    kept " << k.size() << " states (pruned while built)\n" << std::flush;
+                return k;
+            }
+        }
+        return kept(advanceRow(oris, d, opt.scratch, workers), row);
+    };
     std::cout << "lookahead " << lookahead << "\n";
     if (resuming) {
         before = c.seconds;
@@ -1718,7 +1760,7 @@ int main(int argc, char** argv) {
         seen.emplace(h, c.row);
         c.seen.push_back({c.row, h.first, h.second});
         if (d.size() <= SMALL_ROW_STATES) smallForms.emplace(c.row, canonicalForm(d));
-        c.lang = kept(advanceRow(oris, d, opt.scratch, workers), c.row + 1);
+        c.lang = keptNext(d, c.row + 1);
         c.row++;
         c.seconds = before + elapsed();
         if (keepCheckpoints) saveCheckpoint(c, opt.checkpoint);
