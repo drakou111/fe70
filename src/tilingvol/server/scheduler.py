@@ -11,7 +11,10 @@ cheapest width goes first: smallest width x next depth.
 A fourth, "periodic", looks for half-strip fillings that repeat: a checked one proves its width fills
 forever, so the width leaves the strip lane (it can never die), and so does every sum of such widths.
 
-A fifth, "exact", decides one width for good on one big computer (smallest open width first). A
+A fifth, "exact", decides one width for good on one big computer. A run that repeats a row without ever
+reaching the flat frontier proves the width fills forever AND that no rectangle has that side, so fill-
+forever widths (sums like 176 = 88 + 88, which no strip search can kill) are handed out too. Widths
+divisible by the piece's largest prime area factor go first: every rectangle has such a side. A
 volunteer who saves checkpoints can resume a run, so a width whose resumable run reported a row stays with
 that volunteer for exact_reserve_s after their last heartbeat."""
 
@@ -280,9 +283,14 @@ class Scheduler:
         return width_states(self.db.strip_results(), self.db.strip_fills())
 
     def dead_widths(self, states: dict[int, WidthState] | None = None) -> set[int]:
-        """Sides no rectangle can have, beyond those below piece.min_side."""
+        """Sides no rectangle can have, beyond those below piece.min_side: strip deaths (exact deaths are
+        stored as those too) and exact repeats, whose rows cycle forever without the flat frontier."""
         states = self.width_states() if states is None else states
-        return set(self.piece.dead_sides) | {w for w, s in states.items() if s.dead}
+        return (
+            set(self.piece.dead_sides)
+            | {w for w, s in states.items() if s.dead}
+            | {w for w, r in self.exact_decided().items() if r.outcome == EXACT_FOREVER}
+        )
 
     def is_dead(self, key: tuple[int, int], dead: set[int] | None = None) -> bool:
         dead = self.dead_widths() if dead is None else dead
@@ -535,11 +543,12 @@ class Scheduler:
     def _pick_exact(
         self, active, name: str, max_ram_mb: int, requested_width: int | None
     ) -> Assignment:
-        """The smallest width that is neither ruled out, known to fill forever, decided exactly, running,
-        nor reserved by someone else's checkpoint; a volunteer's own checkpointed width comes back to them."""
+        """The smallest width divisible by the piece's side prime, then the smallest other one, that is
+        neither ruled out, decided exactly, running, nor reserved by someone else's checkpoint; a volunteer's
+        own checkpointed width comes back to them. Widths known to fill forever are handed out like any
+        other: only an exact run can tell whether one of them is a rectangle's side."""
         need = self.config.exact_ram_mb
         dead = self.dead_widths()
-        live = self.live_table()
         decided = self.exact_decided()
         leased = {j.width for j in active if j.lane == LANE_EXACT}
         reserved = self.exact_reserved(name)
@@ -562,8 +571,6 @@ class Scheduler:
                 raise AlreadyDecided(f"width {w} is already ruled out")
             if w in decided:
                 raise AlreadyDecided(f"width {w} was already decided exactly")
-            if w in live:
-                raise AlreadyDecided(f"width {w} is already known to fill forever")
             if w in leased:
                 raise RequestRefused(f"width {w} is being run by someone right now")
             if w in reserved:
@@ -571,8 +578,9 @@ class Scheduler:
                     f"width {w} is being decided by {reserved[w]} (they can resume it)"
                 )
             return assignment(w)
-        for w in self.chart_widths():
-            if w in dead or w in live or w in decided or w in leased or w in reserved:
+        prime = self.piece.side_prime
+        for w in sorted(self.chart_widths(), key=lambda w: (w % prime != 0, w)):
+            if w in dead or w in decided or w in leased or w in reserved:
                 continue
             return assignment(w)
         raise NoAssignment("every width in range is decided, running or reserved")

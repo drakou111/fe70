@@ -870,8 +870,8 @@ class Controller:
             )
         elif exact is not None:
             text = (
-                f"Width {job.width} FILLS FOREVER: row {exact.row} repeats row {exact.repeat_from} exactly, so "
-                f"this width never dies (a rectangle with this side is still possible)"
+                f"Width {job.width} is RULED OUT: row {exact.row} repeats row {exact.repeat_from} exactly and "
+                f"no row was flat, so its half-strip fills forever but no rectangle has a side {job.width}"
             )
         elif job.periodic and verdict == VERDICT_POSSIBLE:
             text = (

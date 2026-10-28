@@ -413,10 +413,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 job.width in scheduler.dead_widths()
                 or job.width in scheduler.live_table()
             )
-        if job.lane == LANE_EXACT:
+        if (
+            job.lane == LANE_EXACT
+        ):  # filling forever is no reason to stop: it may still be a side
             return (
                 job.width in scheduler.dead_widths()
-                or job.width in scheduler.live_table()
                 or job.width in scheduler.exact_decided()
             )
         key = (job.width, job.height)

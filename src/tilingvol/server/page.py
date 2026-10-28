@@ -10,7 +10,13 @@ from html import escape
 from pathlib import Path
 
 from tilingvol.server.config import ServerConfig
-from tilingvol.server.db import Database, PeriodicResultRow, ResultRow, StripResultRow
+from tilingvol.server.db import (
+    Database,
+    ExactResultRow,
+    PeriodicResultRow,
+    ResultRow,
+    StripResultRow,
+)
 from tilingvol.server.scheduler import Scheduler, WidthState
 from tilingvol.shared.pieces import PieceSpec
 from tilingvol.shared.protocol import (
@@ -317,8 +323,14 @@ def width_text(
     runner: str | None,
     parts: tuple[int, ...] | None = None,
     certificate: PeriodicResultRow | None = None,
+    exact: ExactResultRow | None = None,
 ) -> str:
     five = " (divisible by 5)" if w % 5 == 0 else ""
+    if exact is not None and exact.outcome == EXACT_FOREVER:
+        return (
+            f"width {w}{five}: FILLS FOREVER and NO RECTANGLE has this side: row {exact.row} repeats row "
+            f"{exact.repeat_from} exactly and no row was flat ({exact.name})"
+        )
     if certificate is not None:
         return (
             f"width {w}{five}: FILLS FOREVER, a filling repeating every {certificate.period} rows from row "
@@ -384,6 +396,7 @@ def render_widths(
         )
     live_table = scheduler.live_table()
     certified = scheduler.certified_widths()
+    exact = scheduler.exact_decided()
     counts = {"dead": 0, "forever": 0, "alive": 0, "running": 0, "todo": 0}
     for w in widths:
         s = states.get(w)
@@ -404,7 +417,7 @@ def render_widths(
         parts.append(
             f'<rect x="{x}" y="{base - bar:.1f}" width="{STRIP_BAR}" height="{bar:.1f}" rx="1.6" '
             f'fill="{fill}" '
-            f'data-t="{escape(width_text(w, s, running.get(w), live, certified.get(w)))}"/>'
+            f'data-t="{escape(width_text(w, s, running.get(w), live, certified.get(w), exact.get(w)))}"/>'
         )
         if w % 5 == 0:
             parts.append(
@@ -476,7 +489,7 @@ def exact_outcome_text(outcome: str, row: int, repeat_from: int, width: int) -> 
     if outcome == EXACT_DEAD:
         return f"ruled out: no filling of {row} rows"
     if outcome == EXACT_FOREVER:
-        return f"fills forever: row {row} repeats row {repeat_from}"
+        return f"ruled out: row {row} repeats row {repeat_from} and no row was flat (fills forever)"
     return f"a {width} x {row} rectangle tiles (being checked)"
 
 

@@ -67,6 +67,17 @@ class PieceSpec:
         return all_orientations(self.cells)
 
     @cached_property
+    def side_prime(self) -> int:
+        """The largest prime factor of the area: a W x H rectangle has W * H divisible by it, so one of its
+        sides is (for the gun, 5)."""
+        n, p, largest = self.area, 2, 1
+        while p * p <= n:
+            while n % p == 0:
+                n, largest = n // p, p
+            p += 1
+        return max(largest, n)
+
+    @cached_property
     def strip_reach(self) -> int:
         """How far a piece can stick out above its lowest row."""
         return max(max(y for _, y in shape) for shape in self.orientations)

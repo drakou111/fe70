@@ -28,8 +28,10 @@ from tilingvol.client.exact_runner import (
 from tilingvol.client.solver_process import MSG_STAGE_START
 from tilingvol.client.width_queue import WidthQueue
 from tilingvol.server.app import create_app
+from tilingvol.server.db import Database
+from tilingvol.server.scheduler import Scheduler
 from tilingvol.shared import token
-from tilingvol.shared.pieces import SIBLING
+from tilingvol.shared.pieces import GUN, SIBLING
 from tilingvol.shared.protocol import (
     EXACT_DEAD,
     EXACT_FOREVER,
@@ -363,25 +365,28 @@ def exact_submission(
 DEAD_10 = ExactOutcome(EXACT_DEAD, 2, 0, 0, (1, 5, 1), 4.0)
 
 
-def test_exact_jobs_go_to_new_apps_smallest_open_width_first(exact_config):
+def test_exact_jobs_go_to_new_apps_side_prime_multiples_first(exact_config):
+    # the sibling's area is 7, so every rectangle has a side divisible by 7: 14, 21, 28, 35 go first
+    assert SIBLING.side_prime == 7 and GUN.side_prime == 5
     with TestClient(create_app(exact_config)) as client:
         assert ask(client, version="0.12.0").status_code == 426
         assert ask(client, ram_mb=1024).status_code == 404  # needs exact_ram_mb
         job = ask(client).json()
         assert (job["lane"], job["width"], job["height"], job["threads"]) == (
             "exact",
-            10,
+            14,
             0,
             1,
         )
         assert [s["exact"] for s in job["stages"]] == [True]
-        assert ask(client).json()["width"] == 11  # 10 is running
+        assert [ask(client).json()["width"] for _ in range(4)] == [21, 28, 35, 10]
+        assert ask(client, width=14).status_code == 409  # running
         assert ask(client, width=10).status_code == 409
 
 
 def test_an_exact_death_rules_the_width_out(exact_config, submit_key):
     with TestClient(create_app(exact_config)) as client:
-        job = ask(client).json()
+        job = ask(client, width=SIB_DEAD[0]).json()
         no_exact = exact_submission(submit_key, job, DEAD_10)
         del no_exact["exact"]
         assert "only with, an exact job" in post_result(client, no_exact, 422)["detail"]
@@ -430,6 +435,12 @@ def test_forever_and_rectangle_outcomes(exact_config, submit_key):
             refused.status_code == 409 and "fills forever" in refused.text
         )  # 24 = 12 + 12
         assert ask(client, width=width).status_code == 410
+        # rows that cycle without the flat frontier: no rectangle has a side 12, at any height
+        scheduler = Scheduler(Database(exact_config.db_path), exact_config)
+        assert width in scheduler.dead_widths() and scheduler.is_dead((width, 35))
+        assert "no row was flat" in client.get("/").text
+        # 24 = 12 + 12 fills forever too, but only an exact run can tell whether it is a side
+        assert ask(client, width=2 * width).json()["width"] == 2 * width
 
         width, height = SIB_RECTANGLE
         job = ask(client, width=width).json()
@@ -466,12 +477,12 @@ def test_a_checkpointed_width_stays_with_its_volunteer(exact_config):
         # without checkpoints the run cannot be resumed, so the width is free again at once
         beat_and_release(client, ask(client).json(), resumable=False)
         job = ask(client, name="someone else").json()
-        assert job["width"] == 10
+        assert job["width"] == 14
         beat_and_release(client, job, resumable=True)
-        assert ask(client).json()["width"] == 11
-        taken = ask(client, width=10, name="another one")
+        assert ask(client).json()["width"] == 21
+        taken = ask(client, width=14, name="another one")
         assert taken.status_code == 409 and "can resume it" in taken.text
-        assert ask(client, width=10, name="someone else").json()["width"] == 10
+        assert ask(client, width=14, name="someone else").json()["width"] == 14
 
 
 # a real run
@@ -492,8 +503,9 @@ def test_a_real_run_decides_widths_and_cleans_up(
     wait_for(lambda: len(server.db.exact_results()) >= 2, TIMEOUT_S)
     c.stop()
     found = {r.width: r.outcome for r in server.db.exact_results()}
-    assert found == {SIB_FOREVER[0]: EXACT_FOREVER, SIB_DEAD[0]: EXACT_DEAD}
-    assert recorder.has("FILLS FOREVER") and recorder.has("RULED OUT exactly")
+    # the listed 12 first, then the server's first multiple of 7; both cycle without a flat row
+    assert found == {SIB_FOREVER[0]: EXACT_FOREVER, 14: EXACT_FOREVER}
+    assert recorder.has("no rectangle has a side 12")
     assert checkpointed_widths(run_settings.exact_dir(c._directory)) == []
 
 
@@ -572,4 +584,4 @@ def test_heartbeats_from_0_13_0_apps_count_as_resumable(exact_config):
             f"/api/jobs/{job['job_id']}/release",
             json={"nonce": job["nonce"], "reason": "closed"},
         )
-        assert ask(client, name="someone else").json()["width"] == 11
+        assert ask(client, name="someone else").json()["width"] == 21
