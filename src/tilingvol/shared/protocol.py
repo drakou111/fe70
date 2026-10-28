@@ -54,7 +54,7 @@ EXACT_VERDICTS = {
 MAX_EXACT_ROW = 100_000
 # exact_width --lookahead: rows ahead a frontier must stay fillable to be kept (0 = keep every frontier);
 # verdicts are the same for every lookahead, state counts are comparable only between equal ones
-EXACT_LOOKAHEAD = 3
+EXACT_LOOKAHEAD = 6
 MAX_EXACT_LOOKAHEAD = 6
 # a piece spans at most 7 rows, so with period >= 7 each repeated block touches only its neighbours
 MIN_PERIOD = 7
