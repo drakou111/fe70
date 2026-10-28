@@ -116,6 +116,9 @@ class Heartbeat(BaseModel):
     # an exact decision: the row it reached and its state count (shown on the page)
     exact_row: int | None = Field(default=None, ge=0, le=MAX_EXACT_ROW)
     exact_states: int | None = Field(default=None, ge=0, le=MAX_EXACT_STATES)
+    exact_resumable: bool = (
+        False  # it saves checkpoints: keep the width for this volunteer
+    )
 
 
 class Release(BaseModel):
@@ -390,7 +393,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         db.touch_job(job_id, body.state)
         if job.lane == LANE_EXACT and body.exact_row is not None:
             db.set_exact_progress(
-                job.width, job.name, job_id, body.exact_row, body.exact_states or 0
+                job.width,
+                job.name,
+                job_id,
+                body.exact_row,
+                body.exact_states or 0,
+                body.exact_resumable,
             )
             page_cache["at"] = 0.0
         return {"ok": True}

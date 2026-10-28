@@ -79,7 +79,7 @@ SEARCH_HINTS = {
     SEARCH_FOREVER: "Looks for a half-strip filling that repeats; one found proves the width fills forever, "
     "so it never needs a strip search again.",
     SEARCH_EXACT: "Decides one width for good: every row until it dies, tiles a rectangle or repeats. Needs "
-    "about 24 GB of RAM and 40 GB of disk, runs for hours, and saves a checkpoint after every row.",
+    "about 24 GB of RAM and 20 GB of disk (40 GB with checkpoints) and runs for hours.",
 }
 # per search: (request placeholder, request hint, depths placeholder, depths hint)
 SEARCH_FIELDS = {
@@ -358,8 +358,15 @@ class App:
             4,
             "Exact folder",
             "inside the app folder",
-            "checkpoints of exact searches",
+            "checkpoints and scratch files",
         )
+        self.checkpoints_var = tk.BooleanVar(value=form.save_checkpoints)
+        ttk.Checkbutton(
+            computer,
+            text="Exact searches save a checkpoint after every row (a crash or Stop then loses one row "
+            "at most; needs about 20 GB more disk)",
+            variable=self.checkpoints_var,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
         connection = ttk.LabelFrame(self.form, text="Connection", padding=(10, 6))
         connection.pack(fill="x", pady=(8, 0))
@@ -505,6 +512,7 @@ class App:
             server_url=self.url_entry.value,
             access_token=self.token_entry.value,
             exact_folder=self.exact_entry.value,
+            save_checkpoints=self.checkpoints_var.get(),
         )
 
     def _button_help(self, key: str) -> str:

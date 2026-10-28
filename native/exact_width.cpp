@@ -1,5 +1,6 @@
 // Exact half-strip width decider (the research repo's cpp/hsw.cpp, DFA mode with streamed minimization),
-// with a checkpoint after every row so a crash or a stop loses at most one row.
+// optionally with a checkpoint after every row so a crash or a stop loses at most one row (without
+// --checkpoint nothing is saved and every run starts from the beginning).
 //
 // Row r's language is the set of frontiers (6 rows of occupancy per column) left by fillings of the first
 // r rows of the width-W half-strip, as a minimal acyclic DFA. The run ends when the language is empty (no
@@ -870,9 +871,10 @@ struct Options {
 };
 
 const char* USAGE =
-    "usage: exact_width --width W --cells \"x,y x,y ...\" --checkpoint FILE --scratch FILE [--start-row R]\n"
+    "usage: exact_width --width W --cells \"x,y x,y ...\" --scratch FILE [--checkpoint FILE] [--start-row R]\n"
     "Decides exactly whether the piece's width-W half-strip dies, tiles a rectangle or fills forever.\n"
-    "Resumes from FILE if it exists (written after every row); the scratch file holds one raw row.\n";
+    "With --checkpoint, resumes from FILE if it exists and rewrites it after every row. The scratch file\n"
+    "holds one raw row.\n";
 
 int parseInt(const std::string& text, const char* what) {
     try {
@@ -916,7 +918,7 @@ Options parseOptions(int argc, char** argv) {
     }
     if (o.width < 1 || o.width > 2000) fail("--width must be between 1 and 2000");
     if (o.startRow < 0 || o.startRow > 12) fail("--start-row must be between 0 and 12");
-    if (o.cells.empty() || o.checkpoint.empty() || o.scratch.empty()) fail(std::string("--width, --cells, --checkpoint and --scratch are required\n") + USAGE);
+    if (o.cells.empty() || o.scratch.empty()) fail(std::string("--width, --cells and --scratch are required\n") + USAGE);
     return o;
 }
 
@@ -963,7 +965,8 @@ int main(int argc, char** argv) {
     auto elapsed = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
 
     Checkpoint c;
-    if (std::filesystem::exists(opt.checkpoint)) {
+    const bool keepCheckpoints = !opt.checkpoint.empty();
+    if (keepCheckpoints && std::filesystem::exists(opt.checkpoint)) {
         c = loadCheckpoint(opt.checkpoint);
         if (c.width != W || c.startRow != opt.startRow || c.pieceKey != pieceKeyOf(oris))
             fail(opt.checkpoint + " belongs to another width or piece");
@@ -1014,6 +1017,6 @@ int main(int argc, char** argv) {
         c.lang = advanceRow(oris, d, opt.scratch);
         c.row++;
         c.seconds = before + elapsed();
-        saveCheckpoint(c, opt.checkpoint);
+        if (keepCheckpoints) saveCheckpoint(c, opt.checkpoint);
     }
 }

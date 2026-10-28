@@ -1,6 +1,7 @@
 """Exact width decisions: runs native/exact_width.cpp's program as a child process and turns its output into
-the same queue messages the CP-SAT solver process sends. The program writes a checkpoint after every row,
-so a crash, a closed window or Stop loses at most one row: the next run of that width resumes from it."""
+the same queue messages the CP-SAT solver process sends. With checkpoints on (Settings.save_checkpoints)
+the program saves one after every row, so a crash, a closed window or Stop loses at most one row: the next
+run of that width resumes from it. Off, nothing is saved and a stopped run starts over."""
 
 import os
 import queue
@@ -22,8 +23,9 @@ BINARY_NAME = "exact_width.exe" if sys.platform == "win32" else "exact_width"
 CHECKPOINT_SUFFIX = ".ckpt"
 SCRATCH_SUFFIX = ".raw"
 LOG_SUFFIX = ".log"
-# a checkpoint plus one raw row of a width near 140 take about 20 GB; wider ones more
+# one raw row of a width near 140 takes up to about 15 GB, a checkpoint as much again; wider ones more
 MIN_FREE_DISK_MB = 40 * 1024
+MIN_FREE_SCRATCH_MB = 20 * 1024  # without checkpoints
 EXIT_FAILED = 2  # the program's own errors (disk full, damaged checkpoint), explained on its last stderr line
 CHECKPOINT_NAME = re.compile(r"(?P<piece>[a-z]+)-(?P<width>\d+)\.ckpt")
 ROW_LINE = re.compile(r"row (\d+) states (\d+) words \S+ seconds (\d+)")
@@ -124,7 +126,12 @@ class ExactProcess:
     """The program as a child process, with the interface SolverRunner uses for the CP-SAT process."""
 
     def __init__(
-        self, piece: PieceSpec, width: int, files: ExactFiles, messages: queue.Queue
+        self,
+        piece: PieceSpec,
+        width: int,
+        files: ExactFiles,
+        messages: queue.Queue,
+        keep_checkpoint: bool,
     ) -> None:
         files.directory.mkdir(parents=True, exist_ok=True)
         command = [
@@ -135,11 +142,11 @@ class ExactProcess:
             cells_argument(piece),
             "--start-row",
             str(piece.exact_start_row),
-            "--checkpoint",
-            str(files.checkpoint),
             "--scratch",
             str(files.scratch),
         ]
+        if keep_checkpoint:
+            command += ["--checkpoint", str(files.checkpoint)]
         self._log = files.log.open("a", encoding="utf-8")
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         self._popen = subprocess.Popen(
@@ -152,6 +159,7 @@ class ExactProcess:
         )
         self._messages = messages
         self._log_path = files.log
+        self._scratch = files.scratch
         self._reader = threading.Thread(
             target=self._read, name="exact-output", daemon=True
         )
@@ -178,6 +186,8 @@ class ExactProcess:
             return
         self._reader.join(timeout)
         self._log.close()
+        # a killed run leaves its half-written row (gigabytes); a resumed run redoes that row anyway
+        self._scratch.unlink(missing_ok=True)
 
     def _read(self) -> None:
         lines: list[str] = []

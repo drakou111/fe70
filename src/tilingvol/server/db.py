@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS exact_progress (  -- the row each running exact decis
     job_id TEXT NOT NULL,
     row INTEGER NOT NULL,
     states INTEGER NOT NULL,
+    resumable INTEGER NOT NULL,               -- 1: the volunteer saves checkpoints and can resume it
     updated REAL NOT NULL
 );
 """
@@ -225,6 +226,7 @@ class ExactProgressRow:
     job_id: str
     row: int
     states: int
+    resumable: bool
     updated: float
 
 
@@ -729,22 +731,29 @@ class Database:
         return [ExactResultRow(*r[:6], tuple(json.loads(r[6])), *r[7:]) for r in rows]
 
     def set_exact_progress(
-        self, width: int, name: str, job_id: str, row: int, states: int
+        self,
+        width: int,
+        name: str,
+        job_id: str,
+        row: int,
+        states: int,
+        resumable: bool,
     ) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO exact_progress (width, name, job_id, row, states, updated) VALUES (?,?,?,?,?,?)"
-                " ON CONFLICT(width) DO UPDATE SET name = excluded.name, job_id = excluded.job_id,"
-                " row = excluded.row, states = excluded.states, updated = excluded.updated",
-                (width, name, job_id, row, states, time.time()),
+                "INSERT INTO exact_progress (width, name, job_id, row, states, resumable, updated)"
+                " VALUES (?,?,?,?,?,?,?) ON CONFLICT(width) DO UPDATE SET name = excluded.name,"
+                " job_id = excluded.job_id, row = excluded.row, states = excluded.states,"
+                " resumable = excluded.resumable, updated = excluded.updated",
+                (width, name, job_id, row, states, int(resumable), time.time()),
             )
 
     def exact_progress(self) -> dict[int, ExactProgressRow]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT width, name, job_id, row, states, updated FROM exact_progress"
+                "SELECT width, name, job_id, row, states, resumable, updated FROM exact_progress"
             ).fetchall()
-        return {r[0]: ExactProgressRow(*r) for r in rows}
+        return {r[0]: ExactProgressRow(*r[:5], bool(r[5]), r[6]) for r in rows}
 
     def use_salt(self, salt: str) -> bool:
         """Record a salt; False if it was used before."""

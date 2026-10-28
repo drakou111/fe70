@@ -24,6 +24,7 @@ from tilingvol.client import memory_guard
 from tilingvol.client.api import ApiClient, NoJobAvailable, ServerError
 from tilingvol.client.exact_runner import (
     MIN_FREE_DISK_MB,
+    MIN_FREE_SCRATCH_MB,
     MSG_EXACT_DONE,
     MSG_EXACT_ROW,
     ExactBinaryMissing,
@@ -162,6 +163,7 @@ class SolverRunner:
     cap_mb: int
     tree_progress: bool = False
     exact_dir: Path | None = None  # where an exact job keeps its checkpoint
+    keep_checkpoint: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
     clock: ActiveClock = field(default_factory=ActiveClock)
     stage_index: int = -1
@@ -183,7 +185,11 @@ class SolverRunner:
             self._queue = queue.Queue()
             files = ExactFiles(self.exact_dir, self.job.piece, self.job.width)
             self._process = ExactProcess(
-                piece_by_name(self.job.piece), self.job.width, files, self._queue
+                piece_by_name(self.job.piece),
+                self.job.width,
+                files,
+                self._queue,
+                self.keep_checkpoint,
             )
             self._watch_process()
             return
@@ -421,7 +427,7 @@ class Controller:
             self._state = State.RUNNING
             if self._job is None:
                 self._log("Started.")
-            elif self._job.exact:
+            elif self._job.exact and self._settings.save_checkpoints:
                 self._log("Continuing the exact decision from its last checkpoint.")
             else:
                 self._log("Restarting the current size from the beginning.")
@@ -538,15 +544,21 @@ class Controller:
             )
         if job.exact:
             files = ExactFiles(self._exact_dir(), job.piece, job.width)
+            keep = settings.save_checkpoints
             again = (
                 "resuming from its checkpoint"
-                if files.checkpoint.exists()
-                else "from row 0"
+                if keep and files.checkpoint.exists()
+                else "from the first row"
+            )
+            saving = (
+                f"a checkpoint is saved after every row in {files.directory}"
+                if keep
+                else "no checkpoints are saved (Save checkpoints is off), so a stop or crash starts it over"
             )
             self._log(
                 f"Got width {job.width} for an exact decision ({again}; about "
                 f"{job.est_ram_mb / 1024:.0f} GB of RAM, one thread). It runs until the width dies, tiles a "
-                f"rectangle or repeats; a checkpoint is saved after every row in {files.directory}."
+                f"rectangle or repeats; {saving}."
             )
             return
         if job.periodic:
@@ -585,6 +597,8 @@ class Controller:
         return self._settings.exact_dir(self._directory)
 
     def _checkpoint_to_resume(self) -> int | None:
+        if not self._settings.save_checkpoints:
+            return None
         for width in checkpointed_widths(self._exact_dir()):
             if width not in self._resume_skipped:
                 return width
@@ -613,6 +627,7 @@ class Controller:
             cap,
             self._settings.tree_progress,
             exact_dir=self._exact_dir(),
+            keep_checkpoint=self._settings.save_checkpoints,
             first_stage=self._filled_stage + 1,
         )
         if self._filled_stage >= 0:
@@ -628,11 +643,14 @@ class Controller:
         directory = self._exact_dir()
         directory.mkdir(parents=True, exist_ok=True)
         free_mb = shutil.disk_usage(directory).free // (1 << 20)
-        if free_mb < MIN_FREE_DISK_MB:
+        keep = self._settings.save_checkpoints
+        need_mb = MIN_FREE_DISK_MB if keep else MIN_FREE_SCRATCH_MB
+        if free_mb < need_mb:
+            what = "its checkpoint and scratch row" if keep else "its scratch row"
             self._log(
                 f"Only {free_mb / 1024:.0f} GB free in {directory}; an exact search needs about "
-                f"{MIN_FREE_DISK_MB // 1024} GB for its checkpoint and scratch row. Free some space or pick "
-                f"another Exact folder, then press Start."
+                f"{need_mb // 1024} GB for {what}. Free some space or pick another Exact folder, then press "
+                f"Start."
             )
             return False
         try:
@@ -966,6 +984,7 @@ class Controller:
                 runner.stage_index if runner else -1,
                 runner.clock.elapsed() if runner else 0.0,
                 runner.exact_row if runner else None,
+                runner.keep_checkpoint if runner else False,
             )
         except ServerError as error:
             if error.status in (404, 409, 410):

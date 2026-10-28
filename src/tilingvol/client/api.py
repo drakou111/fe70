@@ -160,8 +160,10 @@ class ApiClient:
         stage_index: int,
         active_s: float,
         exact_row: tuple[int, int] | None = None,
+        exact_resumable: bool = False,
     ) -> dict:
-        """exact_row: (row, states) an exact decision has reached, shown on the server's page."""
+        """exact_row: (row, states) an exact decision has reached, shown on the server's page;
+        exact_resumable: it saves checkpoints, so the server keeps the width for this volunteer."""
         body = {
             "nonce": job.nonce,
             "state": state,
@@ -170,6 +172,7 @@ class ApiClient:
         }
         if exact_row is not None:
             body["exact_row"], body["exact_states"] = exact_row
+            body["exact_resumable"] = exact_resumable
         return self._post(f"/api/jobs/{job.job_id}/heartbeat", body)
 
     def release(

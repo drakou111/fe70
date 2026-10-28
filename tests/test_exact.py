@@ -79,12 +79,12 @@ def use_binary(exact_binary, monkeypatch) -> Path:
 
 
 def run_width(
-    directory: Path, width: int, stop_after_row: int | None = None
+    directory: Path, width: int, stop_after_row: int | None = None, keep: bool = True
 ) -> list[tuple]:
     """Every message of one run; with stop_after_row, the run is killed once that row is reported."""
     messages: queue.Queue = queue.Queue()
     process = ExactProcess(
-        SIBLING, width, ExactFiles(directory, "sib", width), messages
+        SIBLING, width, ExactFiles(directory, "sib", width), messages, keep
     )
     seen = []
     try:
@@ -138,6 +138,17 @@ def test_the_program_reaches_all_three_verdicts(use_binary, tmp_path):
     assert (rectangle.outcome, rectangle.row) == (EXACT_RECTANGLE, height)
     # width 10 died before its first checkpoint; the others keep theirs until the app sends the result
     assert checkpointed_widths(tmp_path) == [SIB_FOREVER[0], width]
+
+
+def test_without_checkpoints_nothing_is_kept(use_binary, tmp_path):
+    width, earlier, later = SIB_FOREVER
+    forever = outcome_of(run_width(tmp_path, width, keep=False))
+    assert (forever.repeat_from, forever.row) == (earlier, later)
+    stopped = run_width(tmp_path, SLOW_WIDTH, stop_after_row=8, keep=False)
+    again = run_width(tmp_path, SLOW_WIDTH, stop_after_row=6, keep=False)
+    assert min(rows_of(stopped)) == min(rows_of(again))  # starts over
+    assert checkpointed_widths(tmp_path) == []
+    assert not list(tmp_path.glob("*.raw"))  # the scratch row is gone after each row
 
 
 def test_a_killed_run_resumes_from_its_last_row(use_binary, tmp_path):
@@ -347,33 +358,38 @@ def test_forever_and_rectangle_outcomes(exact_config, submit_key):
         assert f"a {width} x {height} rectangle tiles" in client.get("/").text
 
 
+def beat_and_release(client, job, resumable: bool) -> None:
+    beat = client.post(
+        f"/api/jobs/{job['job_id']}/heartbeat",
+        json={
+            "nonce": job["nonce"],
+            "state": "running",
+            "stage_index": 0,
+            "active_s": 5.0,
+            "exact_row": 30,
+            "exact_states": 1234,
+            "exact_resumable": resumable,
+        },
+    )
+    assert beat.status_code == 200
+    assert "row 30 reached (1,234 states)" in client.get("/").text
+    client.post(
+        f"/api/jobs/{job['job_id']}/release",
+        json={"nonce": job["nonce"], "reason": "closed"},
+    )
+
+
 def test_a_checkpointed_width_stays_with_its_volunteer(exact_config):
     with TestClient(create_app(exact_config)) as client:
-        job = ask(client).json()
-        beat = client.post(
-            f"/api/jobs/{job['job_id']}/heartbeat",
-            json={
-                "nonce": job["nonce"],
-                "state": "running",
-                "stage_index": 0,
-                "active_s": 5.0,
-                "exact_row": 30,
-                "exact_states": 1234,
-            },
-        )
-        assert beat.status_code == 200
-        assert "row 30 reached (1,234 states)" in client.get("/").text
-        client.post(
-            f"/api/jobs/{job['job_id']}/release",
-            json={"nonce": job["nonce"], "reason": "closed"},
-        )
-        other = ask(client, name="someone else")
-        assert other.json()["width"] == 11
+        # without checkpoints the run cannot be resumed, so the width is free again at once
+        beat_and_release(client, ask(client).json(), resumable=False)
+        job = ask(client, name="someone else").json()
+        assert job["width"] == 10
+        beat_and_release(client, job, resumable=True)
+        assert ask(client).json()["width"] == 11
         taken = ask(client, width=10, name="another one")
         assert taken.status_code == 409 and "can resume it" in taken.text
-        assert (
-            ask(client, width=10).json()["width"] == 10
-        )  # its own volunteer gets it back
+        assert ask(client, width=10, name="someone else").json()["width"] == 10
 
 
 # a real run
@@ -419,7 +435,10 @@ def test_the_app_resumes_its_checkpoint_first_and_drops_decided_ones(
     c, recorder = controller
     c.start(
         replace(
-            settings(server.url), search=SEARCH_EXACT, exact_folder=str(folder)
+            settings(server.url),
+            search=SEARCH_EXACT,
+            exact_folder=str(folder),
+            save_checkpoints=True,
         ).validated()
     )
     wait_for(lambda: recorder.has("resuming from its checkpoint"), TIMEOUT_S)

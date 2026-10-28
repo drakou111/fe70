@@ -102,8 +102,10 @@ class Settings:
     # own depths, e.g. "24, 28, 32": border depths (the full search follows) or strip depths. Empty: the
     # server's
     custom_stages: str = ""
-    # where exact decisions keep their checkpoints (tens of GB); empty: the app folder
+    # where exact decisions keep their checkpoints (tens of GB) and scratch row; empty: the app folder
     exact_folder: str = ""
+    # an exact decision saves a checkpoint after every row, so a stop or crash loses one row at most
+    save_checkpoints: bool = False
 
     def exact_dir(self, app_directory: Path) -> Path:
         return (
@@ -219,6 +221,7 @@ class Form:
     server_url: str = ""  # empty: the built-in server
     access_token: str = ""
     exact_folder: str = ""  # empty: inside the app folder
+    save_checkpoints: bool = False
 
     def resolve(self) -> Resolved:
         ram_mb = (
@@ -255,6 +258,7 @@ class Form:
             search=self.search,
             custom_stages=self.stages,
             exact_folder=self.exact_folder,
+            save_checkpoints=self.save_checkpoints,
         ).validated()
         if self.search == SEARCH_FOREVER and self.stages.strip():
             raise ValueError(

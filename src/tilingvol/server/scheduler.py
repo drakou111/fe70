@@ -11,9 +11,9 @@ cheapest width goes first: smallest width x next depth.
 A fourth, "periodic", looks for half-strip fillings that repeat: a checked one proves its width fills
 forever, so the width leaves the strip lane (it can never die), and so does every sum of such widths.
 
-A fifth, "exact", decides one width for good on one big computer (smallest open width first). The
-volunteer's checkpoint makes the run resumable, so a width whose run reported a row stays with that
-volunteer for exact_reserve_s after their last heartbeat."""
+A fifth, "exact", decides one width for good on one big computer (smallest open width first). A
+volunteer who saves checkpoints can resume a run, so a width whose resumable run reported a row stays with
+that volunteer for exact_reserve_s after their last heartbeat."""
 
 import math
 import re
@@ -521,12 +521,15 @@ class Scheduler:
         raise NoAssignment("every open width has had every repeat setting tried")
 
     def exact_reserved(self, name: str, now: float | None = None) -> dict[int, str]:
-        """Widths whose exact run (by someone other than `name`) reported a row recently: width -> name."""
+        """Widths whose resumable exact run (by someone other than `name`) reported a row recently:
+        width -> name."""
         now = now or time.time()
         return {
             w: p.name
             for w, p in self.db.exact_progress().items()
-            if p.name != name and now - p.updated < self.config.exact_reserve_s
+            if p.resumable
+            and p.name != name
+            and now - p.updated < self.config.exact_reserve_s
         }
 
     def _pick_exact(
