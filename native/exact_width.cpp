@@ -790,6 +790,29 @@ struct Checkpoint {
     SDfa lang;
 };
 
+// n, e (uint64), start (int32), acc[n], degree[n] (uint8), sym[e], tgt[e] (int32); edges in state order
+void writeLanguage(FILE* f, const SDfa& d) {
+    uint64_t n = d.size(), e = d.sym.size();
+    writeValue(f, n, "language");
+    writeValue(f, e, "language");
+    writeValue(f, d.start, "language");
+    writeAll(f, d.acc.data(), n, "language");
+    std::vector<uint8_t> degree(n);
+    for (uint64_t v = 0; v < n; v++) degree[v] = (uint8_t)(d.off[v + 1] - d.off[v]);  // at most SYMBOLS
+    writeAll(f, degree.data(), n, "language");
+    writeAll(f, d.sym.data(), e, "language");
+    writeAll(f, d.tgt.data(), 4 * e, "language");
+}
+
+// --dump: one file per row, for looking at the automata (research/automaton_view.py reads them)
+void dumpLanguage(const SDfa& d, const std::string& dir, int row) {
+    std::string path = dir + "/row" + std::to_string(row) + ".dfa";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) fail("cannot write " + path);
+    writeLanguage(f, d);
+    if (fclose(f) != 0) fail("cannot finish " + path + "; is the disk full?");
+}
+
 void saveCheckpoint(const Checkpoint& c, const std::string& path) {
     std::string tmp = path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
@@ -805,17 +828,7 @@ void saveCheckpoint(const Checkpoint& c, const std::string& path) {
     for (auto& s : c.seen) { writeValue(f, s.row, "checkpoint"); writeValue(f, s.h1, "checkpoint"); writeValue(f, s.h2, "checkpoint"); }
     writeValue(f, (uint64_t)c.counts.size(), "checkpoint");
     writeAll(f, c.counts.data(), 8 * c.counts.size(), "checkpoint");
-    const SDfa& d = c.lang;
-    uint64_t n = d.size(), e = d.sym.size();
-    writeValue(f, n, "checkpoint");
-    writeValue(f, e, "checkpoint");
-    writeValue(f, d.start, "checkpoint");
-    writeAll(f, d.acc.data(), n, "checkpoint");
-    std::vector<uint8_t> degree(n);
-    for (uint64_t v = 0; v < n; v++) degree[v] = (uint8_t)(d.off[v + 1] - d.off[v]);  // at most SYMBOLS
-    writeAll(f, degree.data(), n, "checkpoint");
-    writeAll(f, d.sym.data(), e, "checkpoint");
-    writeAll(f, d.tgt.data(), 4 * e, "checkpoint");
+    writeLanguage(f, c.lang);
     writeAll(f, CHECKPOINT_END, sizeof CHECKPOINT_END, "checkpoint");
     if (fflush(f) != 0 || fclose(f) != 0) fail("cannot finish checkpoint " + tmp + "; is the disk full?");
     std::error_code error;
@@ -867,14 +880,15 @@ struct Options {
     int width = 0;
     int startRow = DEFAULT_START_ROW;
     std::vector<Cell> cells;
-    std::string cellsText, checkpoint, scratch;
+    std::string cellsText, checkpoint, scratch, dumpDir;
 };
 
 const char* USAGE =
     "usage: exact_width --width W --cells \"x,y x,y ...\" --scratch FILE [--checkpoint FILE] [--start-row R]\n"
+    "                   [--dump DIR]\n"
     "Decides exactly whether the piece's width-W half-strip dies, tiles a rectangle or fills forever.\n"
     "With --checkpoint, resumes from FILE if it exists and rewrites it after every row. The scratch file\n"
-    "holds one raw row.\n";
+    "holds one raw row. --dump writes every row's minimal automaton to DIR/row<r>.dfa.\n";
 
 int parseInt(const std::string& text, const char* what) {
     try {
@@ -914,6 +928,7 @@ Options parseOptions(int argc, char** argv) {
         else if (a == "--cells") { o.cellsText = v; o.cells = parseCells(v); }
         else if (a == "--checkpoint") o.checkpoint = v;
         else if (a == "--scratch") o.scratch = v;
+        else if (a == "--dump") o.dumpDir = v;
         else fail("unknown option " + a + "\n" + USAGE);
     }
     if (o.width < 1 || o.width > 2000) fail("--width must be between 1 and 2000");
@@ -983,6 +998,7 @@ int main(int argc, char** argv) {
 
     while (true) {
         SDfa& d = c.lang;
+        if (!opt.dumpDir.empty()) dumpLanguage(d, opt.dumpDir, c.row);
         double words = countWords(d, W);
         c.counts.push_back(d.size());
         std::cout << "row " << c.row << " states " << d.size() << " words " << words << " seconds "
