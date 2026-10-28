@@ -3,6 +3,7 @@ and a real run through the controller."""
 
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -174,7 +175,12 @@ def test_a_killed_run_resumes_from_its_last_row(use_binary, tmp_path):
 
 
 def test_bad_arguments_fail_loudly(use_binary, tmp_path):
-    for args in (["--width", "0"], ["--cells", "0,0 0,0"], ["--bogus", "1"]):
+    for args in (
+        ["--width", "0"],
+        ["--cells", "0,0 0,0"],
+        ["--bogus", "1"],
+        ["--threads", "0"],
+    ):
         done = subprocess.run(
             [
                 str(use_binary),
@@ -247,6 +253,7 @@ def run_binary(
     lookahead: int,
     checkpoint: Path | None = None,
     stop_after_row: int | None = None,
+    threads: int = 1,
 ) -> list[str]:
     """The program's output lines; with stop_after_row, killed once that row is printed."""
     command = [
@@ -261,6 +268,8 @@ def run_binary(
         str(tmp_path / "scratch.raw"),
         "--lookahead",
         str(lookahead),
+        "--threads",
+        str(threads),
     ]
     if checkpoint is not None:
         command += ["--checkpoint", str(checkpoint)]
@@ -291,6 +300,28 @@ def test_every_lookahead_gives_the_same_verdicts(use_binary, tmp_path):
     assert (
         dead[0] == "lookahead 3" and dead[-1] == f"dead {SIB_DEAD[1]}"
     )  # the exact death row
+
+
+def without_seconds(lines: list[str]) -> list[str]:
+    return [re.sub(r" seconds \d+", "", line) for line in lines]
+
+
+def test_threads_change_nothing_but_the_time(use_binary, tmp_path):
+    for width in (SIB_DEAD[0], SIB_FOREVER[0], SIB_RECTANGLE[0], LONG_RECTANGLE_WIDTH):
+        for lookahead in (0, 3):
+            one = run_binary(use_binary, tmp_path, width, lookahead)
+            four = run_binary(use_binary, tmp_path, width, lookahead, threads=4)
+            assert without_seconds(one) == without_seconds(four), (width, lookahead)
+
+
+def test_a_repeat_across_a_resume_is_still_confirmed(use_binary, tmp_path):
+    """A resumed run has no stored forms of the rows before it, so it rebuilds the earlier row."""
+    width, earlier, later = SIB_FOREVER
+    checkpoint = tmp_path / "forever.ckpt"
+    run_binary(use_binary, tmp_path, width, 3, checkpoint, stop_after_row=earlier + 2)
+    resumed = run_binary(use_binary, tmp_path, width, 3, checkpoint, threads=2)
+    assert resumed[1] != "start 4"  # it did resume
+    assert resumed[-1] == f"forever {earlier} {later}"
 
 
 def test_a_resumed_run_keeps_its_checkpoints_lookahead(use_binary, tmp_path):

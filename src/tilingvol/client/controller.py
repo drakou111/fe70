@@ -164,6 +164,9 @@ class SolverRunner:
     tree_progress: bool = False
     exact_dir: Path | None = None  # where an exact job keeps its checkpoint
     keep_checkpoint: bool = False
+    exact_threads: int = (
+        1  # threads of an exact job (the server's thread count is for CP-SAT jobs)
+    )
     lock: threading.Lock = field(default_factory=threading.Lock)
     clock: ActiveClock = field(default_factory=ActiveClock)
     stage_index: int = -1
@@ -190,6 +193,7 @@ class SolverRunner:
                 files,
                 self._queue,
                 self.keep_checkpoint,
+                self.exact_threads,
             )
             self._watch_process()
             return
@@ -557,7 +561,7 @@ class Controller:
             )
             self._log(
                 f"Got width {job.width} for an exact decision ({again}; about "
-                f"{job.est_ram_mb / 1024:.0f} GB of RAM, one thread). It runs until the width dies, tiles a "
+                f"{job.est_ram_mb / 1024:.0f} GB of RAM, {settings.max_threads} threads). It runs until the width dies, tiles a "
                 f"rectangle or repeats; {saving}."
             )
             return
@@ -628,6 +632,7 @@ class Controller:
             self._settings.tree_progress,
             exact_dir=self._exact_dir(),
             keep_checkpoint=self._settings.save_checkpoints,
+            exact_threads=self._settings.max_threads,
             first_stage=self._filled_stage + 1,
         )
         if self._filled_stage >= 0:

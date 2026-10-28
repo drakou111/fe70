@@ -136,7 +136,10 @@ class ExactProcess:
         files: ExactFiles,
         messages: queue.Queue,
         keep_checkpoint: bool,
+        threads: int = 1,
     ) -> None:
+        if threads < 1:
+            raise ValueError(f"an exact run needs at least 1 thread, got {threads}")
         files.directory.mkdir(parents=True, exist_ok=True)
         command = [
             str(exact_binary()),
@@ -152,6 +155,8 @@ class ExactProcess:
             str(
                 EXACT_LOOKAHEAD
             ),  # a resumed run keeps its checkpoint's lookahead instead
+            "--threads",
+            str(threads),
         ]
         if keep_checkpoint:
             command += ["--checkpoint", str(files.checkpoint)]

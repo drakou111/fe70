@@ -17,7 +17,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,9 +29,11 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -55,6 +59,9 @@ constexpr char CHECKPOINT_MAGIC[8] = {'F', 'E', '7', '0', 'X', 'W', '0', '1'};
 constexpr char CHECKPOINT_END[4] = {'E', 'N', 'D', '!'};
 constexpr size_t IO_CHUNK = 1 << 26;
 constexpr int DEFAULT_START_ROW = 8;
+constexpr int MAX_THREADS = 256;
+// rows this small keep their canonical form, so a repeat of one is confirmed without recomputing it
+constexpr size_t SMALL_ROW_STATES = 1 << 15;
 
 [[noreturn]] void fail(const std::string& message) {
     std::cerr << "error: " << message << "\n" << std::flush;
@@ -327,7 +334,7 @@ struct SDfa {
 // Open-addressing table of int32 ids; key equality and hashing supplied by the caller.
 class IdTable {
 public:
-    IdTable() { slots.assign(1 << 16, -1); }
+    explicit IdTable(size_t initialSlots = 1 << 16) { slots.assign(initialSlots, -1); }
     template <class Eq, class Make>
     int32_t findOrInsert(uint64_t h, Eq eq, Make make, const std::function<uint64_t(int32_t)>& rehashOf) {
         if ((count + 1) * 2 > slots.size()) grow(rehashOf);
@@ -357,6 +364,207 @@ private:
             slots[i] = id;
         }
     }
+};
+
+// A fixed set of worker threads that run one parallel loop at a time; the calling thread works too.
+class Workers {
+public:
+    explicit Workers(int threads) : count(std::max(1, threads)) {
+        for (int i = 1; i < count; i++) pool.emplace_back([this, i] { loop(i); });
+    }
+    ~Workers() {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            stop = true;
+        }
+        wake.notify_all();
+        for (auto& t : pool) t.join();
+    }
+    Workers(const Workers&) = delete;
+    Workers& operator=(const Workers&) = delete;
+
+    int size() const { return count; }
+
+    // body(begin, end) on chunks of [0, n), `grain` items each, spread over the threads
+    void forRange(size_t n, size_t grain, const std::function<void(size_t, size_t)>& body) {
+        forRange(n, grain, [&](size_t b, size_t e, int) { body(b, e); });
+    }
+
+    // the same, with the index (0..size()-1) of the thread running each chunk
+    void forRange(size_t n, size_t grain, const std::function<void(size_t, size_t, int)>& body) {
+        if (n == 0) return;
+        grain = std::max<size_t>(1, grain);
+        if (count == 1 || n <= grain) { body(0, n, 0); return; }
+        {
+            std::lock_guard<std::mutex> lock(m);
+            job = &body;
+            total = n;
+            chunk = grain;
+            nextItem = 0;
+            busy = count - 1;
+            generation++;
+        }
+        wake.notify_all();
+        work(0);
+        std::unique_lock<std::mutex> lock(m);
+        finished.wait(lock, [&] { return busy == 0; });
+        job = nullptr;
+    }
+
+private:
+    int count;
+    std::vector<std::thread> pool;
+    std::mutex m;
+    std::condition_variable wake, finished;
+    const std::function<void(size_t, size_t, int)>* job = nullptr;
+    size_t total = 0, chunk = 1;
+    std::atomic<size_t> nextItem{0};
+    int busy = 0;
+    uint64_t generation = 0;
+    bool stop = false;
+
+    void work(int worker) {
+        while (true) {
+            size_t begin = nextItem.fetch_add(chunk);
+            if (begin >= total) return;
+            (*job)(begin, std::min(total, begin + chunk), worker);
+        }
+    }
+
+    void loop(int worker) {
+        uint64_t seen = 0;
+        while (true) {
+            std::unique_lock<std::mutex> lock(m);
+            wake.wait(lock, [&] { return stop || generation != seen; });
+            if (stop) return;
+            seen = generation;
+            lock.unlock();
+            work(worker);
+            lock.lock();
+            if (--busy == 0) finished.notify_one();
+        }
+    }
+};
+
+// Distinct items interned from many threads at once, in SHARDS separately locked tables. An id is
+// (index in its shard << SHARD_BITS | shard) until finish() numbers all items densely, shard by shard.
+constexpr int SHARD_BITS = 8;
+constexpr uint32_t SHARDS = 1u << SHARD_BITS;
+constexpr uint64_t SHARD_LIMIT = 1ULL << (32 - SHARD_BITS);  // items per shard
+constexpr size_t SHARD_SLOTS = 1 << 8;
+
+inline uint32_t shardOf(uint64_t h) { return (uint32_t)(h >> (64 - SHARD_BITS)); }
+
+class ShardOffsets {
+public:
+    std::array<uint64_t, SHARDS + 1> start{};
+    int32_t dense(uint32_t sparse) const { return (int32_t)(start[sparse & (SHARDS - 1)] + (sparse >> SHARD_BITS)); }
+    uint64_t total() const { return start[SHARDS]; }
+};
+
+template <class T, class Hash>
+class ShardedIds {
+public:
+    ShardedIds() {
+        for (auto& s : shards) s.rehash = [&s](int32_t id) { return Hash{}(s.items[id]); };
+    }
+    uint32_t intern(const T& item) {
+        uint64_t h = Hash{}(item);
+        uint32_t k = shardOf(h);
+        Shard& s = shards[k];
+        std::lock_guard<std::mutex> lock(s.m);
+        int32_t local = s.table.findOrInsert(
+            h, [&](int32_t id) { return s.items[id] == item; },
+            [&]() {
+                if (s.items.size() >= SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
+                s.items.push_back(item);
+                return (int32_t)s.items.size() - 1;
+            },
+            s.rehash);
+        return (uint32_t)local << SHARD_BITS | k;
+    }
+    // every item in dense order, and the map from interned ids to dense ones; empties the shards
+    std::vector<T> finish(ShardOffsets& offsets) {
+        for (uint32_t k = 0; k < SHARDS; k++) offsets.start[k + 1] = offsets.start[k] + shards[k].items.size();
+        if (offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
+        std::vector<T> out;
+        out.reserve(offsets.total());
+        for (auto& s : shards) {
+            out.insert(out.end(), s.items.begin(), s.items.end());
+            std::vector<T>().swap(s.items);
+            s.table = IdTable(SHARD_SLOTS);
+        }
+        return out;
+    }
+
+private:
+    struct Shard {
+        std::mutex m;
+        IdTable table{SHARD_SLOTS};
+        std::vector<T> items;
+        std::function<uint64_t(int32_t)> rehash;
+    };
+    std::array<Shard, SHARDS> shards;
+};
+
+uint64_t hashInts(const int32_t* p, size_t n);
+
+// Sets of int32 (sorted, as the caller hands them in) interned like ShardedIds.
+class ShardedSets {
+public:
+    ShardedSets() {
+        for (auto& s : shards) s.rehash = [&s](int32_t id) { return s.hash[id]; };
+    }
+    uint32_t intern(const std::vector<int32_t>& set) {
+        uint64_t h = hashInts(set.data(), set.size());
+        uint32_t k = shardOf(h);
+        Shard& s = shards[k];
+        std::lock_guard<std::mutex> lock(s.m);
+        auto same = [&](int32_t id) {
+            uint64_t a = s.start[id], b = s.start[id + 1];
+            return b - a == set.size() && std::equal(set.begin(), set.end(), s.pool.begin() + a);
+        };
+        int32_t local = s.table.findOrInsert(h, same, [&]() {
+            if (s.hash.size() >= SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
+            s.pool.insert(s.pool.end(), set.begin(), set.end());
+            s.start.push_back(s.pool.size());
+            s.hash.push_back(h);
+            return (int32_t)s.hash.size() - 1;
+        }, s.rehash);
+        return (uint32_t)local << SHARD_BITS | k;
+    }
+    bool empty() const {
+        for (auto& s : shards) if (!s.hash.empty()) return false;
+        return true;
+    }
+    // every set in dense order (pool and start offsets), and the map from interned ids to dense ones
+    void finish(ShardOffsets& offsets, std::vector<int32_t>& pool, std::vector<uint64_t>& start) {
+        for (uint32_t k = 0; k < SHARDS; k++) offsets.start[k + 1] = offsets.start[k] + shards[k].hash.size();
+        if (offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
+        pool.clear();
+        start.assign(1, 0);
+        start.reserve(offsets.total() + 1);
+        for (auto& s : shards) {
+            uint64_t base = pool.size();
+            pool.insert(pool.end(), s.pool.begin(), s.pool.end());
+            for (size_t i = 1; i < s.start.size(); i++) start.push_back(base + s.start[i]);
+            std::vector<int32_t>().swap(s.pool);
+            s.start.assign(1, 0);
+            std::vector<uint64_t>().swap(s.hash);
+            s.table = IdTable(SHARD_SLOTS);
+        }
+    }
+
+private:
+    struct Shard {
+        std::mutex m;
+        IdTable table{SHARD_SLOTS};
+        std::vector<int32_t> pool;
+        std::vector<uint64_t> start{0};
+        std::vector<uint64_t> hash;
+        std::function<uint64_t(int32_t)> rehash;
+    };
+    std::array<Shard, SHARDS> shards;
 };
 
 uint64_t hashInts(const int32_t* p, size_t n) {
@@ -528,128 +736,164 @@ struct DiskSink {
     }
 };
 
-// One row of the transducer over a layered DFA, layer by layer into the sink.
-void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, DiskSink& sink) {
-    NStateHash nh;
-    std::vector<std::pair<int, NState>> buf;
-    auto expand = [&](const NState& s) {
+// One row of the transducer over a layered DFA, layer by layer into the sink. Each layer is a subset
+// construction: every transducer state of the layer is expanded once (in parallel), then every subset state
+// collects its successor sets per output symbol (in parallel); new states and sets of the next layer go to
+// sharded tables and are numbered densely once the layer is done.
+constexpr size_t EXPAND_CHUNK = 1 << 12;  // transducer states per task
+constexpr size_t SUBSET_CHUNK = 1 << 10;  // subset states per task
+constexpr size_t MINIMIZE_CHUNK = 1 << 14;  // raw states per task when minimizing
+
+struct LayerOutput {  // one task's share of a layer, in subset-state order
+    std::vector<uint8_t> acc, degree, sym;
+    std::vector<uint32_t> tgt;  // interned ids until the next layer is numbered
+};
+
+void writeLayer(std::vector<LayerOutput>& parts, const ShardOffsets& next, DiskSink& sink, Workers& workers) {
+    workers.forRange(parts.size(), 1, [&](size_t b, size_t e) {
+        for (size_t p = b; p < e; p++) for (auto& t : parts[p].tgt) t = (uint32_t)next.dense(t);
+    });
+    sink.beginLayer();
+    for (auto& part : parts) {
+        size_t x = 0;
+        for (size_t i = 0; i < part.acc.size(); i++) {
+            sink.state(part.acc[i], part.sym.data() + x, reinterpret_cast<const int32_t*>(part.tgt.data()) + x, part.degree[i]);
+            x += part.degree[i];
+        }
+        part = LayerOutput();
+    }
+    sink.endLayer();
+}
+
+void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, DiskSink& sink, Workers& workers) {
+    auto expand = [&](const NState& s, std::vector<std::pair<int, NState>>& buf) {
         buf.clear();
         if (s.q >= 0)
             for (uint64_t e = in.off[s.q]; e < in.off[s.q + 1]; e++) stepColumn(oris, s, in.sym[e], in.tgt[e], buf);
         flushStep(s, s.q >= 0 && in.acc[s.q], buf);
     };
     auto isAccept = [&](const NState& s) { return s.q == FLUSH_BASE - 3; };
-
-    struct Layer {
-        std::vector<NState> nstates;
-        IdTable nid;
-        std::vector<int32_t> setPool;
-        std::vector<uint64_t> setStart{0};
-        std::vector<uint64_t> setHash;
-        IdTable did;
-    };
-    auto internN = [&](Layer& L, const NState& s) -> int32_t {
-        std::function<uint64_t(int32_t)> rh = [&](int32_t id) { return nh(L.nstates[id]); };
-        return L.nid.findOrInsert(nh(s), [&](int32_t id) { return L.nstates[id] == s; },
-                                  [&]() { L.nstates.push_back(s); return (int32_t)L.nstates.size() - 1; }, rh);
-    };
-    auto internD = [&](Layer& L, const std::vector<int32_t>& set) -> int32_t {
-        uint64_t h = hashInts(set.data(), set.size());
-        std::function<uint64_t(int32_t)> rh = [&](int32_t id) { return L.setHash[id]; };
-        auto eq = [&](int32_t id) {
-            uint64_t a = L.setStart[id], b = L.setStart[id + 1];
-            return b - a == set.size() && std::equal(set.begin(), set.end(), L.setPool.begin() + a);
-        };
-        return L.did.findOrInsert(h, eq, [&]() {
-            L.setPool.insert(L.setPool.end(), set.begin(), set.end());
-            L.setStart.push_back(L.setPool.size());
-            L.setHash.push_back(h);
-            return (int32_t)L.setHash.size() - 1;
-        }, rh);
+    auto order = [](const NState& a, const NState& b) {
+        return std::tie(a.q, a.cap, a.win, a.pend) < std::tie(b.q, b.cap, b.win, b.pend);
     };
 
     // the first LEFT_REACH columns produce no output
     std::vector<NState> cur{NState{in.start, 0, 0, 0}};
+    std::vector<std::pair<int, NState>> buf;
     for (int k = 0; k < LEFT_REACH; k++) {
         std::vector<NState> nxt;
-        for (auto& s : cur) { expand(s); for (auto& [sy, t] : buf) if (sy == -1) nxt.push_back(t); }
-        std::sort(nxt.begin(), nxt.end(), [](const NState& a, const NState& b) {
-            return std::tie(a.q, a.cap, a.win, a.pend) < std::tie(b.q, b.cap, b.win, b.pend);
-        });
+        for (auto& s : cur) { expand(s, buf); for (auto& [sy, t] : buf) if (sy == -1) nxt.push_back(t); }
+        std::sort(nxt.begin(), nxt.end(), order);
         nxt.erase(std::unique(nxt.begin(), nxt.end()), nxt.end());
         cur.swap(nxt);
     }
     if (cur.empty()) { sink.empty(); return; }
-    auto layer = std::make_unique<Layer>();
-    {
-        std::vector<int32_t> ids;
-        for (auto& s : cur) ids.push_back(internN(*layer, s));
-        std::sort(ids.begin(), ids.end());
-        internD(*layer, ids);
-    }
-    std::array<std::vector<int32_t>, SYMBOLS> succ;
-    std::vector<int32_t> set;
-    uint8_t outSym[SYMBOLS];
-    int32_t outTgt[SYMBOLS];
+
+    // the current layer: its transducer states, and its subset states as sets of their ids
+    std::vector<NState> nstates = std::move(cur);
+    std::vector<int32_t> setPool(nstates.size());
+    for (size_t i = 0; i < nstates.size(); i++) setPool[i] = (int32_t)i;
+    std::vector<uint64_t> setStart{0, nstates.size()};
+
     while (true) {
-        auto next = std::make_unique<Layer>();
-        size_t count = layer->setHash.size();
-        sink.beginLayer();
-        // transitions of this layer's NFA states, computed once (targets are ids in the next layer)
-        std::vector<int64_t> memoOff(layer->nstates.size(), -1);
-        std::vector<uint16_t> memoLen(layer->nstates.size(), 0);
-        std::vector<int8_t> memoSym;
-        std::vector<int32_t> memoTgt;
-        std::vector<char> acceptN(layer->nstates.size(), 0);
-        for (size_t i = 0; i < layer->nstates.size(); i++) acceptN[i] = isAccept(layer->nstates[i]);
-        for (size_t d = 0; d < count; d++) {
-            set.assign(layer->setPool.begin() + layer->setStart[d], layer->setPool.begin() + layer->setStart[d + 1]);
-            bool acc = false;
-            for (auto& v : succ) v.clear();
-            for (int32_t id : set) {
-                if (acceptN[id]) acc = true;
-                if (memoOff[id] < 0) {
-                    expand(layer->nstates[id]);
-                    auto local = buf;
-                    memoOff[id] = (int64_t)memoSym.size();
-                    memoLen[id] = (uint16_t)local.size();
-                    for (auto& [sy, t] : local) { memoSym.push_back((int8_t)sy); memoTgt.push_back(internN(*next, t)); }
+        // every transducer state's moves, with targets as ids of the next layer
+        size_t n = nstates.size(), chunks = (n + EXPAND_CHUNK - 1) / EXPAND_CHUNK;
+        std::vector<std::vector<uint8_t>> moveSym(chunks);
+        std::vector<std::vector<uint32_t>> moveTgt(chunks);
+        std::vector<uint32_t> moveStart(n);
+        std::vector<uint16_t> moveCount(n);
+        std::vector<char> accepting(n);
+        auto nextStates = std::make_unique<ShardedIds<NState, NStateHash>>();
+        workers.forRange(chunks, 1, [&](size_t b, size_t e) {
+            std::vector<std::pair<int, NState>> local;
+            for (size_t c = b; c < e; c++) {
+                for (size_t id = c * EXPAND_CHUNK; id < std::min(n, (c + 1) * EXPAND_CHUNK); id++) {
+                    accepting[id] = isAccept(nstates[id]);
+                    expand(nstates[id], local);
+                    moveStart[id] = (uint32_t)moveSym[c].size();
+                    for (auto& [sy, t] : local) {
+                        if (sy < 0) continue;
+                        moveSym[c].push_back((uint8_t)sy);
+                        moveTgt[c].push_back(nextStates->intern(t));
+                    }
+                    moveCount[id] = (uint16_t)(moveSym[c].size() - moveStart[id]);
                 }
-                for (int64_t e = memoOff[id]; e < memoOff[id] + memoLen[id]; e++) if (memoSym[e] >= 0) succ[memoSym[e]].push_back(memoTgt[e]);
             }
-            int k = 0;
-            for (int a = 0; a < SYMBOLS; a++) {
-                if (succ[a].empty()) continue;
-                std::sort(succ[a].begin(), succ[a].end());
-                succ[a].erase(std::unique(succ[a].begin(), succ[a].end()), succ[a].end());
-                outSym[k] = (uint8_t)a;
-                outTgt[k++] = internD(*next, succ[a]);
+        });
+        ShardOffsets stateIds;
+        std::vector<NState> following = nextStates->finish(stateIds);
+        nextStates.reset();
+        workers.forRange(chunks, 1, [&](size_t b, size_t e) {
+            for (size_t c = b; c < e; c++) for (auto& t : moveTgt[c]) t = (uint32_t)stateIds.dense(t);
+        });
+
+        // every subset state's successor set per symbol
+        size_t sets = setStart.size() - 1, parts = (sets + SUBSET_CHUNK - 1) / SUBSET_CHUNK;
+        std::vector<LayerOutput> out(parts);
+        auto nextSets = std::make_unique<ShardedSets>();
+        workers.forRange(parts, 1, [&](size_t b, size_t e) {
+            std::array<std::vector<int32_t>, SYMBOLS> succ;
+            for (size_t p = b; p < e; p++) {
+                LayerOutput& o = out[p];
+                for (size_t d = p * SUBSET_CHUNK; d < std::min(sets, (p + 1) * SUBSET_CHUNK); d++) {
+                    bool acc = false;
+                    for (auto& v : succ) v.clear();
+                    for (uint64_t i = setStart[d]; i < setStart[d + 1]; i++) {
+                        int32_t id = setPool[i];
+                        if (accepting[id]) acc = true;
+                        const size_t c = id / EXPAND_CHUNK;
+                        for (uint32_t x = moveStart[id]; x < moveStart[id] + moveCount[id]; x++)
+                            succ[moveSym[c][x]].push_back((int32_t)moveTgt[c][x]);
+                    }
+                    uint8_t degree = 0;
+                    for (int a = 0; a < SYMBOLS; a++) {
+                        if (succ[a].empty()) continue;
+                        std::sort(succ[a].begin(), succ[a].end());
+                        succ[a].erase(std::unique(succ[a].begin(), succ[a].end()), succ[a].end());
+                        o.sym.push_back((uint8_t)a);
+                        o.tgt.push_back(nextSets->intern(succ[a]));
+                        degree++;
+                    }
+                    o.acc.push_back(acc);
+                    o.degree.push_back(degree);
+                }
             }
-            sink.state(acc, outSym, outTgt, k);
-        }
-        sink.endLayer();
-        if (next->setHash.empty()) break;
-        layer = std::move(next);
+        });
+        std::vector<std::vector<uint8_t>>().swap(moveSym);
+        std::vector<std::vector<uint32_t>>().swap(moveTgt);
+        bool last = nextSets->empty();
+        ShardOffsets setIds;
+        nextSets->finish(setIds, setPool, setStart);
+        nextSets.reset();
+        writeLayer(out, setIds, sink, workers);
+        if (last) break;
+        nstates = std::move(following);
     }
 }
 
 // The next row's minimal DFA without holding the raw one in memory. Every accepted word has length W, so
 // states of different layers are never equivalent: minimizing each layer against the already minimized
 // next layer, last layer first, gives exactly the minimal DFA.
-SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch);
+SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& workers);
 
-SDfa advanceRow(const std::vector<Orientation>& oris, SDfa& in, const std::string& scratch) {
+SDfa advanceRow(const std::vector<Orientation>& oris, SDfa& in, const std::string& scratch, Workers& workers) {
     DiskSink sink;
     sink.f = fopen(scratch.c_str(), "w+b");
     if (!sink.f) fail("cannot open scratch file " + scratch);
-    transduceLayered(oris, in, sink);
+    auto t0 = std::chrono::steady_clock::now();
+    transduceLayered(oris, in, sink, workers);
     in.release();
-    return minimizeFromDisk(sink, scratch);
+    auto t1 = std::chrono::steady_clock::now();
+    SDfa out = minimizeFromDisk(sink, scratch, workers);
+    auto t2 = std::chrono::steady_clock::now();
+    std::cerr << "    seconds: transduce " << std::chrono::duration<double>(t1 - t0).count() << " minimize "
+              << std::chrono::duration<double>(t2 - t1).count() << "\n" << std::flush;
+    return out;
 }
 
 // The minimal DFA of the layers in a scratch file (each layer's targets are local ids in the next layer),
 // minimized last layer first; deletes the file.
-SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch) {
+SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& workers) {
     if (sink.isEmpty) { fclose(sink.f); std::remove(scratch.c_str()); return SDfa::emptyLanguage(); }
     size_t L = sink.layerPos.size();
     struct MinLayer { std::vector<uint8_t> acc, sym; std::vector<uint32_t> off{0}; std::vector<int32_t> tgt; };
@@ -667,35 +911,65 @@ SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch) {
         readAll(sink.f, sym.data(), e, "scratch");
         readAll(sink.f, tgt.data(), 4 * e, "scratch");
         auto cn = [&](int32_t t) -> int32_t { return t < (int32_t)clsNext.size() ? clsNext[t] : -1; };
-        std::vector<int32_t> cls(n, -1), rep;
-        std::vector<uint64_t> repHash;
-        IdTable table;
-        std::function<uint64_t(int32_t)> rh = [&](int32_t c) { return repHash[c]; };
-        for (uint64_t v = 0; v < n; v++) {
-            bool useful = acc[v];
-            uint64_t h = acc[v] ? HASH_ACCEPT : HASH_REJECT;
-            for (uint32_t x = off[v]; x < off[v + 1]; x++) {
-                int32_t c = cn(tgt[x]);
-                if (c < 0) continue;
-                useful = true;
-                h = mixEdge(h, sym[x], c);
-            }
-            if (!useful) continue;
-            auto sameAs = [&](int32_t c) {
-                int32_t r = rep[c];
-                if (acc[r] != acc[v]) return false;
-                uint32_t a = off[r], ae = off[r + 1], b = off[v], be = off[v + 1];
-                while (true) {
-                    while (a < ae && cn(tgt[a]) < 0) a++;
-                    while (b < be && cn(tgt[b]) < 0) b++;
-                    if (a == ae || b == be) return a == ae && b == be;
-                    if (sym[a] != sym[b] || cn(tgt[a]) != cn(tgt[b])) return false;
-                    a++;
-                    b++;
+        // states with the same acceptance and the same edges into the next layer's classes are one class;
+        // classes are found in sharded tables (in parallel), then numbered densely shard by shard
+        struct ClassShard {
+            std::mutex m;
+            IdTable table{SHARD_SLOTS};
+            std::vector<int32_t> rep;
+            std::vector<uint64_t> hash;
+            std::function<uint64_t(int32_t)> rehash;
+        };
+        auto shards = std::make_unique<std::array<ClassShard, SHARDS>>();
+        for (auto& sh : *shards) sh.rehash = [&sh](int32_t c) { return sh.hash[c]; };
+        std::vector<int32_t> cls(n, -1);
+        std::vector<uint32_t> sparse(n);
+        workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t e) {
+            for (uint64_t v = b; v < e; v++) {
+                bool useful = acc[v];
+                uint64_t h = acc[v] ? HASH_ACCEPT : HASH_REJECT;
+                for (uint32_t x = off[v]; x < off[v + 1]; x++) {
+                    int32_t c = cn(tgt[x]);
+                    if (c < 0) continue;
+                    useful = true;
+                    h = mixEdge(h, sym[x], c);
                 }
-            };
-            cls[v] = table.findOrInsert(h, sameAs, [&]() { rep.push_back((int32_t)v); repHash.push_back(h); return (int32_t)rep.size() - 1; }, rh);
-        }
+                if (!useful) continue;
+                uint32_t k = shardOf(h);
+                ClassShard& sh = (*shards)[k];
+                auto sameAs = [&](int32_t c) {
+                    int32_t r = sh.rep[c];
+                    if (acc[r] != acc[v]) return false;
+                    uint32_t a = off[r], ae = off[r + 1], bb = off[v], be = off[v + 1];
+                    while (true) {
+                        while (a < ae && cn(tgt[a]) < 0) a++;
+                        while (bb < be && cn(tgt[bb]) < 0) bb++;
+                        if (a == ae || bb == be) return a == ae && bb == be;
+                        if (sym[a] != sym[bb] || cn(tgt[a]) != cn(tgt[bb])) return false;
+                        a++;
+                        bb++;
+                    }
+                };
+                std::lock_guard<std::mutex> lock(sh.m);
+                int32_t local = sh.table.findOrInsert(h, sameAs, [&]() {
+                    if (sh.rep.size() >= SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
+                    sh.rep.push_back((int32_t)v);
+                    sh.hash.push_back(h);
+                    return (int32_t)sh.rep.size() - 1;
+                }, sh.rehash);
+                sparse[v] = (uint32_t)local << SHARD_BITS | k;
+                cls[v] = 0;  // useful; numbered below
+            }
+        });
+        ShardOffsets ids;
+        for (uint32_t k = 0; k < SHARDS; k++) ids.start[k + 1] = ids.start[k] + (*shards)[k].rep.size();
+        std::vector<int32_t> rep;
+        rep.reserve(ids.total());
+        for (auto& sh : *shards) rep.insert(rep.end(), sh.rep.begin(), sh.rep.end());
+        shards.reset();
+        workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t e) {
+            for (size_t v = b; v < e; v++) if (cls[v] >= 0) cls[v] = ids.dense(sparse[v]);
+        });
         MinLayer& m = mins[d];
         m.acc.resize(rep.size());
         for (size_t c = 0; c < rep.size(); c++) {
@@ -732,16 +1006,25 @@ SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch) {
     return out;
 }
 
+// Words of length W, one pass over the layers (every state of these automata sits at a single depth).
 double countWords(const SDfa& d, int W) {
-    std::vector<double> cur(d.size(), 0), nxt(d.size(), 0);
-    cur[d.start] = 1;
-    for (int len = 0; len < W; len++) {
-        std::fill(nxt.begin(), nxt.end(), 0.0);
-        for (size_t v = 0; v < d.size(); v++) if (cur[v] != 0) for (uint64_t e = d.off[v]; e < d.off[v + 1]; e++) nxt[d.tgt[e]] += cur[v];
-        cur.swap(nxt);
+    std::vector<double> ways(d.size(), 0);
+    std::vector<int32_t> depth(d.size(), -1), layer{d.start}, next;
+    ways[d.start] = 1;
+    depth[d.start] = 0;
+    for (int len = 0; len < W && !layer.empty(); len++) {
+        next.clear();
+        for (int32_t v : layer)
+            for (uint64_t e = d.off[v]; e < d.off[v + 1]; e++) {
+                int32_t t = d.tgt[e];
+                if (depth[t] < 0) { depth[t] = len + 1; next.push_back(t); }
+                else if (depth[t] != len + 1) fail("an automaton state sits at two depths");
+                ways[t] += ways[v];
+            }
+        layer.swap(next);
     }
     double total = 0;
-    for (size_t v = 0; v < d.size(); v++) if (d.acc[v]) total += cur[v];
+    for (int32_t v : layer) if (d.acc[v]) total += ways[v];
     return total;
 }
 
@@ -809,59 +1092,88 @@ public:
     int depth() const { return rows; }
 
     // the frontiers of d with no bad window (d is a layered DFA of width-W words)
-    // The product of d with the last w-1 columns read is built one column position at a time and written
-    // to the scratch file, then minimized last layer first, so only one layer of it is ever in memory.
-    SDfa keep(const SDfa& d, int W, const std::string& scratch) const {
+    // The product of d with the last w-1 columns read is built one column position at a time (each position's
+    // states in parallel) and written to the scratch file, then minimized last layer first, so only one layer
+    // of it is ever in memory.
+    SDfa keep(const SDfa& d, int W, const std::string& scratch, Workers& workers) const {
         if (rows == 0) return d;
         const int w = std::min(WINDOW_COLS, W);
         const uint64_t mask = w > 1 ? (1ULL << (6 * (w - 1))) - 1 : 0;
-        struct Key { int32_t v; uint64_t hist; bool operator==(const Key& o) const { return v == o.v && hist == o.hist; } };
-        struct KeyHash { size_t operator()(const Key& k) const { return (size_t)((uint64_t)(uint32_t)k.v * 0x9E3779B97F4A7C15ULL ^ k.hist * 0xBF58476D1CE4E5B9ULL); } };
         DiskSink sink;
         sink.f = fopen(scratch.c_str(), "w+b");
         if (!sink.f) fail("cannot open scratch file " + scratch);
-        std::vector<Key> layer{{d.start, 0}}, next;
-        std::unordered_map<Key, int32_t, KeyHash> nextId;
-        uint8_t syms[SYMBOLS];
-        int32_t tgts[SYMBOLS];
+        std::vector<WindowKey> layer{{d.start, 0}};
+        std::vector<std::unordered_map<uint64_t, bool>> caches(workers.size());  // in front of the shared memo
         for (int pos = 0; pos <= W && !layer.empty(); pos++) {
-            sink.beginLayer();
-            next.clear();
-            nextId.clear();
-            for (const Key& key : layer) {
-                int k = 0;
-                for (uint64_t e = d.off[key.v]; e < d.off[key.v + 1]; e++) {
-                    uint64_t window = key.hist << 6 | d.sym[e];
-                    // the window of columns pos-w+1..pos, complete once w columns are read
-                    if (pos + 1 >= w && bad(window, w, pos + 1 == w, pos + 1 == W)) continue;
-                    Key to{d.tgt[e], window & mask};
-                    auto [it, added] = nextId.try_emplace(to, (int32_t)next.size());
-                    if (added) next.push_back(to);
-                    syms[k] = d.sym[e];
-                    tgts[k++] = it->second;
+            size_t parts = (layer.size() + KEEP_CHUNK - 1) / KEEP_CHUNK;
+            std::vector<LayerOutput> out(parts);
+            auto nextKeys = std::make_unique<ShardedIds<WindowKey, WindowKeyHash>>();
+            workers.forRange(parts, 1, [&](size_t b, size_t e, int worker) {
+                auto& cache = caches[worker];
+                for (size_t p = b; p < e; p++) {
+                    LayerOutput& o = out[p];
+                    for (size_t i = p * KEEP_CHUNK; i < std::min(layer.size(), (p + 1) * KEEP_CHUNK); i++) {
+                        const WindowKey& key = layer[i];
+                        uint8_t degree = 0;
+                        for (uint64_t x = d.off[key.v]; x < d.off[key.v + 1]; x++) {
+                            uint64_t window = key.hist << 6 | d.sym[x];
+                            // the window of columns pos-w+1..pos, complete once w columns are read
+                            if (pos + 1 >= w && bad(window, w, pos + 1 == w, pos + 1 == W, cache)) continue;
+                            o.sym.push_back(d.sym[x]);
+                            o.tgt.push_back(nextKeys->intern(WindowKey{d.tgt[x], window & mask}));
+                            degree++;
+                        }
+                        o.acc.push_back(d.acc[key.v]);
+                        o.degree.push_back(degree);
+                    }
                 }
-                sink.state(d.acc[key.v], syms, tgts, k);
-            }
-            sink.endLayer();
+            });
             peakLayer = std::max(peakLayer, layer.size());
-            layer.swap(next);
+            ShardOffsets ids;
+            layer = nextKeys->finish(ids);
+            nextKeys.reset();
+            writeLayer(out, ids, sink, workers);
         }
-        return minimizeFromDisk(sink, scratch);
+        return minimizeFromDisk(sink, scratch, workers);
     }
 
     size_t peak() const { return peakLayer; }  // the largest layer of a window product
 
 private:
+    static constexpr size_t KEEP_CHUNK = 1 << 12;
+    static constexpr int MEMO_SHARDS = 64;
+    struct WindowKey {
+        int32_t v;
+        uint64_t hist;
+        bool operator==(const WindowKey& o) const { return v == o.v && hist == o.hist; }
+    };
+    struct WindowKeyHash {
+        size_t operator()(const WindowKey& k) const {
+            uint64_t h = (uint64_t)(uint32_t)k.v * 0x9E3779B97F4A7C15ULL ^ k.hist * 0xBF58476D1CE4E5B9ULL;
+            h ^= h >> 31;
+            h *= 0x94D049BB133111EBULL;
+            return h ^ (h >> 29);
+        }
+    };
+    struct MemoShard {
+        std::mutex m;
+        std::unordered_map<uint64_t, bool> verdicts;
+    };
     int rows;
     std::vector<std::vector<Cell>> shapes;  // (dr, dc) from the first row-major cell
-    mutable std::unordered_map<uint64_t, bool> memo;
+    mutable std::array<MemoShard, MEMO_SHARDS> memo;
     mutable size_t peakLayer = 0;
 
     // window: w columns of 6 bits, oldest in the highest bits
-    bool bad(uint64_t window, int w, bool leftWall, bool rightWall) const {
+    bool bad(uint64_t window, int w, bool leftWall, bool rightWall, std::unordered_map<uint64_t, bool>& cache) const {
         uint64_t key = window << 3 | (uint64_t)leftWall << 1 | (uint64_t)rightWall;
-        auto it = memo.find(key);
-        if (it != memo.end()) return it->second;
+        if (auto it = cache.find(key); it != cache.end()) return it->second;
+        MemoShard& shard = memo[(key * 0x9E3779B97F4A7C15ULL) >> 58];
+        {
+            std::lock_guard<std::mutex> lock(shard.m);
+            auto it = shard.verdicts.find(key);
+            if (it != shard.verdicts.end()) return cache.emplace(key, it->second).first->second;
+        }
         int left = leftWall ? 0 : WINDOW_MARGIN, right = rightWall ? 0 : WINDOW_MARGIN;
         int width = left + w + right;
         std::vector<uint32_t> cols(width, 0);
@@ -890,7 +1202,9 @@ private:
             return false;
         };
         bool result = !fill();
-        memo.emplace(key, result);
+        cache.emplace(key, result);
+        std::lock_guard<std::mutex> lock(shard.m);
+        shard.verdicts.emplace(key, result);
         return result;
     }
 };
@@ -999,15 +1313,17 @@ struct Options {
     std::vector<Cell> cells;
     std::string cellsText, checkpoint, scratch, dumpDir;
     int lookahead = 0;
+    int threads = 1;
 };
 
 const char* USAGE =
     "usage: exact_width --width W --cells \"x,y x,y ...\" --scratch FILE [--checkpoint FILE] [--start-row R]\n"
-    "                   [--dump DIR] [--lookahead K]\n"
+    "                   [--dump DIR] [--lookahead K] [--threads N]\n"
     "Decides exactly whether the piece's width-W half-strip dies, tiles a rectangle or fills forever.\n"
     "With --checkpoint, resumes from FILE if it exists and rewrites it after every row. The scratch file\n"
     "holds one raw row. --dump writes every row's minimal automaton to DIR/row<r>.dfa. --lookahead K keeps only\n"
-    "frontiers that can fill K more rows (same verdicts; the state counts are of the kept sets).\n";
+    "frontiers that can fill K more rows (same verdicts; the state counts are of the kept sets). --threads N\n"
+    "spreads each row's work over N threads (same verdicts and state counts).\n";
 
 int parseInt(const std::string& text, const char* what) {
     try {
@@ -1049,11 +1365,13 @@ Options parseOptions(int argc, char** argv) {
         else if (a == "--scratch") o.scratch = v;
         else if (a == "--dump") o.dumpDir = v;
         else if (a == "--lookahead") o.lookahead = parseInt(v, "--lookahead");
+        else if (a == "--threads") o.threads = parseInt(v, "--threads");
         else fail("unknown option " + a + "\n" + USAGE);
     }
     if (o.width < 1 || o.width > 2000) fail("--width must be between 1 and 2000");
     if (o.startRow < 0 || o.startRow > 12) fail("--start-row must be between 0 and 12");
     if (o.lookahead < 0 || o.lookahead > 6) fail("--lookahead must be between 0 and 6");
+    if (o.threads < 1 || o.threads > MAX_THREADS) fail("--threads must be between 1 and " + std::to_string(MAX_THREADS));
     if (o.cells.empty() || o.scratch.empty()) fail(std::string("--width, --cells and --scratch are required\n") + USAGE);
     return o;
 }
@@ -1097,6 +1415,7 @@ int main(int argc, char** argv) {
     Options opt = parseOptions(argc, argv);
     auto oris = orientationsOf(opt.cells);
     const int W = opt.width;
+    Workers workers(opt.threads);
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
 
@@ -1123,7 +1442,7 @@ int main(int argc, char** argv) {
     // the full set's row, with every row up to the death as empty kept sets in the counts
     auto deathFrom = [&](SDfa full, int row) {
         while (countWords(full, W) > 0) {
-            full = advanceRow(oris, full, opt.scratch);
+            full = advanceRow(oris, full, opt.scratch, workers);
             row++;
             c.counts.push_back(1);
             std::cout << "row " << row << " states 1 words 0 seconds " << (int64_t)(before + elapsed()) << "\n";
@@ -1135,8 +1454,10 @@ int main(int argc, char** argv) {
     // the kept part of a row's full set; an empty kept part ends the run with the exact death row
     auto kept = [&](SDfa full, int row) -> SDfa {
         if (look.depth() == 0 || countWords(full, W) == 0) return full;
-        SDfa k = look.keep(full, W, opt.scratch);
-        std::cerr << "    kept " << k.size() << " of " << full.size() << " states (largest window layer " << look.peak() << ")\n" << std::flush;
+        auto t = std::chrono::steady_clock::now();
+        SDfa k = look.keep(full, W, opt.scratch, workers);
+        std::cerr << "    kept " << k.size() << " of " << full.size() << " states (largest window layer " << look.peak()
+                  << ", " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count() << " s)\n" << std::flush;
         if (countWords(k, W) > 0) return k;
         c.counts.push_back(1);
         std::cout << "row " << row << " states 1 words 0 seconds " << (int64_t)(before + elapsed()) << "\n";
@@ -1158,6 +1479,7 @@ int main(int argc, char** argv) {
     }
     std::map<std::pair<uint64_t, uint64_t>, int32_t> seen;
     for (auto& s : c.seen) seen.emplace(std::make_pair(s.h1, s.h2), s.row);
+    std::map<int32_t, std::vector<uint64_t>> smallForms;  // rows of this run, not those of a resumed checkpoint
 
     while (true) {
         SDfa& d = c.lang;
@@ -1182,10 +1504,16 @@ int main(int argc, char** argv) {
             // a hash match is confirmed by rebuilding the earlier row and comparing exactly
             int32_t earlier = it->second;
             auto now = canonicalForm(d);
-            auto [r0, first] = firstRow(oris, opt.startRow, W);
-            SDfa e = look.keep(first, W, opt.scratch);
-            for (int r = r0; r < earlier; r++) e = look.keep(advanceRow(oris, e, opt.scratch), W, opt.scratch);
-            if (canonicalForm(e) == now) {
+            bool same;
+            if (auto stored = smallForms.find(earlier); stored != smallForms.end()) {
+                same = stored->second == now;
+            } else {
+                auto [r0, first] = firstRow(oris, opt.startRow, W);
+                SDfa e = look.keep(first, W, opt.scratch, workers);
+                for (int r = r0; r < earlier; r++) e = look.keep(advanceRow(oris, e, opt.scratch, workers), W, opt.scratch, workers);
+                same = canonicalForm(e) == now;
+            }
+            if (same) {
                 printCounts(c.counts);
                 std::cout << "forever " << earlier << " " << c.row << "\n" << std::flush;
                 return 0;
@@ -1194,7 +1522,8 @@ int main(int argc, char** argv) {
         }
         seen.emplace(h, c.row);
         c.seen.push_back({c.row, h.first, h.second});
-        c.lang = kept(advanceRow(oris, d, opt.scratch), c.row + 1);
+        if (d.size() <= SMALL_ROW_STATES) smallForms.emplace(c.row, canonicalForm(d));
+        c.lang = kept(advanceRow(oris, d, opt.scratch, workers), c.row + 1);
         c.row++;
         c.seconds = before + elapsed();
         if (keepCheckpoints) saveCheckpoint(c, opt.checkpoint);
