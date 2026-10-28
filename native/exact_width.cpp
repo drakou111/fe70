@@ -315,9 +315,34 @@ Dfa minimizeDense(const Dfa& d) {
     return out;
 }
 
+// Edge offsets in 5 bytes each instead of 8 (a 32-bit low part and an 8-bit high part, so up to 2^40
+// edges): with about 2 edges per state this is a fifth of a row automaton's memory.
+class Offsets {
+public:
+    Offsets() { push_back(0); }
+    void push_back(uint64_t x) {
+        if (x >> 40) fail("an automaton has too many edges for 40-bit offsets");
+        lo.push_back((uint32_t)x);
+        hi.push_back((uint8_t)(x >> 32));
+    }
+    uint64_t operator[](size_t i) const { return (uint64_t)hi[i] << 32 | lo[i]; }
+    void clear() {
+        std::vector<uint32_t>().swap(lo);
+        std::vector<uint8_t>().swap(hi);
+    }
+    void reserve(size_t n) {
+        lo.reserve(n);
+        hi.reserve(n);
+    }
+
+private:
+    std::vector<uint32_t> lo;
+    std::vector<uint8_t> hi;
+};
+
 // Sparse layered DFA: edges of state v are off[v]..off[v+1], in increasing symbol order.
 struct SDfa {
-    std::vector<uint64_t> off{0};
+    Offsets off;
     std::vector<uint8_t> sym;
     std::vector<int32_t> tgt;
     std::vector<uint8_t> acc;
@@ -1291,9 +1316,11 @@ Checkpoint loadCheckpoint(const std::string& path) {
     readAll(f, d.acc.data(), n, "checkpoint");
     std::vector<uint8_t> degree(n);
     readAll(f, degree.data(), n, "checkpoint");
-    d.off.assign(n + 1, 0);
-    for (uint64_t v = 0; v < n; v++) d.off[v + 1] = d.off[v] + degree[v];
-    if (d.off[n] != e) fail(path + " is damaged (edge count)");
+    d.off = Offsets();
+    d.off.reserve(n + 1);
+    uint64_t edges = 0;
+    for (uint64_t v = 0; v < n; v++) d.off.push_back(edges += degree[v]);
+    if (edges != e) fail(path + " is damaged (edge count)");
     d.sym.resize(e);
     d.tgt.resize(e);
     readAll(f, d.sym.data(), e, "checkpoint");
