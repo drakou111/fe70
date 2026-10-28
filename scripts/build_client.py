@@ -19,10 +19,11 @@ ENTRY = ROOT / "scripts" / "entry.py"
 APP_NAME = "fe70"
 SCRAMBLE_STEP = 73
 EXACT_SOURCE = ROOT / "native" / "exact_width.cpp"
+# its own folder: a development copy in build/native may be running (Windows cannot overwrite it then)
 EXACT_BINARY = (
     ROOT
     / "build"
-    / "native"
+    / "bundle"
     / ("exact_width.exe" if sys.platform == "win32" else "exact_width")
 )
 # MinGW's runtime DLLs would otherwise have to ship next to the program

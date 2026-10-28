@@ -38,15 +38,17 @@ class ExactBinaryMissing(RuntimeError):
 
 
 def exact_binary() -> Path:
-    """The packaged program (PyInstaller), else a development build (scripts/build_client.py builds it into
-    build/native). BINARY_ENV points elsewhere, for tests."""
+    """The packaged program (PyInstaller), else a development build: build/native (built by hand), then
+    build/bundle (scripts/build_client.py). BINARY_ENV points elsewhere, for tests."""
     override = os.environ.get(BINARY_ENV)
     if override:
         candidates = [Path(override)]
     elif getattr(sys, "frozen", False):
         candidates = [Path(sys._MEIPASS) / BINARY_NAME]  # type: ignore[attr-defined]
     else:
-        candidates = [ROOT / "build" / "native" / BINARY_NAME]
+        candidates = [
+            ROOT / "build" / folder / BINARY_NAME for folder in ("native", "bundle")
+        ]
     for path in candidates:
         if path.is_file():
             return path
