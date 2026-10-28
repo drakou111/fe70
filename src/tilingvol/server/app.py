@@ -116,9 +116,8 @@ class Heartbeat(BaseModel):
     # an exact decision: the row it reached and its state count (shown on the page)
     exact_row: int | None = Field(default=None, ge=0, le=MAX_EXACT_ROW)
     exact_states: int | None = Field(default=None, ge=0, le=MAX_EXACT_STATES)
-    exact_resumable: bool = (
-        False  # it saves checkpoints: keep the width for this volunteer
-    )
+    # it saves checkpoints, so keep the width for this volunteer; None: a 0.13.0 app, which always does
+    exact_resumable: bool | None = None
 
 
 class Release(BaseModel):
@@ -398,7 +397,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 job_id,
                 body.exact_row,
                 body.exact_states or 0,
-                body.exact_resumable,
+                body.exact_resumable is not False,
             )
             page_cache["at"] = 0.0
         return {"ok": True}

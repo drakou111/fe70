@@ -271,6 +271,15 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE frames ADD COLUMN symmetric INTEGER NOT NULL DEFAULT 0"
             )
+        progress_columns = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(exact_progress)")
+        }
+        if (
+            "resumable" not in progress_columns
+        ):  # created by version 0.13.0, whose apps always resume
+            self._conn.execute(
+                "ALTER TABLE exact_progress ADD COLUMN resumable INTEGER NOT NULL DEFAULT 1"
+            )
 
     def close(self) -> None:
         with self._lock:

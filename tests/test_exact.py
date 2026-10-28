@@ -452,3 +452,42 @@ def test_the_app_resumes_its_checkpoint_first_and_drops_decided_ones(
     )
     assert status.job.width == SLOW_WIDTH and status.exact_row[0] >= 8
     assert os.path.exists(folder / f"sib-{SLOW_WIDTH}.ckpt")
+
+
+def test_a_0_13_0_database_and_app_keep_working(tmp_path):
+    import sqlite3
+
+    from tilingvol.server.db import Database
+
+    path = tmp_path / "old.sqlite3"
+    with sqlite3.connect(path) as conn:  # the table as version 0.13.0 created it
+        conn.execute(
+            "CREATE TABLE exact_progress (width INTEGER PRIMARY KEY, name TEXT NOT NULL, job_id TEXT NOT NULL,"
+            " row INTEGER NOT NULL, states INTEGER NOT NULL, updated REAL NOT NULL)"
+        )
+        conn.execute("INSERT INTO exact_progress VALUES (150, 'old', 'j', 40, 7, 1.0)")
+    db = Database(path)
+    assert db.exact_progress()[150].resumable  # 0.13.0 apps always saved checkpoints
+    db.set_exact_progress(151, "new", "k", 5, 9, False)
+    assert not db.exact_progress()[151].resumable
+
+
+def test_heartbeats_from_0_13_0_apps_count_as_resumable(exact_config):
+    with TestClient(create_app(exact_config)) as client:
+        job = ask(client).json()
+        client.post(
+            f"/api/jobs/{job['job_id']}/heartbeat",
+            json={
+                "nonce": job["nonce"],
+                "state": "running",
+                "stage_index": 0,
+                "active_s": 5.0,
+                "exact_row": 30,
+                "exact_states": 1234,
+            },
+        )
+        client.post(
+            f"/api/jobs/{job['job_id']}/release",
+            json={"nonce": job["nonce"], "reason": "closed"},
+        )
+        assert ask(client, name="someone else").json()["width"] == 11
