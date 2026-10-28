@@ -269,7 +269,7 @@ def test_known_results_are_seeded_once(tmp_path, sib_config):
     rows = Database(config.db_path).strip_results()
     assert len(rows) == len(known_strips.GUN_STRIPS)
     dead = {r.width for r in rows if r.verdict == "impossible"}
-    assert dead == {135, 137, 141, 142, 143}
+    assert dead == {135, 137, 139, 141, 142, 143}
     scheduler = Scheduler(Database(config.db_path), config)
     assert scheduler.is_dead((140, 142)) and not scheduler.is_dead((140, 144))
     assert scheduler.is_dead((137, 200))
