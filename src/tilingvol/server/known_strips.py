@@ -1,6 +1,7 @@
 """Half-strip depth results found outside the app, added to the database when the server starts (each
-only once). zach's runs use strip_depth_cpsat.py, Drakou111's halfstrip_depth.py of the research repo;
-both cover the first h rows of the width-W half-strip and let pieces stick out above, like the app."""
+only once). zach's runs use strip_depth_cpsat.py, Drakou111's halfstrip_depth.py of the research repo,
+except 137's death, which is exact (cpp/hsw.cpp of the research repo). All cover the first h rows of
+the width-W half-strip and let pieces stick out above, like the app."""
 
 from dataclasses import dataclass
 
@@ -26,6 +27,7 @@ GUN_STRIPS = (
     KnownStrip("zach", 138, 88, VERDICT_FILLED, 0.0),
     KnownStrip("zach", 139, 64, VERDICT_FILLED, 0.0),
     KnownStrip("zach", 144, 112, VERDICT_FILLED, 0.0),
+    KnownStrip("Drakou111", 137, 175, VERDICT_IMPOSSIBLE, 10361.0),
     KnownStrip("Drakou111", 140, 40, VERDICT_FILLED, 114.0),
     KnownStrip("Drakou111", 150, 30, VERDICT_FILLED, 32.0),
     KnownStrip("Drakou111", 160, 44, VERDICT_FILLED, 1449.0),

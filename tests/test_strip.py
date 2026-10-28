@@ -269,9 +269,10 @@ def test_known_results_are_seeded_once(tmp_path, sib_config):
     rows = Database(config.db_path).strip_results()
     assert len(rows) == len(known_strips.GUN_STRIPS)
     dead = {r.width for r in rows if r.verdict == "impossible"}
-    assert dead == {135, 141, 142, 143}
+    assert dead == {135, 137, 141, 142, 143}
     scheduler = Scheduler(Database(config.db_path), config)
     assert scheduler.is_dead((140, 142)) and not scheduler.is_dead((140, 144))
+    assert scheduler.is_dead((137, 200))
 
 
 def test_a_real_run_rules_out_widths_and_sends_pictures(
@@ -387,7 +388,11 @@ def test_sums_of_live_widths_fill_forever_and_are_never_scheduled(strip_config):
         refused = request(client, size=(22, None))
         assert refused.status_code == 409 and "fills forever (11 + 11)" in refused.text
         page = client.get("/").text
-        assert "FILLS FOREVER" in page and "Fills forever (a repeating filling, or a sum of 11, such widths)" in page
+        assert (
+            "FILLS FOREVER" in page
+            and "Fills forever (a repeating filling, or a sum of 11, such widths)"
+            in page
+        )
 
 
 def test_area_bound_matches_the_size_it_names(strip_config):
