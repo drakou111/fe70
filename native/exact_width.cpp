@@ -1122,6 +1122,7 @@ public:
     // of it is ever in memory.
     SDfa keep(const SDfa& d, int W, const std::string& scratch, Workers& workers) const {
         if (rows == 0) return d;
+        if (W > WINDOW_COLS && filterCovers(d, workers)) return keepFiltered(d, W, scratch, workers);
         const int w = std::min(WINDOW_COLS, W);
         const uint64_t mask = w > 1 ? (1ULL << (6 * (w - 1))) - 1 : 0;
         DiskSink sink;
@@ -1162,9 +1163,172 @@ public:
         return minimizeFromDisk(sink, scratch, workers);
     }
 
+    // keep() through the window filter: the product's second component is the filter's state
+    SDfa keepFiltered(const SDfa& d, int W, const std::string& scratch, Workers& workers) const {
+        const Filter& f = *filter;
+        DiskSink sink;
+        sink.f = fopen(scratch.c_str(), "w+b");
+        if (!sink.f) fail("cannot open scratch file " + scratch);
+        std::vector<WindowKey> layer{{d.start, (uint64_t)f.start}};
+        for (int pos = 0; pos <= W && !layer.empty(); pos++) {
+            size_t parts = (layer.size() + KEEP_CHUNK - 1) / KEEP_CHUNK;
+            std::vector<LayerOutput> out(parts);
+            auto nextKeys = std::make_unique<ShardedIds<WindowKey, WindowKeyHash>>();
+            workers.forRange(parts, 1, [&](size_t b, size_t e) {
+                for (size_t p = b; p < e; p++) {
+                    LayerOutput& o = out[p];
+                    for (size_t i = p * KEEP_CHUNK; i < std::min(layer.size(), (p + 1) * KEEP_CHUNK); i++) {
+                        const WindowKey& key = layer[i];
+                        const size_t row = (size_t)key.hist * f.m;
+                        uint8_t degree = 0;
+                        for (uint64_t x = d.off[key.v]; x < d.off[key.v + 1]; x++) {
+                            int32_t next = f.next[row + f.index[d.sym[x]]];
+                            if (next == f.dead) continue;
+                            o.sym.push_back(d.sym[x]);
+                            o.tgt.push_back(nextKeys->intern(WindowKey{d.tgt[x], (uint64_t)next}));
+                            degree++;
+                        }
+                        o.acc.push_back(d.acc[key.v] && f.acc[key.hist]);
+                        o.degree.push_back(degree);
+                    }
+                }
+            });
+            peakLayer = std::max(peakLayer, layer.size());
+            ShardOffsets ids;
+            layer = nextKeys->finish(ids);
+            nextKeys.reset();
+            writeLayer(out, ids, sink, workers);
+        }
+        return minimizeFromDisk(sink, scratch, workers);
+    }
+
     size_t peak() const { return peakLayer; }  // the largest layer of a window product
 
 private:
+    static constexpr size_t MAX_FILTER_ALPHABET = 12;  // 12^7 windows, three tests each
+    static constexpr size_t FILTER_CHUNK = 1 << 14;
+    struct Filter {
+        std::array<int8_t, 64> index;  // symbol -> letter, -1 outside the alphabet
+        int m = 0;
+        std::vector<int32_t> next;  // state * m + letter
+        std::vector<uint8_t> acc;
+        int32_t start = 0, dead = 0;
+        size_t states = 0;
+    };
+    mutable std::unique_ptr<Filter> filter;
+
+    // Whether a filter covering d's symbols exists, building (or widening) it when that alphabet is small
+    // enough. The kept sets are the same either way; the filter only makes keep() faster and smaller.
+    bool filterCovers(const SDfa& d, Workers& workers) const {
+        std::array<char, 64> used{};
+        for (uint8_t s : d.sym) used[s] = 1;
+        if (filter) {
+            bool covered = true;
+            for (int s = 0; s < 64; s++) if (used[s] && filter->index[s] < 0) covered = false;
+            if (covered) return true;
+            for (int s = 0; s < 64; s++) if (filter->index[s] >= 0) used[s] = 1;
+        }
+        std::vector<int> alphabet;
+        for (int s = 0; s < 64; s++) if (used[s]) alphabet.push_back(s);
+        if (alphabet.size() > MAX_FILTER_ALPHABET) return false;
+        auto t = std::chrono::steady_clock::now();
+        buildFilter(alphabet, workers);
+        std::cerr << "    window filter over " << alphabet.size() << " symbols: " << filter->states << " states ("
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count() << " s)\n"
+                  << std::flush;
+        return true;
+    }
+
+    // The minimal DFA of the words (over `alphabet`) that keep() keeps for widths > WINDOW_COLS: the first
+    // complete window is tested with the left wall, later ones without walls, and the last one with the right
+    // wall instead (a state accepts when its last window passes that test). Every window over the alphabet
+    // is tested once, in parallel; the DFA's states are the prefixes shorter than a window and the last
+    // WINDOW_COLS-1 symbols with the result of the right-wall test, minimized by Moore refinement.
+    void buildFilter(const std::vector<int>& alphabet, Workers& workers) const {
+        const int m = (int)alphabet.size(), w = WINDOW_COLS;
+        uint64_t windows = 1;
+        for (int i = 0; i < w; i++) windows *= m;
+        const uint64_t histories = windows / m;
+        constexpr uint8_t BAD_NONE = 1, BAD_LEFT = 2, BAD_RIGHT = 4;
+        std::vector<uint8_t> verdict(windows, 0);
+        workers.forRange(windows, FILTER_CHUNK, [&](size_t b, size_t e) {
+            for (uint64_t i = b; i < e; i++) {
+                uint64_t window = 0, rest = i;
+                std::array<int, WINDOW_COLS> digit{};
+                for (int c = w - 1; c >= 0; c--) { digit[c] = (int)(rest % m); rest /= m; }
+                for (int c = 0; c < w; c++) window = window << 6 | (uint64_t)alphabet[digit[c]];
+                uint8_t v = 0;
+                if (badUncached(window, w, false, false)) v |= BAD_NONE;
+                if (badUncached(window, w, true, false)) v |= BAD_LEFT;
+                if (badUncached(window, w, false, true)) v |= BAD_RIGHT;
+                verdict[i] = v;
+            }
+        });
+        // raw states: prefixes of length 0..w-1, then (history, accepts) pairs, END, DEAD
+        std::vector<uint64_t> prefixBase(w);
+        uint64_t n = 0;
+        for (uint64_t len = 0, size = 1; len < (uint64_t)w; len++, size *= m) { prefixBase[len] = n; n += size; }
+        const uint64_t steadyBase = n;
+        n += 2 * histories;
+        const uint64_t END = n++, DEAD = n++;
+        if (n * m >= INT32_MAX) fail("the window filter's alphabet is too large");
+        std::vector<int32_t> raw(n * m, (int32_t)DEAD);
+        std::vector<uint8_t> rawAcc(n, 0);
+        rawAcc[END] = 1;
+        for (uint64_t len = 0, size = 1; len + 1 < (uint64_t)w; len++, size *= m)
+            for (uint64_t v = 0; v < size; v++)
+                for (int a = 0; a < m; a++) raw[(prefixBase[len] + v) * m + a] = (int32_t)(prefixBase[len + 1] + v * m + a);
+        for (uint64_t v = 0; v < histories; v++)
+            for (int a = 0; a < m; a++) {
+                uint64_t win = v * m + a;
+                if (!(verdict[win] & BAD_LEFT)) raw[(prefixBase[w - 1] + v) * m + a] = (int32_t)(steadyBase + 2 * (win % histories));
+            }
+        for (uint64_t h = 0; h < histories; h++)
+            for (int acc = 0; acc < 2; acc++) {
+                uint64_t s = steadyBase + 2 * h + acc;
+                rawAcc[s] = (uint8_t)acc;
+                for (int a = 0; a < m; a++) {
+                    uint64_t win = h * m + a;
+                    bool goodNone = !(verdict[win] & BAD_NONE), goodRight = !(verdict[win] & BAD_RIGHT);
+                    uint64_t t = DEAD;
+                    if (goodNone) t = steadyBase + 2 * (win % histories) + (goodRight ? 1 : 0);
+                    else if (goodRight) t = END;
+                    raw[s * m + a] = (int32_t)t;
+                }
+            }
+        std::vector<uint8_t>().swap(verdict);
+        // Moore refinement
+        std::vector<int32_t> cls(n), nextCls(n);
+        for (uint64_t s = 0; s < n; s++) cls[s] = rawAcc[s];
+        size_t classes = 2;
+        std::vector<int32_t> key(m + 1);
+        while (true) {
+            std::map<std::vector<int32_t>, int32_t> sig;
+            for (uint64_t s = 0; s < n; s++) {
+                key[0] = cls[s];
+                for (int a = 0; a < m; a++) key[a + 1] = cls[raw[s * m + a]];
+                nextCls[s] = sig.try_emplace(key, (int32_t)sig.size()).first->second;
+            }
+            cls.swap(nextCls);
+            if (sig.size() == classes) break;
+            classes = sig.size();
+        }
+        auto f = std::make_unique<Filter>();
+        f->index.fill(-1);
+        for (int a = 0; a < m; a++) f->index[alphabet[a]] = (int8_t)a;
+        f->m = m;
+        f->next.assign(classes * m, -1);
+        f->acc.assign(classes, 0);
+        for (uint64_t s = 0; s < n; s++) {
+            f->acc[cls[s]] = rawAcc[s];
+            for (int a = 0; a < m; a++) f->next[(size_t)cls[s] * m + a] = cls[raw[s * m + a]];
+        }
+        f->start = cls[prefixBase[0]];
+        f->dead = cls[DEAD];
+        f->states = classes;
+        filter = std::move(f);
+    }
+
     static constexpr size_t KEEP_CHUNK = 1 << 12;
     static constexpr int MEMO_SHARDS = 64;
     struct WindowKey {
@@ -1199,6 +1363,14 @@ private:
             auto it = shard.verdicts.find(key);
             if (it != shard.verdicts.end()) return cache.emplace(key, it->second).first->second;
         }
+        bool result = badUncached(window, w, leftWall, rightWall);
+        cache.emplace(key, result);
+        std::lock_guard<std::mutex> lock(shard.m);
+        shard.verdicts.emplace(key, result);
+        return result;
+    }
+
+    bool badUncached(uint64_t window, int w, bool leftWall, bool rightWall) const {
         int left = leftWall ? 0 : WINDOW_MARGIN, right = rightWall ? 0 : WINDOW_MARGIN;
         int width = left + w + right;
         std::vector<uint32_t> cols(width, 0);
@@ -1226,11 +1398,7 @@ private:
             }
             return false;
         };
-        bool result = !fill();
-        cache.emplace(key, result);
-        std::lock_guard<std::mutex> lock(shard.m);
-        shard.verdicts.emplace(key, result);
-        return result;
+        return !fill();
     }
 };
 
