@@ -49,6 +49,7 @@ from tilingvol.shared.protocol import (
     MAX_PEAK_RAM_MB,
     NO_LIMIT,
     PERIODIC_SINCE,
+    RELEASE_CLOSED,
     RELEASE_REASONS,
     SEARCH_EXACT,
     SEARCH_FOREVER,
@@ -439,6 +440,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if job.state != "active":
             return {"ok": True}
         db.end_job(job_id, "released", body.reason, body.peak_ram_mb or None)
+        if job.lane == LANE_EXACT:
+            if body.reason != RELEASE_CLOSED:
+                # given up, out of memory or failed: nobody will resume it, so the width is free again
+                db.drop_exact_progress(job.width, job_id)
+            page_cache["at"] = 0.0  # the run shows as paused or gone instead of running
         log.info("job %s released: %s %s", job_id, body.reason, body.detail)
         return {"ok": True}
 

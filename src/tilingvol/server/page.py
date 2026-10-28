@@ -493,17 +493,33 @@ def exact_outcome_text(outcome: str, row: int, repeat_from: int, width: int) -> 
     return f"a {width} x {row} rectangle tiles (being checked)"
 
 
-def render_exact(db: Database) -> str:
-    """Exact width decisions, finished and running."""
+def exact_progress_text(p, active: bool) -> str:
+    if active:
+        return f"running: row {p.row} reached ({p.states:,} states)"
+    return f"paused at row {p.row} ({p.states:,} states); {p.name} can resume it"
+
+
+def render_exact(db: Database, reserve_s: float) -> str:
+    """Exact width decisions, finished, running, and paused ones their volunteer can still resume."""
     results = db.exact_results()[::-1]
-    running = sorted(db.exact_progress().values(), key=lambda p: p.width)
+    # a width counts as running while any exact job holds it (a resumed run reports its first row later)
+    active = {j.width for j in db.active_jobs() if j.lane == LANE_EXACT}
+    now = time.time()
+    running = sorted(
+        (
+            p
+            for p in db.exact_progress().values()
+            if p.width in active or (p.resumable and now - p.updated < reserve_s)
+        ),
+        key=lambda p: p.width,
+    )
     rows = "".join(
         f"<tr><td>width {r.width}</td><td>{escape(exact_outcome_text(r.outcome, r.row, r.repeat_from, r.width))}"
         f'</td><td>{escape(r.name)}</td><td class="num">{hours(r.compute_s)}</td>'
         f'<td class="num">{ago(r.submitted)}</td></tr>'
         for r in results
     ) + "".join(
-        f"<tr><td>width {p.width}</td><td>running: row {p.row} reached ({p.states:,} states)</td>"
+        f"<tr><td>width {p.width}</td><td>{escape(exact_progress_text(p, p.width in active))}</td>"
         f'<td>{escape(p.name)}</td><td class="num">-</td><td class="num">{ago(p.updated)}</td></tr>'
         for p in running
     )
@@ -833,7 +849,7 @@ checked by a complete computer search.</p>
 <div class="map">{"".join(parts)}<div class="tip" hidden></div></div>
 <p class="note">{map_note(piece, dead)}</p></section>
 {render_widths(db, scheduler, states, active)}
-{render_exact(db)}
+{render_exact(db, config.exact_reserve_s)}
 {gallery_html}
 <div class="two">
 <section class="card"><h2>Running now</h2>{running_html}</section>

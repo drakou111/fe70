@@ -482,7 +482,7 @@ def test_forever_and_rectangle_outcomes(exact_config, submit_key):
         assert f"a {width} x {height} rectangle tiles" in client.get("/").text
 
 
-def beat_and_release(client, job, resumable: bool) -> None:
+def beat_and_release(client, job, resumable: bool, reason: str = "closed") -> None:
     beat = client.post(
         f"/api/jobs/{job['job_id']}/heartbeat",
         json={
@@ -499,7 +499,7 @@ def beat_and_release(client, job, resumable: bool) -> None:
     assert "row 30 reached (1,234 states)" in client.get("/").text
     client.post(
         f"/api/jobs/{job['job_id']}/release",
-        json={"nonce": job["nonce"], "reason": "closed"},
+        json={"nonce": job["nonce"], "reason": reason},
     )
 
 
@@ -513,7 +513,27 @@ def test_a_checkpointed_width_stays_with_its_volunteer(exact_config):
         assert ask(client).json()["width"] == 21
         taken = ask(client, width=14, name="another one")
         assert taken.status_code == 409 and "can resume it" in taken.text
+        assert (
+            "paused at row 30 (1,234 states); someone else can resume it"
+            in client.get("/").text
+        )
         assert ask(client, width=14, name="someone else").json()["width"] == 14
+
+
+def test_a_given_up_exact_run_frees_its_width_at_once(exact_config):
+    """Giving up or running out of memory: nobody will resume the run, even with a checkpoint."""
+    with TestClient(create_app(exact_config)) as client:
+        for reason in ("gave_up", "memory"):
+            job = ask(client).json()
+            beat_and_release(client, job, resumable=True, reason=reason)
+            page = client.get("/").text
+            assert "row 30 reached" not in page and "paused at row 30" not in page
+            again = ask(client, width=job["width"], name="someone else")
+            assert again.status_code == 200, again.text
+            client.post(
+                f"/api/jobs/{again.json()['job_id']}/release",
+                json={"nonce": again.json()["nonce"], "reason": "gave_up"},
+            )
 
 
 # a real run
@@ -595,6 +615,22 @@ def test_a_0_13_0_database_and_app_keep_working(tmp_path):
     assert db.exact_progress()[150].resumable  # 0.13.0 apps always saved checkpoints
     db.set_exact_progress(151, "new", "k", 5, 9, False)
     assert not db.exact_progress()[151].resumable
+
+
+def test_progress_of_runs_given_up_before_the_fix_is_dropped_at_startup(tmp_path):
+    db = Database(tmp_path / "db.sqlite3")
+    for job_id, reason in (("gone", "memory"), ("paused", "closed")):
+        db._conn.execute(
+            "INSERT INTO jobs (job_id, nonce, width, height, name, ip, lane, stages, threads, est_ram_mb,"
+            " client_version, created, heartbeat, state, end_reason) VALUES"
+            " (?, 'n', ?, 0, 'v', '', 'exact', '[]', 1, 1, '0.13.3', 0, 0, 'released', ?)",
+            (job_id, 30 if job_id == "gone" else 31, reason),
+        )
+        db.set_exact_progress(
+            30 if job_id == "gone" else 31, "v", job_id, 12, 99, resumable=True
+        )
+    db.close()
+    assert set(Database(tmp_path / "db.sqlite3").exact_progress()) == {31}
 
 
 def test_heartbeats_from_0_13_0_apps_count_as_resumable(exact_config):

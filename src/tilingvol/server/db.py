@@ -289,6 +289,11 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE exact_progress ADD COLUMN resumable INTEGER NOT NULL DEFAULT 1"
             )
+        # runs given back for good before 0.14.0's server dropped their progress on release
+        self._conn.execute(
+            "DELETE FROM exact_progress WHERE job_id IN (SELECT job_id FROM jobs WHERE state = 'released'"
+            " AND end_reason != 'closed')"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -766,6 +771,14 @@ class Database:
                 " job_id = excluded.job_id, row = excluded.row, states = excluded.states,"
                 " resumable = excluded.resumable, updated = excluded.updated",
                 (width, name, job_id, row, states, int(resumable), time.time()),
+            )
+
+    def drop_exact_progress(self, width: int, job_id: str) -> None:
+        """Forget a run's progress (it was given back), unless another job has reported on the width since."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM exact_progress WHERE width = ? AND job_id = ?",
+                (width, job_id),
             )
 
     def exact_progress(self) -> dict[int, ExactProgressRow]:
