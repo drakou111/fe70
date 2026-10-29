@@ -510,7 +510,11 @@ def test_forever_and_rectangle_outcomes(exact_config, submit_key):
         # rows that cycle without the flat frontier: no rectangle has a side 12, at any height
         scheduler = Scheduler(Database(exact_config.db_path), exact_config)
         assert width in scheduler.dead_widths() and scheduler.is_dead((width, 35))
-        assert "no row was flat" in client.get("/").text
+        page = client.get("/").text
+        assert "no row was flat" in page
+        # 12 itself has its own colour; 24 = 12 + 12 only fills forever
+        assert "ruled out every rectangle with this side<b>1</b>" in page
+        assert "rectangles not ruled out yet<b>" in page
         # 24 = 12 + 12 fills forever too, but only an exact run can tell whether it is a side
         assert ask(client, width=2 * width).json()["width"] == 2 * width
 

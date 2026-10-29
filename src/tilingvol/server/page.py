@@ -59,7 +59,7 @@ STYLE = """
 :root {
   --bg: #f6f7f5; --card: #ffffff; --fg: #1b1f1d; --muted: #66706b; --line: #e3e6e3;
   --todo: #e4e7e4; --timed: #f59f00; --run: #4263eb; --found: #fab005; --flag: #e8590c; --accent: #2b8a3e;
-  --sym: #b197fc; --alive: #74c0fc; --forever: #20c997;
+  --sym: #b197fc; --alive: #74c0fc; --forever: #20c997; --closed: #0b7285;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #121514; --card: #1b1f1d; --fg: #e9ecea; --muted: #98a29d; --line: #2c322f; --todo: #2e3431; }
@@ -397,12 +397,15 @@ def render_widths(
     live_table = scheduler.live_table()
     certified = scheduler.certified_widths()
     exact = scheduler.exact_decided()
-    counts = {"dead": 0, "forever": 0, "alive": 0, "running": 0, "todo": 0}
+    counts = {"dead": 0, "closed": 0, "forever": 0, "alive": 0, "running": 0, "todo": 0}
     for w in widths:
         s = states.get(w)
         x = px(w)
         live = live_table.get(w)
-        if live is not None:
+        decided = exact.get(w)
+        if decided is not None and decided.outcome == EXACT_FOREVER:
+            status, fill, rows = "closed", "var(--closed)", top_rows
+        elif live is not None:
             status, fill, rows = "forever", "var(--forever)", top_rows
         elif s is not None and s.dead:
             status, fill, rows = "dead", "var(--accent)", s.dead_rows
@@ -434,14 +437,26 @@ def render_widths(
         ("running", "var(--run)", "Running now"),
         ("todo", "var(--todo)", "Not searched yet"),
     ]
-    if scheduler.piece.live_bases or certified:
+    if scheduler.piece.live_bases or certified or counts["forever"]:
         bases = "".join(f"{b}, " for b in sorted(scheduler.piece.live_bases))
         legend_items.insert(
             1,
             (
                 "forever",
                 "var(--forever)",
-                f"Fills forever (a repeating filling, or a sum of {bases}such widths)",
+                (
+                    f"Fills forever (a repeating filling, or a sum of {bases}such widths); rectangles not "
+                    "ruled out yet"
+                ),
+            ),
+        )
+    if counts["closed"]:
+        legend_items.insert(
+            1,
+            (
+                "closed",
+                "var(--closed)",
+                "Fills forever, and an exact run ruled out every rectangle with this side",
             ),
         )
     legend = "".join(
