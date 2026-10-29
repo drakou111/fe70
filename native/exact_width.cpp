@@ -123,14 +123,16 @@ struct Dfa {
 };
 
 // Transducer state (one input column consumed per step).
-// win: columns c-3..c-1 (finalized except output), 7 bits each; pend: columns c..c+6 from placed pieces
+// win: columns c-3..c-1 (finalized except output), 7 bits each; pend: columns c..c+6 from placed pieces.
+// cap and win share one 32-bit word: a layer holds tens of millions of these, and 16 bytes beat 24.
 struct NState {
     int32_t q;
-    uint8_t cap;  // min(columns processed, 3)
-    uint32_t win;
+    uint32_t cap : 2;  // min(columns processed, 3)
+    uint32_t win : 3 * COL_BITS;
     uint64_t pend;
     bool operator==(const NState& o) const { return q == o.q && cap == o.cap && win == o.win && pend == o.pend; }
 };
+static_assert(sizeof(NState) == 16, "a transducer state should pack into 16 bytes");
 struct NStateHash {
     size_t operator()(const NState& s) const {
         uint64_t h = (uint64_t)(uint32_t)s.q * 0x9E3779B97F4A7C15ULL ^ ((uint64_t)s.win << 3 | s.cap);
@@ -1043,7 +1045,8 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
     };
     auto isAccept = [&](const NState& s) { return s.q == FLUSH_BASE - 3; };
     auto order = [](const NState& a, const NState& b) {
-        return std::tie(a.q, a.cap, a.win, a.pend) < std::tie(b.q, b.cap, b.win, b.pend);
+        return std::make_tuple(a.q, (uint32_t)a.cap, (uint32_t)a.win, a.pend) <
+               std::make_tuple(b.q, (uint32_t)b.cap, (uint32_t)b.win, b.pend);
     };
 
     // the first LEFT_REACH columns produce no output
@@ -1108,6 +1111,7 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         });
         Segmented<NState> following = nextStates->finish();
         nextStates.reset();
+        nstates = Segmented<NState>();  // the subset phase needs only their moves
         in.get(++inputDepth, input);
         uint64_t moves = 0;
         for (const auto& m : moveSym) moves += m.size();
