@@ -273,6 +273,14 @@ def test_known_results_are_seeded_once(tmp_path, sib_config):
     scheduler = Scheduler(Database(config.db_path), config)
     assert scheduler.is_dead((140, 142)) and not scheduler.is_dead((140, 144))
     assert scheduler.is_dead((137, 200))
+    certified = scheduler.certified_widths()
+    assert set(certified) == {c.width for c in known_strips.GUN_CERTIFICATES}
+    assert (
+        Database(config.db_path).periodic_certificate(certified[208].result_id)
+        is not None
+    )
+    live = scheduler.live_table()
+    assert live[208] == (208,) and 160 not in live
 
 
 def test_a_real_run_rules_out_widths_and_sends_pictures(

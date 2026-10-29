@@ -689,6 +689,37 @@ class Database:
                 ),
             )
 
+    def import_periodic_certificate(
+        self,
+        width: int,
+        start: int,
+        period: int,
+        duration_s: float,
+        name: str,
+        placements: list,
+    ) -> bool:
+        """Add a known certificate unless one for this width was imported before; True if added."""
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "INSERT INTO periodic_results (width, start, period, verdict, duration_s, name, submitted,"
+                    " source, placements) SELECT ?,?,?,?,?,?,?, 'import', ? WHERE NOT EXISTS (SELECT 1"
+                    " FROM periodic_results WHERE source = 'import' AND width = ?)",
+                    (
+                        width,
+                        start,
+                        period,
+                        PERIODIC_FOUND,
+                        duration_s,
+                        name,
+                        time.time(),
+                        json.dumps(placements),
+                        width,
+                    ),
+                ).rowcount
+                > 0
+            )
+
     def periodic_results(self) -> list[PeriodicResultRow]:
         with self._lock:
             rows = self._conn.execute(

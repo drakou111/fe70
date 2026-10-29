@@ -190,8 +190,8 @@ class RateLimiter:
 def create_app(config: ServerConfig | None = None) -> FastAPI:
     config = config or ServerConfig.from_env()
     db = Database(config.db_path)
-    if added := known_strips.seed(db, config.piece.name):
-        log.info("added %d known strip results", added)
+    if added := known_strips.seed(db, config.piece):
+        log.info("added %d known strip results and certificates", added)
     scheduler = Scheduler(db, config)
     limiter = RateLimiter(config.max_requests_per_minute)
     pick_lock = threading.Lock()
