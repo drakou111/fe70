@@ -9,6 +9,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,6 +18,7 @@ from tests.conftest import wait_for
 from tests.test_end_to_end import controller, settings  # noqa: F401 - fixture
 from tests.test_server import NAME, post_result
 from tilingvol.client import controller as controller_module
+from tilingvol.client.controller import Controller
 from tilingvol.client.exact_runner import (
     BINARY_ENV,
     MSG_EXACT_DONE,
@@ -38,6 +40,7 @@ from tilingvol.shared.protocol import (
     EXACT_FOREVER,
     EXACT_RECTANGLE,
     EXACT_SINCE,
+    RELEASE_MEMORY,
     SEARCH_EXACT,
     ExactOutcome,
 )
@@ -657,6 +660,58 @@ def test_the_app_resumes_its_checkpoint_first_and_drops_decided_ones(
     )
     assert status.job.width == SLOW_WIDTH and status.exact_row[0] >= 8
     assert os.path.exists(folder / f"sib-{SLOW_WIDTH}.ckpt")
+
+
+def test_the_list_comes_before_checkpoints_and_giving_up_deletes_one(
+    exact_config,
+    make_live_server,
+    controller,  # noqa: F811 - fixture
+    use_binary,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(controller_module, "MIN_FREE_DISK_MB", 1)
+    folder = tmp_path / "exact-folder"
+    run_width(folder, SLOW_WIDTH, stop_after_row=8)
+    server = make_live_server(exact_config)
+    c, recorder = controller
+    c.start(
+        replace(
+            settings(server.url),
+            search=SEARCH_EXACT,
+            exact_folder=str(folder),
+            save_checkpoints=True,
+        ).validated(),
+        widths=WidthQueue((SIB_FOREVER[0],)),
+    )
+    # the listed width runs first; the checkpoint is resumed once the list is used up
+    wait_for(lambda: recorder.has("resuming from its checkpoint"), TIMEOUT_S)
+    assert [r.width for r in server.db.exact_results()] == [SIB_FOREVER[0]]
+    wait_for(lambda: (s := recorder.last_status()) and s.exact_row, TIMEOUT_S)
+    c.give_up()
+    wait_for(lambda: recorder.has("Gave up"), TIMEOUT_S)
+    assert checkpointed_widths(folder) == []
+
+
+def test_running_out_of_memory_skips_resuming_that_width(tmp_path):
+    """The same run would run out of memory at the same row; the checkpoint stays for a bigger Max RAM."""
+    folder = tmp_path / "exact-folder"
+    run_settings = replace(
+        settings("http://127.0.0.1:1"),
+        search=SEARCH_EXACT,
+        exact_folder=str(folder),
+        save_checkpoints=True,
+    ).validated()
+    folder.mkdir()
+    (folder / f"sib-{SLOW_WIDTH}.ckpt").write_bytes(b"checkpoint")
+    c = Controller(tmp_path, b"k" * 32, lambda event: None)
+    c._settings = run_settings
+    c._api = SimpleNamespace(release=lambda *args: None)
+    assert c._checkpoint_to_resume() == SLOW_WIDTH
+    c._job = SimpleNamespace(exact=True, width=SLOW_WIDTH)
+    c._release(RELEASE_MEMORY, "out of memory")
+    assert c._checkpoint_to_resume() is None
+    assert checkpointed_widths(folder) == [SLOW_WIDTH]
 
 
 def test_a_0_13_0_database_and_app_keep_working(tmp_path):

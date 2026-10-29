@@ -361,7 +361,7 @@ class Controller:
         requested: tuple[int, int | None] | None = None,
         widths: WidthQueue | None = None,
     ) -> None:
-        """widths: the volunteer's own strip widths, shared by the parallel searches (width search only)."""
+        """widths: the volunteer's own widths, shared by the parallel searches (width and exact searches)."""
         self._commands.put(("start", settings, requested, widths))
 
     def pause(self) -> None:
@@ -483,10 +483,11 @@ class Controller:
         settings = self._settings
         width, height = self._requested or (None, None)
         queued = resumed = None
-        if width is None and settings.search == SEARCH_EXACT:
-            resumed = width = self._checkpoint_to_resume()
+        # the volunteer's own list first, then their unfinished checkpoints, then the server's pick
         if width is None and self._widths is not None:
             queued = width = self._widths.claim(self)
+        if width is None and settings.search == SEARCH_EXACT:
+            resumed = width = self._checkpoint_to_resume()
         try:
             self._job = self._api.request_job(
                 settings.name,
@@ -607,6 +608,16 @@ class Controller:
             if width not in self._resume_skipped:
                 return width
         return None
+
+    def _give_up_checkpoints(self, width: int) -> None:
+        """Given up for good: the server frees the width, so its checkpoint must not be resumed either."""
+        try:
+            self._drop_checkpoints(width)
+        except OSError as error:
+            self._resume_skipped.add(width)
+            self._log(
+                f"Could not delete the checkpoint of width {width} ({error}); delete it by hand."
+            )
 
     def _drop_checkpoints(self, width: int) -> None:
         for path in self._exact_dir().glob(f"*-{width}.ckpt"):
@@ -968,6 +979,11 @@ class Controller:
                 self._widths.drop(self)
             else:
                 self._widths.release(self)
+        if job.exact and reason == RELEASE_GAVE_UP:
+            self._give_up_checkpoints(job.width)
+        elif job.exact and reason == RELEASE_MEMORY:
+            # the same run would run out of memory at the same row; the checkpoint stays for a bigger Max RAM
+            self._resume_skipped.add(job.width)
         self._send_frame(job)
         self._unsent_frame = None
         try:
