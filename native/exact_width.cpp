@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <span>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -336,6 +337,14 @@ public:
         lo.reserve(n);
         hi.reserve(n);
     }
+    void resize(size_t n) {
+        lo.resize(n);
+        hi.resize(n);
+    }
+    void set(size_t i, uint64_t x) {  // x < 2^40, checked by the caller
+        lo[i] = (uint32_t)x;
+        hi[i] = (uint8_t)(x >> 32);
+    }
 
 private:
     std::vector<uint32_t> lo;
@@ -487,6 +496,50 @@ public:
     std::array<uint64_t, SHARDS + 1> start{};
     int32_t dense(uint32_t sparse) const { return (int32_t)(start[sparse & (SHARDS - 1)] + (sparse >> SHARD_BITS)); }
     uint64_t total() const { return start[SHARDS]; }
+    // the shard holding dense index i (the last k with start[k] <= i, so never an empty shard)
+    uint32_t shardOf(uint64_t i) const {
+        return (uint32_t)(std::upper_bound(start.begin(), start.end(), i) - start.begin() - 1);
+    }
+};
+
+// A layer's items as the shards built them, moved in rather than concatenated: dense index i is item
+// i - offsets.start[k] of segment k.
+template <class T>
+class Segmented {
+public:
+    std::array<std::vector<T>, SHARDS> segment;
+    ShardOffsets offsets;
+    Segmented() = default;
+    explicit Segmented(std::vector<T> items) {
+        for (uint32_t k = 1; k <= SHARDS; k++) offsets.start[k] = items.size();
+        segment[0] = std::move(items);
+    }
+    size_t size() const { return offsets.total(); }
+    bool empty() const { return size() == 0; }
+    const T& operator[](uint64_t i) const {
+        uint32_t k = offsets.shardOf(i);
+        return segment[k][i - offsets.start[k]];
+    }
+};
+
+// Sets of int32 the same way: each shard's pool and set offsets moved in; a set lies in one shard.
+class SegmentedSets {
+public:
+    std::array<std::vector<int32_t>, SHARDS> pool;
+    std::array<std::vector<uint64_t>, SHARDS> start;  // start[k][j]..start[k][j + 1] in pool[k]
+    ShardOffsets offsets;
+    explicit SegmentedSets(std::vector<int32_t> set) {
+        for (uint32_t k = 1; k <= SHARDS; k++) offsets.start[k] = 1;
+        start[0] = {0, set.size()};
+        pool[0] = std::move(set);
+    }
+    SegmentedSets() = default;
+    size_t size() const { return offsets.total(); }
+    std::span<const int32_t> operator[](uint64_t d) const {
+        uint32_t k = offsets.shardOf(d);
+        uint64_t j = d - offsets.start[k];
+        return {pool[k].data() + start[k][j], start[k][j + 1] - start[k][j]};
+    }
 };
 
 template <class T, class Hash>
@@ -510,16 +563,15 @@ public:
             s.rehash);
         return (uint32_t)local << SHARD_BITS | k;
     }
-    // every item in dense order, and the map from interned ids to dense ones; empties the shards
-    std::vector<T> finish(ShardOffsets& offsets) {
-        for (uint32_t k = 0; k < SHARDS; k++) offsets.start[k + 1] = offsets.start[k] + shards[k].items.size();
-        if (offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
-        std::vector<T> out;
-        out.reserve(offsets.total());
-        for (auto& s : shards) {
-            out.insert(out.end(), s.items.begin(), s.items.end());
-            std::vector<T>().swap(s.items);
-            s.table = IdTable(SHARD_SLOTS);
+    // every item in dense order (its offsets also map interned ids to dense ones); empties the shards
+    Segmented<T> finish() {
+        Segmented<T> out;
+        for (uint32_t k = 0; k < SHARDS; k++) out.offsets.start[k + 1] = out.offsets.start[k] + shards[k].items.size();
+        if (out.offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
+        for (uint32_t k = 0; k < SHARDS; k++) {
+            out.segment[k] = std::move(shards[k].items);
+            shards[k].items.clear();  // moved-from: make it certainly empty
+            shards[k].table = IdTable(SHARD_SLOTS);
         }
         return out;
     }
@@ -564,22 +616,21 @@ public:
         for (auto& s : shards) if (!s.hash.empty()) return false;
         return true;
     }
-    // every set in dense order (pool and start offsets), and the map from interned ids to dense ones
-    void finish(ShardOffsets& offsets, std::vector<int32_t>& pool, std::vector<uint64_t>& start) {
-        for (uint32_t k = 0; k < SHARDS; k++) offsets.start[k + 1] = offsets.start[k] + shards[k].hash.size();
-        if (offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
-        pool.clear();
-        start.assign(1, 0);
-        start.reserve(offsets.total() + 1);
-        for (auto& s : shards) {
-            uint64_t base = pool.size();
-            pool.insert(pool.end(), s.pool.begin(), s.pool.end());
-            for (size_t i = 1; i < s.start.size(); i++) start.push_back(base + s.start[i]);
-            std::vector<int32_t>().swap(s.pool);
+    // every set in dense order (its offsets also map interned ids to dense ones); empties the shards
+    SegmentedSets finish() {
+        SegmentedSets out;
+        for (uint32_t k = 0; k < SHARDS; k++) out.offsets.start[k + 1] = out.offsets.start[k] + shards[k].hash.size();
+        if (out.offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
+        for (uint32_t k = 0; k < SHARDS; k++) {
+            Shard& s = shards[k];
+            out.pool[k] = std::move(s.pool);
+            s.pool.clear();
+            out.start[k] = std::move(s.start);
             s.start.assign(1, 0);
             std::vector<uint64_t>().swap(s.hash);
             s.table = IdTable(SHARD_SLOTS);
         }
+        return out;
     }
 
 private:
@@ -733,34 +784,13 @@ void writeValue(FILE* f, const T& v, const char* what) { writeAll(f, &v, sizeof 
 template <class T>
 T readValue(FILE* f, const char* what) { T v; readAll(f, &v, sizeof v, what); return v; }
 
-// Writes each output layer of the transducer to a scratch file: n, e, acc[n], off[n+1] (uint32), sym[e],
-// tgt[e] (local ids in the next layer). Memory stays at one layer.
+// The transducer's output layers in a scratch file, each as n, e, acc[n], off[n+1] (uint32), sym[e],
+// tgt[e] (local ids in the next layer); writeLayer() streams them there straight from the tasks' buffers.
 struct DiskSink {
     FILE* f = nullptr;
     bool isEmpty = false;
     std::vector<int64_t> layerPos;
-    std::vector<uint8_t> acc, sym;
-    std::vector<uint32_t> off;
-    std::vector<int32_t> tgt;
     void empty() { isEmpty = true; }
-    void beginLayer() { acc.clear(); sym.clear(); tgt.clear(); off.assign(1, 0); }
-    void state(bool a, const uint8_t* s, const int32_t* t, int k) {
-        acc.push_back(a);
-        sym.insert(sym.end(), s, s + k);
-        tgt.insert(tgt.end(), t, t + k);
-        if (sym.size() > UINT32_MAX) fail("a layer has too many edges for 32-bit offsets");
-        off.push_back((uint32_t)sym.size());
-    }
-    void endLayer() {
-        layerPos.push_back(FTELL(f));
-        uint64_t n = acc.size(), e = sym.size();
-        writeValue(f, n, "scratch");
-        writeValue(f, e, "scratch");
-        writeAll(f, acc.data(), n, "scratch");
-        writeAll(f, off.data(), 4 * (n + 1), "scratch");
-        writeAll(f, sym.data(), e, "scratch");
-        writeAll(f, tgt.data(), 4 * e, "scratch");
-    }
 };
 
 // The words Lookahead::keep() keeps, as a minimal DFA over a small frontier alphabet (Lookahead::buildFilter).
@@ -793,16 +823,34 @@ void writeLayer(std::vector<LayerOutput>& parts, const ShardOffsets& next, DiskS
     workers.forRange(parts.size(), 1, [&](size_t b, size_t e) {
         for (size_t p = b; p < e; p++) for (auto& t : parts[p].tgt) t = (uint32_t)next.dense(t);
     });
-    sink.beginLayer();
-    for (auto& part : parts) {
-        size_t x = 0;
-        for (size_t i = 0; i < part.acc.size(); i++) {
-            sink.state(part.acc[i], part.sym.data() + x, reinterpret_cast<const int32_t*>(part.tgt.data()) + x, part.degree[i]);
-            x += part.degree[i];
-        }
-        part = LayerOutput();
+    uint64_t n = 0, e = 0;
+    for (const auto& part : parts) {
+        n += part.acc.size();
+        e += part.sym.size();
     }
-    sink.endLayer();
+    if (e > UINT32_MAX) fail("a layer has too many edges for 32-bit offsets");
+    sink.layerPos.push_back(FTELL(sink.f));
+    writeValue(sink.f, n, "scratch");
+    writeValue(sink.f, e, "scratch");
+    for (const auto& part : parts) writeAll(sink.f, part.acc.data(), part.acc.size(), "scratch");
+    uint32_t edges = 0;
+    writeValue(sink.f, edges, "scratch");
+    std::vector<uint32_t> off;
+    for (auto& part : parts) {
+        off.resize(part.degree.size());
+        for (size_t i = 0; i < off.size(); i++) off[i] = edges += part.degree[i];
+        writeAll(sink.f, off.data(), 4 * off.size(), "scratch");
+        std::vector<uint8_t>().swap(part.degree);
+        std::vector<uint8_t>().swap(part.acc);
+    }
+    for (auto& part : parts) {
+        writeAll(sink.f, part.sym.data(), part.sym.size(), "scratch");
+        std::vector<uint8_t>().swap(part.sym);
+    }
+    for (auto& part : parts) {
+        writeAll(sink.f, part.tgt.data(), 4 * part.tgt.size(), "scratch");
+        std::vector<uint32_t>().swap(part.tgt);
+    }
 }
 
 void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, DiskSink& sink, Workers& workers,
@@ -831,11 +879,11 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
     if (cur.empty()) { sink.empty(); return; }
 
     // the current layer: its transducer states, and its subset states as sets of their ids
-    std::vector<NState> nstates = std::move(cur);
-    std::vector<int32_t> setPool(nstates.size());
-    for (size_t i = 0; i < nstates.size(); i++) setPool[i] = (int32_t)i;
-    if (filter) setPool.push_back(-(filter->start + 1));
-    std::vector<uint64_t> setStart{0, setPool.size()};
+    std::vector<int32_t> first(cur.size());
+    for (size_t i = 0; i < cur.size(); i++) first[i] = (int32_t)i;
+    if (filter) first.push_back(-(filter->start + 1));
+    Segmented<NState> nstates(std::move(cur));
+    SegmentedSets setsOf(std::move(first));
 
     while (true) {
         // every transducer state's moves, with targets as ids of the next layer
@@ -849,9 +897,13 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
             std::vector<std::pair<int, NState>> local;
             for (size_t c = b; c < e; c++) {
-                for (size_t id = c * EXPAND_CHUNK; id < std::min(n, (c + 1) * EXPAND_CHUNK); id++) {
-                    accepting[id] = isAccept(nstates[id]);
-                    expand(nstates[id], local);
+                const size_t lo = c * EXPAND_CHUNK, hi = std::min(n, (c + 1) * EXPAND_CHUNK);
+                uint32_t k = nstates.offsets.shardOf(lo);
+                for (size_t id = lo; id < hi; id++) {
+                    while (id >= nstates.offsets.start[k + 1]) k++;
+                    const NState& from = nstates.segment[k][id - nstates.offsets.start[k]];
+                    accepting[id] = isAccept(from);
+                    expand(from, local);
                     moveStart[id] = (uint32_t)moveSym[c].size();
                     for (auto& [sy, t] : local) {
                         if (sy < 0) continue;
@@ -862,15 +914,14 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
                 }
             }
         });
-        ShardOffsets stateIds;
-        std::vector<NState> following = nextStates->finish(stateIds);
+        Segmented<NState> following = nextStates->finish();
         nextStates.reset();
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
-            for (size_t c = b; c < e; c++) for (auto& t : moveTgt[c]) t = (uint32_t)stateIds.dense(t);
+            for (size_t c = b; c < e; c++) for (auto& t : moveTgt[c]) t = (uint32_t)following.offsets.dense(t);
         });
 
         // every subset state's successor set per symbol
-        size_t sets = setStart.size() - 1, parts = (sets + SUBSET_CHUNK - 1) / SUBSET_CHUNK;
+        size_t sets = setsOf.size(), parts = (sets + SUBSET_CHUNK - 1) / SUBSET_CHUNK;
         std::vector<LayerOutput> out(parts);
         auto nextSets = std::make_unique<ShardedSets>();
         workers.forRange(parts, 1, [&](size_t b, size_t e) {
@@ -880,11 +931,12 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
                 for (size_t d = p * SUBSET_CHUNK; d < std::min(sets, (p + 1) * SUBSET_CHUNK); d++) {
                     bool acc = false;
                     for (auto& v : succ) v.clear();
-                    uint64_t end = setStart[d + 1];
+                    std::span<const int32_t> set = setsOf[d];
+                    size_t end = set.size();
                     int32_t state = 0;  // the filter's
-                    if (filter) state = -setPool[--end] - 1;
-                    for (uint64_t i = setStart[d]; i < end; i++) {
-                        int32_t id = setPool[i];
+                    if (filter) state = -set[--end] - 1;
+                    for (size_t i = 0; i < end; i++) {
+                        int32_t id = set[i];
                         if (accepting[id]) acc = true;
                         const size_t c = id / EXPAND_CHUNK;
                         for (uint32_t x = moveStart[id]; x < moveStart[id] + moveCount[id]; x++)
@@ -914,10 +966,9 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
         std::vector<std::vector<uint8_t>>().swap(moveSym);
         std::vector<std::vector<uint32_t>>().swap(moveTgt);
         bool last = nextSets->empty();
-        ShardOffsets setIds;
-        nextSets->finish(setIds, setPool, setStart);
+        setsOf = nextSets->finish();
         nextSets.reset();
-        writeLayer(out, setIds, sink, workers);
+        writeLayer(out, setsOf.offsets, sink, workers);
         if (last) break;
         nstates = std::move(following);
     }
@@ -947,16 +998,17 @@ SDfa advanceRow(const std::vector<Orientation>& oris, SDfa& in, const std::strin
 }
 
 // The minimal DFA of the layers in a scratch file (each layer's targets are local ids in the next layer),
-// minimized last layer first; deletes the file.
+// minimized last layer first; deletes the file. Each minimized layer is appended to the same file, and the
+// result is read back into arrays of its exact size, so the minimized layers are never in memory twice.
 SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& workers) {
     if (sink.isEmpty) { fclose(sink.f); std::remove(scratch.c_str()); return SDfa::emptyLanguage(); }
     size_t L = sink.layerPos.size();
-    struct MinLayer { std::vector<uint8_t> acc, sym; std::vector<uint32_t> off{0}; std::vector<int32_t> tgt; };
-    std::vector<MinLayer> mins(L);
+    struct Spilled { int64_t pos; uint64_t states, edges; };
+    std::vector<Spilled> mins(L);
     std::vector<int32_t> clsNext;
-    std::vector<uint8_t> acc, sym;
-    std::vector<uint32_t> off;
-    std::vector<int32_t> tgt;
+    std::vector<uint8_t> acc, sym, minAcc, minSym;
+    std::vector<uint32_t> off, minOff;
+    std::vector<int32_t> tgt, minTgt;
     for (size_t d = L; d-- > 0;) {
         if (FSEEK(sink.f, sink.layerPos[d], SEEK_SET) != 0) fail("scratch file seek failed");
         uint64_t n = readValue<uint64_t>(sink.f, "scratch"), e = readValue<uint64_t>(sink.f, "scratch");
@@ -965,7 +1017,11 @@ SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& worke
         readAll(sink.f, off.data(), 4 * (n + 1), "scratch");
         readAll(sink.f, sym.data(), e, "scratch");
         readAll(sink.f, tgt.data(), 4 * e, "scratch");
-        auto cn = [&](int32_t t) -> int32_t { return t < (int32_t)clsNext.size() ? clsNext[t] : -1; };
+        // every target as a class of the next layer, or -1 where it leads nowhere: looked up once
+        workers.forRange(e, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
+            const int32_t known = (int32_t)clsNext.size();
+            for (size_t x = b; x < end; x++) tgt[x] = tgt[x] < known ? clsNext[tgt[x]] : -1;
+        });
         // states with the same acceptance and the same edges into the next layer's classes are one class;
         // classes are found in sharded tables (in parallel), then numbered densely shard by shard
         struct ClassShard {
@@ -979,15 +1035,14 @@ SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& worke
         for (auto& sh : *shards) sh.rehash = [&sh](int32_t c) { return sh.hash[c]; };
         std::vector<int32_t> cls(n, -1);
         std::vector<uint32_t> sparse(n);
-        workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t e) {
-            for (uint64_t v = b; v < e; v++) {
+        workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
+            for (uint64_t v = b; v < end; v++) {
                 bool useful = acc[v];
                 uint64_t h = acc[v] ? HASH_ACCEPT : HASH_REJECT;
                 for (uint32_t x = off[v]; x < off[v + 1]; x++) {
-                    int32_t c = cn(tgt[x]);
-                    if (c < 0) continue;
+                    if (tgt[x] < 0) continue;
                     useful = true;
-                    h = mixEdge(h, sym[x], c);
+                    h = mixEdge(h, sym[x], tgt[x]);
                 }
                 if (!useful) continue;
                 uint32_t k = shardOf(h);
@@ -997,10 +1052,10 @@ SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& worke
                     if (acc[r] != acc[v]) return false;
                     uint32_t a = off[r], ae = off[r + 1], bb = off[v], be = off[v + 1];
                     while (true) {
-                        while (a < ae && cn(tgt[a]) < 0) a++;
-                        while (bb < be && cn(tgt[bb]) < 0) bb++;
+                        while (a < ae && tgt[a] < 0) a++;
+                        while (bb < be && tgt[bb] < 0) bb++;
                         if (a == ae || bb == be) return a == ae && bb == be;
-                        if (sym[a] != sym[bb] || cn(tgt[a]) != cn(tgt[bb])) return false;
+                        if (sym[a] != sym[bb] || tgt[a] != tgt[bb]) return false;
                         a++;
                         bb++;
                     }
@@ -1018,66 +1073,90 @@ SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& worke
         });
         ShardOffsets ids;
         for (uint32_t k = 0; k < SHARDS; k++) ids.start[k + 1] = ids.start[k] + (*shards)[k].rep.size();
-        std::vector<int32_t> rep;
-        rep.reserve(ids.total());
-        for (auto& sh : *shards) rep.insert(rep.end(), sh.rep.begin(), sh.rep.end());
+        Segmented<int32_t> rep;
+        rep.offsets = ids;
+        for (uint32_t k = 0; k < SHARDS; k++) rep.segment[k] = std::move((*shards)[k].rep);
         shards.reset();
-        workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t e) {
-            for (size_t v = b; v < e; v++) if (cls[v] >= 0) cls[v] = ids.dense(sparse[v]);
+        workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
+            for (size_t v = b; v < end; v++) if (cls[v] >= 0) cls[v] = ids.dense(sparse[v]);
         });
+        std::vector<uint32_t>().swap(sparse);
         // exact sizes first (edge counts per class, then their prefix sums), so the layer is filled in place
-        MinLayer& m = mins[d];
         size_t classes = rep.size();
-        m.acc.resize(classes);
-        m.off.assign(classes + 1, 0);
-        workers.forRange(classes, MINIMIZE_CHUNK, [&](size_t b, size_t e) {
-            for (size_t c = b; c < e; c++) {
+        minAcc.resize(classes);
+        minOff.assign(classes + 1, 0);
+        workers.forRange(classes, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
+            for (size_t c = b; c < end; c++) {
                 int32_t r = rep[c];
-                m.acc[c] = acc[r];
+                minAcc[c] = acc[r];
                 uint32_t kept = 0;
-                for (uint32_t x = off[r]; x < off[r + 1]; x++) kept += cn(tgt[x]) >= 0;
-                m.off[c + 1] = kept;
+                for (uint32_t x = off[r]; x < off[r + 1]; x++) kept += tgt[x] >= 0;
+                minOff[c + 1] = kept;
             }
         });
-        for (size_t c = 0; c < classes; c++) m.off[c + 1] += m.off[c];
-        m.sym.resize(m.off[classes]);
-        m.tgt.resize(m.off[classes]);
-        workers.forRange(classes, MINIMIZE_CHUNK, [&](size_t b, size_t e) {
-            for (size_t c = b; c < e; c++) {
+        for (size_t c = 0; c < classes; c++) minOff[c + 1] += minOff[c];
+        minSym.resize(minOff[classes]);
+        minTgt.resize(minOff[classes]);
+        workers.forRange(classes, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
+            for (size_t c = b; c < end; c++) {
                 int32_t r = rep[c];
-                uint32_t at = m.off[c];
+                uint32_t at = minOff[c];
                 for (uint32_t x = off[r]; x < off[r + 1]; x++) {
-                    int32_t t = cn(tgt[x]);
-                    if (t < 0) continue;
-                    m.sym[at] = sym[x];
-                    m.tgt[at++] = t;
+                    if (tgt[x] < 0) continue;
+                    minSym[at] = sym[x];
+                    minTgt[at++] = tgt[x];
                 }
             }
         });
+        if (FSEEK(sink.f, 0, SEEK_END) != 0) fail("scratch file seek failed");
+        mins[d] = {FTELL(sink.f), classes, minSym.size()};
+        writeAll(sink.f, minAcc.data(), classes, "scratch");
+        writeAll(sink.f, minOff.data(), 4 * (classes + 1), "scratch");
+        writeAll(sink.f, minSym.data(), minSym.size(), "scratch");
+        writeAll(sink.f, minTgt.data(), 4 * minTgt.size(), "scratch");
         clsNext.swap(cls);
     }
+    for (auto* v : {&acc, &sym, &minAcc, &minSym}) std::vector<uint8_t>().swap(*v);
+    for (auto* v : {&off, &minOff}) std::vector<uint32_t>().swap(*v);
+    for (auto* v : {&tgt, &minTgt}) std::vector<int32_t>().swap(*v);
+    if (clsNext.empty() || clsNext[0] < 0) {
+        fclose(sink.f);
+        std::remove(scratch.c_str());
+        return SDfa::emptyLanguage();
+    }
+    std::vector<int64_t> base(L + 1, 0);
+    std::vector<uint64_t> edgeBase(L + 1, 0);
+    for (size_t d = 0; d < L; d++) {
+        base[d + 1] = base[d] + (int64_t)mins[d].states;
+        edgeBase[d + 1] = edgeBase[d] + mins[d].edges;
+    }
+    if (base[L] >= INT32_MAX) fail("the minimal DFA is too large for 32-bit ids");
+    if (edgeBase[L] >> 40) fail("an automaton has too many edges for 40-bit offsets");
+    SDfa out;
+    out.acc.resize(base[L]);
+    out.off.resize(base[L] + 1);
+    out.sym.resize(edgeBase[L]);
+    out.tgt.resize(edgeBase[L]);
+    std::vector<uint32_t> localOff;
+    for (size_t d = 0; d < L; d++) {
+        const uint64_t n = mins[d].states, e = mins[d].edges;
+        if (FSEEK(sink.f, mins[d].pos, SEEK_SET) != 0) fail("scratch file seek failed");
+        localOff.resize(n + 1);
+        readAll(sink.f, out.acc.data() + base[d], n, "scratch");
+        readAll(sink.f, localOff.data(), 4 * (n + 1), "scratch");
+        readAll(sink.f, out.sym.data() + edgeBase[d], e, "scratch");
+        readAll(sink.f, out.tgt.data() + edgeBase[d], 4 * e, "scratch");
+        workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
+            for (size_t c = b; c < end; c++) out.off.set(base[d] + c, edgeBase[d] + localOff[c]);
+        });
+        const int32_t shift = (int32_t)base[d + 1];
+        workers.forRange(e, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
+            for (size_t x = edgeBase[d] + b; x < edgeBase[d] + end; x++) out.tgt[x] += shift;
+        });
+    }
+    out.off.set(base[L], edgeBase[L]);
     fclose(sink.f);
     std::remove(scratch.c_str());
-    if (clsNext.empty() || clsNext[0] < 0) return SDfa::emptyLanguage();
-    std::vector<int64_t> base(L + 1, 0);
-    for (size_t d = 0; d < L; d++) base[d + 1] = base[d] + (int64_t)mins[d].acc.size();
-    if (base[L] >= INT32_MAX) fail("the minimal DFA is too large for 32-bit ids");
-    size_t edges = 0;
-    for (const MinLayer& m : mins) edges += m.sym.size();
-    SDfa out;
-    out.acc.reserve(base[L]);
-    out.off.reserve(base[L] + 1);
-    out.sym.reserve(edges);
-    out.tgt.reserve(edges);
-    for (size_t d = 0; d < L; d++) {
-        MinLayer& m = mins[d];
-        for (size_t c = 0; c < m.acc.size(); c++) {
-            out.acc.push_back(m.acc[c]);
-            for (uint32_t x = m.off[c]; x < m.off[c + 1]; x++) { out.sym.push_back(m.sym[x]); out.tgt.push_back((int32_t)(base[d + 1] + m.tgt[x])); }
-            out.off.push_back(out.sym.size());
-        }
-        m = MinLayer();
-    }
     out.start = (int32_t)(base[0] + clsNext[0]);
     return out;
 }
@@ -1179,7 +1258,7 @@ public:
         DiskSink sink;
         sink.f = fopen(scratch.c_str(), "w+b");
         if (!sink.f) fail("cannot open scratch file " + scratch);
-        std::vector<WindowKey> layer{{d.start, 0}};
+        Segmented<WindowKey> layer(std::vector<WindowKey>{{d.start, 0}});
         std::vector<std::unordered_map<uint64_t, bool>> caches(workers.size());  // in front of the shared memo
         for (int pos = 0; pos <= W && !layer.empty(); pos++) {
             size_t parts = (layer.size() + KEEP_CHUNK - 1) / KEEP_CHUNK;
@@ -1206,10 +1285,9 @@ public:
                 }
             });
             peakLayer = std::max(peakLayer, layer.size());
-            ShardOffsets ids;
-            layer = nextKeys->finish(ids);
+            layer = nextKeys->finish();
             nextKeys.reset();
-            writeLayer(out, ids, sink, workers);
+            writeLayer(out, layer.offsets, sink, workers);
         }
         return minimizeFromDisk(sink, scratch, workers);
     }
@@ -1220,7 +1298,7 @@ public:
         DiskSink sink;
         sink.f = fopen(scratch.c_str(), "w+b");
         if (!sink.f) fail("cannot open scratch file " + scratch);
-        std::vector<WindowKey> layer{{d.start, (uint64_t)f.start}};
+        Segmented<WindowKey> layer(std::vector<WindowKey>{{d.start, (uint64_t)f.start}});
         for (int pos = 0; pos <= W && !layer.empty(); pos++) {
             size_t parts = (layer.size() + KEEP_CHUNK - 1) / KEEP_CHUNK;
             std::vector<LayerOutput> out(parts);
@@ -1245,10 +1323,9 @@ public:
                 }
             });
             peakLayer = std::max(peakLayer, layer.size());
-            ShardOffsets ids;
-            layer = nextKeys->finish(ids);
+            layer = nextKeys->finish();
             nextKeys.reset();
-            writeLayer(out, ids, sink, workers);
+            writeLayer(out, layer.offsets, sink, workers);
         }
         return minimizeFromDisk(sink, scratch, workers);
     }
