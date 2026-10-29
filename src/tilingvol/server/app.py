@@ -443,7 +443,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if job.lane == LANE_EXACT:
             if body.reason != RELEASE_CLOSED:
                 # given up, out of memory or failed: nobody will resume it, so the width is free again
-                db.drop_exact_progress(job.width, job_id)
+                db.drop_exact_progress(job.width, job_id, job.name)
             page_cache["at"] = 0.0  # the run shows as paused or gone instead of running
         log.info("job %s released: %s %s", job_id, body.reason, body.detail)
         return {"ok": True}

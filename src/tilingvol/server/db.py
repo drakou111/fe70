@@ -773,12 +773,14 @@ class Database:
                 (width, name, job_id, row, states, int(resumable), time.time()),
             )
 
-    def drop_exact_progress(self, width: int, job_id: str) -> None:
-        """Forget a run's progress (it was given back), unless another job has reported on the width since."""
+    def drop_exact_progress(self, width: int, job_id: str, name: str) -> None:
+        """Forget a run's progress (it was given back), unless someone else has reported on the width since.
+        Matching the name too covers a resumed run given back before it reported a row: the progress is
+        still under the earlier job's id."""
         with self._lock:
             self._conn.execute(
-                "DELETE FROM exact_progress WHERE width = ? AND job_id = ?",
-                (width, job_id),
+                "DELETE FROM exact_progress WHERE width = ? AND (job_id = ? OR name = ?)",
+                (width, job_id, name),
             )
 
     def exact_progress(self) -> dict[int, ExactProgressRow]:

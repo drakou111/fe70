@@ -577,6 +577,21 @@ def test_a_given_up_exact_run_frees_its_width_at_once(exact_config):
             )
 
 
+def test_giving_up_a_resumed_run_frees_its_width(exact_config):
+    """A resumed run given back before it reports a row still drops the checkpoint it inherited."""
+    with TestClient(create_app(exact_config)) as client:
+        job = ask(client).json()
+        beat_and_release(client, job, resumable=True)
+        resumed = ask(client, width=job["width"]).json()
+        client.post(
+            f"/api/jobs/{resumed['job_id']}/release",
+            json={"nonce": resumed["nonce"], "reason": "gave_up"},
+        )
+        assert "paused at row 30" not in client.get("/").text
+        again = ask(client, width=job["width"], name="someone else")
+        assert again.status_code == 200, again.text
+
+
 # a real run
 
 
