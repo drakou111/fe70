@@ -337,14 +337,6 @@ public:
         lo.reserve(n);
         hi.reserve(n);
     }
-    void resize(size_t n) {
-        lo.resize(n);
-        hi.resize(n);
-    }
-    void set(size_t i, uint64_t x) {  // x < 2^40, checked by the caller
-        lo[i] = (uint32_t)x;
-        hi[i] = (uint8_t)(x >> 32);
-    }
 
 private:
     std::vector<uint32_t> lo;
@@ -793,6 +785,185 @@ struct DiskSink {
     void empty() { isEmpty = true; }
 };
 
+// One layer of a layered DFA: the states after d symbols, with edges into the next layer (local ids).
+struct Layer {
+    std::vector<uint8_t> acc, sym;
+    std::vector<uint32_t> off{0};
+    std::vector<int32_t> tgt;
+    size_t size() const { return acc.size(); }
+};
+
+// Files of one run: <scratch>.<n> for each row automaton and raw transducer output. Files a killed run
+// left behind are removed when the next run with the same --scratch starts.
+class ScratchFiles {
+public:
+    explicit ScratchFiles(std::string base) : base(std::move(base)) {}
+    std::string fresh() { return base + "." + std::to_string(next++); }
+    void removeLeftovers() const {
+        namespace fs = std::filesystem;
+        const fs::path p(base);
+        const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+        const std::string prefix = p.filename().string() + ".";
+        std::error_code error;
+        for (const auto& entry : fs::directory_iterator(dir, error)) {
+            const std::string name = entry.path().filename().string();
+            if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) continue;
+            if (!std::all_of(name.begin() + prefix.size(), name.end(), [](char ch) { return ch >= '0' && ch <= '9'; }))
+                continue;
+            fs::remove(entry.path(), error);
+        }
+    }
+
+private:
+    std::string base;
+    uint64_t next = 0;
+};
+
+// A layered DFA of width-W words kept in a file and read one layer at a time, so a row never has to fit in
+// memory: every edge goes from layer d to layer d + 1, and states and targets are numbered within their layer.
+// Layers may be written in any order. The file is deleted with the object.
+class LayeredDfa {
+public:
+    int32_t start = 0;  // a state of layer 0
+
+    LayeredDfa() = default;
+    explicit LayeredDfa(std::string file) : path(std::move(file)) {
+        f = fopen(path.c_str(), "w+b");
+        if (!f) fail("cannot open scratch file " + path);
+    }
+    LayeredDfa(const LayeredDfa&) = delete;
+    LayeredDfa& operator=(const LayeredDfa&) = delete;
+    LayeredDfa(LayeredDfa&& o) noexcept { take(o); }
+    LayeredDfa& operator=(LayeredDfa&& o) noexcept {
+        if (this != &o) {
+            reset();
+            take(o);
+        }
+        return *this;
+    }
+    ~LayeredDfa() { reset(); }
+
+    void reset() {  // deletes the file
+        if (f) {
+            fclose(f);
+            std::remove(path.c_str());
+            f = nullptr;
+        }
+        layers.clear();
+        start = 0;
+        symbols = 0;
+    }
+    size_t depth() const { return layers.size(); }
+    uint64_t statesAt(size_t d) const { return d < layers.size() ? layers[d].states : 0; }
+    uint64_t size() const {
+        uint64_t n = 0;
+        for (const Info& l : layers) n += l.states;
+        return n;
+    }
+    uint64_t edges() const {
+        uint64_t e = 0;
+        for (const Info& l : layers) e += l.edges;
+        return e;
+    }
+    uint64_t symbolsUsed() const { return symbols; }  // bit s: some edge reads symbol s
+
+    void put(size_t d, const uint8_t* acc, const uint32_t* off, const uint8_t* sym, const int32_t* tgt, uint64_t n) {
+        const uint64_t e = off[n];
+        if (FSEEK(f, 0, SEEK_END) != 0) fail("scratch file seek failed");
+        if (d >= layers.size()) layers.resize(d + 1);
+        layers[d] = {FTELL(f), n, e};
+        writeAll(f, acc, n, "row automaton");
+        writeAll(f, off, 4 * (n + 1), "row automaton");
+        writeAll(f, sym, e, "row automaton");
+        writeAll(f, tgt, 4 * e, "row automaton");
+        for (uint64_t x = 0; x < e; x++) symbols |= 1ULL << sym[x];
+    }
+    void put(size_t d, const Layer& l) { put(d, l.acc.data(), l.off.data(), l.sym.data(), l.tgt.data(), l.size()); }
+
+    // layer d (empty past the last layer)
+    void get(size_t d, Layer& l) const {
+        const uint64_t n = statesAt(d), e = d < layers.size() ? layers[d].edges : 0;
+        l.acc.resize(n);
+        l.off.assign(n + 1, 0);
+        l.sym.resize(e);
+        l.tgt.resize(e);
+        if (n == 0) return;
+        if (FSEEK(f, layers[d].pos, SEEK_SET) != 0) fail("scratch file seek failed");
+        readAll(f, l.acc.data(), n, "row automaton");
+        readAll(f, l.off.data(), 4 * (n + 1), "row automaton");
+        readAll(f, l.sym.data(), e, "row automaton");
+        readAll(f, l.tgt.data(), 4 * e, "row automaton");
+    }
+
+    LayeredDfa copy(std::string file) const {
+        LayeredDfa out(std::move(file));
+        Layer l;
+        for (size_t d = 0; d < depth(); d++) {
+            get(d, l);
+            out.put(d, l);
+        }
+        out.start = start;
+        return out;
+    }
+
+    static LayeredDfa emptyLanguage(std::string file) {
+        LayeredDfa out(std::move(file));
+        const uint8_t acc = 0;
+        const uint32_t off[2] = {0, 0};
+        out.put(0, &acc, off, nullptr, nullptr, 1);
+        return out;
+    }
+
+private:
+    struct Info { int64_t pos = 0; uint64_t states = 0, edges = 0; };
+    FILE* f = nullptr;
+    std::string path;
+    std::vector<Info> layers;
+    uint64_t symbols = 0;
+
+    void take(LayeredDfa& o) {
+        f = o.f;
+        path = std::move(o.path);
+        layers = std::move(o.layers);
+        start = o.start;
+        symbols = o.symbols;
+        o.f = nullptr;
+        o.layers.clear();
+    }
+};
+
+// A small in-memory layered DFA (the first rows) as a LayeredDfa, its states renumbered layer by layer.
+LayeredDfa toLayered(const SDfa& s, std::string file) {
+    LayeredDfa out(std::move(file));
+    std::vector<int32_t> local(s.size(), -1), layer{s.start}, next;
+    local[s.start] = 0;
+    Layer l;
+    for (size_t d = 0; !layer.empty(); d++) {
+        next.clear();
+        l.acc.clear();
+        l.sym.clear();
+        l.tgt.clear();
+        l.off.assign(1, 0);
+        for (int32_t v : layer) {
+            l.acc.push_back(s.acc[v]);
+            for (uint64_t e = s.off[v]; e < s.off[v + 1]; e++) {
+                int32_t t = s.tgt[e];
+                if (local[t] < 0) {
+                    local[t] = (int32_t)next.size();
+                    next.push_back(t);
+                }
+                l.sym.push_back(s.sym[e]);
+                l.tgt.push_back(local[t]);
+            }
+            l.off.push_back((uint32_t)l.sym.size());
+        }
+        out.put(d, l);
+        layer.swap(next);
+    }
+    out.start = 0;
+    return out;
+}
+
 // The words Lookahead::keep() keeps, as a minimal DFA over a small frontier alphabet (Lookahead::buildFilter).
 struct WindowFilter {
     std::array<int8_t, 64> index;  // symbol -> letter, -1 outside the alphabet
@@ -853,13 +1024,21 @@ void writeLayer(std::vector<LayerOutput>& parts, const ShardOffsets& next, DiskS
     }
 }
 
-void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, DiskSink& sink, Workers& workers,
+void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in, DiskSink& sink, Workers& workers,
                       const WindowFilter* filter, std::atomic<bool>& uncovered) {
+    // every transducer state of a layer has read the same number of input columns: its q is a state of the
+    // input layer `inputDepth` (or a flush state after the last column)
+    Layer input;
+    size_t inputDepth = 0;
+    in.get(0, input);
     auto expand = [&](const NState& s, std::vector<std::pair<int, NState>>& buf) {
         buf.clear();
-        if (s.q >= 0)
-            for (uint64_t e = in.off[s.q]; e < in.off[s.q + 1]; e++) stepColumn(oris, s, in.sym[e], in.tgt[e], buf);
-        flushStep(s, s.q >= 0 && in.acc[s.q], buf);
+        if (s.q >= 0) {
+            if ((size_t)s.q >= input.size()) fail("a transducer state lies outside its input layer");
+            for (uint32_t e = input.off[s.q]; e < input.off[s.q + 1]; e++)
+                stepColumn(oris, s, input.sym[e], input.tgt[e], buf);
+        }
+        flushStep(s, s.q >= 0 && input.acc[s.q], buf);
     };
     auto isAccept = [&](const NState& s) { return s.q == FLUSH_BASE - 3; };
     auto order = [](const NState& a, const NState& b) {
@@ -875,6 +1054,7 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
         std::sort(nxt.begin(), nxt.end(), order);
         nxt.erase(std::unique(nxt.begin(), nxt.end()), nxt.end());
         cur.swap(nxt);
+        in.get(++inputDepth, input);
     }
     if (cur.empty()) { sink.empty(); return; }
 
@@ -916,6 +1096,7 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
         });
         Segmented<NState> following = nextStates->finish();
         nextStates.reset();
+        in.get(++inputDepth, input);
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
             for (size_t c = b; c < e; c++) for (auto& t : moveTgt[c]) t = (uint32_t)following.offsets.dense(t);
         });
@@ -977,34 +1158,37 @@ void transduceLayered(const std::vector<Orientation>& oris, const SDfa& in, Disk
 // The next row's minimal DFA without holding the raw one in memory. Every accepted word has length W, so
 // states of different layers are never equivalent: minimizing each layer against the already minimized
 // next layer, last layer first, gives exactly the minimal DFA.
-SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& workers);
+LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string file, Workers& workers);
 
-SDfa advanceRow(const std::vector<Orientation>& oris, SDfa& in, const std::string& scratch, Workers& workers,
-                const WindowFilter* filter = nullptr, bool* uncovered = nullptr) {
+LayeredDfa advanceRow(const std::vector<Orientation>& oris, const LayeredDfa& in, ScratchFiles& files, Workers& workers,
+                      const WindowFilter* filter = nullptr, bool* uncovered = nullptr) {
     DiskSink sink;
-    sink.f = fopen(scratch.c_str(), "w+b");
-    if (!sink.f) fail("cannot open scratch file " + scratch);
+    const std::string raw = files.fresh();
+    sink.f = fopen(raw.c_str(), "w+b");
+    if (!sink.f) fail("cannot open scratch file " + raw);
     auto t0 = std::chrono::steady_clock::now();
     std::atomic<bool> missed{false};
     transduceLayered(oris, in, sink, workers, filter, missed);
     if (uncovered) *uncovered = missed;
-    if (!filter) in.release();  // a pruned row may still need its input, to rebuild it in full
     auto t1 = std::chrono::steady_clock::now();
-    SDfa out = minimizeFromDisk(sink, scratch, workers);
+    LayeredDfa out = minimizeFromDisk(sink, raw, files.fresh(), workers);
     auto t2 = std::chrono::steady_clock::now();
     std::cerr << "    seconds: transduce " << std::chrono::duration<double>(t1 - t0).count() << " minimize "
               << std::chrono::duration<double>(t2 - t1).count() << "\n" << std::flush;
     return out;
 }
 
-// The minimal DFA of the layers in a scratch file (each layer's targets are local ids in the next layer),
-// minimized last layer first; deletes the file. Each minimized layer is appended to the same file, and the
-// result is read back into arrays of its exact size, so the minimized layers are never in memory twice.
-SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& workers) {
-    if (sink.isEmpty) { fclose(sink.f); std::remove(scratch.c_str()); return SDfa::emptyLanguage(); }
+// The minimal DFA of the raw layers in a scratch file (each layer's targets are local ids in the next layer),
+// minimized last layer first, each minimized layer written straight to `file`; deletes the raw file.
+LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string file, Workers& workers) {
+    if (sink.isEmpty) {
+        fclose(sink.f);
+        std::remove(raw.c_str());
+        return LayeredDfa::emptyLanguage(std::move(file));
+    }
     size_t L = sink.layerPos.size();
-    struct Spilled { int64_t pos; uint64_t states, edges; };
-    std::vector<Spilled> mins(L);
+    const std::string name = file;
+    LayeredDfa out(std::move(file));
     std::vector<int32_t> clsNext;
     std::vector<uint8_t> acc, sym, minAcc, minSym;
     std::vector<uint32_t> off, minOff;
@@ -1108,121 +1292,130 @@ SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& worke
                 }
             }
         });
-        if (FSEEK(sink.f, 0, SEEK_END) != 0) fail("scratch file seek failed");
-        mins[d] = {FTELL(sink.f), classes, minSym.size()};
-        writeAll(sink.f, minAcc.data(), classes, "scratch");
-        writeAll(sink.f, minOff.data(), 4 * (classes + 1), "scratch");
-        writeAll(sink.f, minSym.data(), minSym.size(), "scratch");
-        writeAll(sink.f, minTgt.data(), 4 * minTgt.size(), "scratch");
+        out.put(d, minAcc.data(), minOff.data(), minSym.data(), minTgt.data(), classes);
         clsNext.swap(cls);
     }
-    for (auto* v : {&acc, &sym, &minAcc, &minSym}) std::vector<uint8_t>().swap(*v);
-    for (auto* v : {&off, &minOff}) std::vector<uint32_t>().swap(*v);
-    for (auto* v : {&tgt, &minTgt}) std::vector<int32_t>().swap(*v);
-    if (clsNext.empty() || clsNext[0] < 0) {
-        fclose(sink.f);
-        std::remove(scratch.c_str());
-        return SDfa::emptyLanguage();
-    }
-    std::vector<int64_t> base(L + 1, 0);
-    std::vector<uint64_t> edgeBase(L + 1, 0);
-    for (size_t d = 0; d < L; d++) {
-        base[d + 1] = base[d] + (int64_t)mins[d].states;
-        edgeBase[d + 1] = edgeBase[d] + mins[d].edges;
-    }
-    if (base[L] >= INT32_MAX) fail("the minimal DFA is too large for 32-bit ids");
-    if (edgeBase[L] >> 40) fail("an automaton has too many edges for 40-bit offsets");
-    SDfa out;
-    out.acc.resize(base[L]);
-    out.off.resize(base[L] + 1);
-    out.sym.resize(edgeBase[L]);
-    out.tgt.resize(edgeBase[L]);
-    std::vector<uint32_t> localOff;
-    for (size_t d = 0; d < L; d++) {
-        const uint64_t n = mins[d].states, e = mins[d].edges;
-        if (FSEEK(sink.f, mins[d].pos, SEEK_SET) != 0) fail("scratch file seek failed");
-        localOff.resize(n + 1);
-        readAll(sink.f, out.acc.data() + base[d], n, "scratch");
-        readAll(sink.f, localOff.data(), 4 * (n + 1), "scratch");
-        readAll(sink.f, out.sym.data() + edgeBase[d], e, "scratch");
-        readAll(sink.f, out.tgt.data() + edgeBase[d], 4 * e, "scratch");
-        workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
-            for (size_t c = b; c < end; c++) out.off.set(base[d] + c, edgeBase[d] + localOff[c]);
-        });
-        const int32_t shift = (int32_t)base[d + 1];
-        workers.forRange(e, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
-            for (size_t x = edgeBase[d] + b; x < edgeBase[d] + end; x++) out.tgt[x] += shift;
-        });
-    }
-    out.off.set(base[L], edgeBase[L]);
     fclose(sink.f);
-    std::remove(scratch.c_str());
-    out.start = (int32_t)(base[0] + clsNext[0]);
+    std::remove(raw.c_str());
+    if (clsNext.empty() || clsNext[0] < 0) {
+        out.reset();
+        return LayeredDfa::emptyLanguage(name);
+    }
+    out.start = clsNext[0];
     return out;
 }
 
-// Words of length W, one pass over the layers (every state of these automata sits at a single depth).
-double countWords(const SDfa& d, int W) {
-    std::vector<double> ways(d.size(), 0);
-    std::vector<int32_t> depth(d.size(), -1), layer{d.start}, next;
+// Words of length W, one pass over the layers.
+double countWords(const LayeredDfa& d, int W) {
+    Layer layer;
+    d.get(0, layer);
+    if (layer.size() == 0) return 0;
+    std::vector<double> ways(layer.size(), 0), next;
     ways[d.start] = 1;
-    depth[d.start] = 0;
-    for (int len = 0; len < W && !layer.empty(); len++) {
-        next.clear();
-        for (int32_t v : layer)
-            for (uint64_t e = d.off[v]; e < d.off[v + 1]; e++) {
-                int32_t t = d.tgt[e];
-                if (depth[t] < 0) { depth[t] = len + 1; next.push_back(t); }
-                else if (depth[t] != len + 1) fail("an automaton state sits at two depths");
-                ways[t] += ways[v];
-            }
-        layer.swap(next);
+    for (int len = 0; len < W; len++) {
+        next.assign(d.statesAt(len + 1), 0);
+        for (size_t v = 0; v < layer.size(); v++)
+            if (ways[v] != 0)
+                for (uint32_t e = layer.off[v]; e < layer.off[v + 1]; e++) next[layer.tgt[e]] += ways[v];
+        ways.swap(next);
+        d.get(len + 1, layer);
+        if (layer.size() == 0) return 0;
     }
     double total = 0;
-    for (int32_t v : layer) if (d.acc[v]) total += ways[v];
+    for (size_t v = 0; v < layer.size(); v++) if (layer.acc[v]) total += ways[v];
     return total;
 }
 
-bool acceptsFlat(const SDfa& d, int W) {
+bool acceptsFlat(const LayeredDfa& d, int W) {
+    Layer layer;
     int32_t q = d.start;
-    for (int i = 0; i < W && q >= 0; i++) q = d.next(q, 0);
-    return q >= 0 && d.acc[q];
-}
-
-// Canonical encoding (BFS renumbering; edges are stored in increasing symbol order).
-template <class Sink>
-void canonicalWalk(const SDfa& d, Sink sink) {
-    std::vector<int32_t> num(d.size(), -1);
-    std::vector<int32_t> order{d.start};
-    num[d.start] = 0;
-    for (size_t i = 0; i < order.size(); i++) {
-        int32_t v = order[i];
-        sink(d.acc[v] ? 0xAULL : 0xBULL);
-        for (uint64_t e = d.off[v]; e < d.off[v + 1]; e++) {
-            int32_t t = d.tgt[e];
-            if (num[t] < 0) { num[t] = (int32_t)order.size(); order.push_back(t); }
-            sink((uint64_t)d.sym[e] << 40 | (uint64_t)num[t]);
-        }
-        sink(0xFFFFULL);
+    for (int i = 0; i < W; i++) {
+        d.get(i, layer);
+        if ((size_t)q >= layer.size()) return false;
+        int32_t next = -1;
+        for (uint32_t e = layer.off[q]; e < layer.off[q + 1]; e++) if (layer.sym[e] == 0) next = layer.tgt[e];
+        if (next < 0) return false;
+        q = next;
     }
+    d.get(W, layer);
+    return (size_t)q < layer.size() && layer.acc[q];
 }
 
-std::pair<uint64_t, uint64_t> canonicalHash(const SDfa& d) {
+// The canonical encoding (BFS renumbering; edges are stored in increasing symbol order), one layer at a time.
+// A BFS from the start meets the layers in order, so a state's number is the count of states in the layers
+// before its own plus its rank of discovery in its layer.
+class CanonicalWalker {
+public:
+    explicit CanonicalWalker(const LayeredDfa& d) : d(d) {
+        d.get(0, layer);
+        if (layer.size() > 0) order.push_back(d.start);
+    }
+    // the next layer's encoding; false once every layer is done
+    bool next(std::vector<uint64_t>& out) {
+        out.clear();
+        if (order.empty()) return false;
+        const uint64_t nextBase = base + order.size();
+        num.assign(d.statesAt(depth + 1), -1);
+        nextOrder.clear();
+        for (int32_t v : order) {
+            out.push_back(layer.acc[v] ? 0xAULL : 0xBULL);
+            for (uint32_t e = layer.off[v]; e < layer.off[v + 1]; e++) {
+                int32_t t = layer.tgt[e];
+                if (num[t] < 0) {
+                    num[t] = (int32_t)nextOrder.size();
+                    nextOrder.push_back(t);
+                }
+                out.push_back((uint64_t)layer.sym[e] << 40 | (nextBase + (uint64_t)num[t]));
+            }
+            out.push_back(0xFFFFULL);
+        }
+        order.swap(nextOrder);
+        base = nextBase;
+        d.get(++depth, layer);
+        return true;
+    }
+
+private:
+    const LayeredDfa& d;
+    Layer layer;
+    std::vector<int32_t> order, nextOrder, num;
+    uint64_t base = 0;
+    size_t depth = 0;
+};
+
+std::pair<uint64_t, uint64_t> canonicalHash(const LayeredDfa& d) {
     uint64_t h1 = 0x243F6A8885A308D3ULL, h2 = 0x13198A2E03707344ULL;
-    canonicalWalk(d, [&](uint64_t v) {
-        h1 ^= v + 0x9E3779B97F4A7C15ULL + (h1 << 6) + (h1 >> 2);
-        h1 *= 0xBF58476D1CE4E5B9ULL;
-        h2 += v * 0x94D049BB133111EBULL;
-        h2 ^= h2 >> 31;
-        h2 *= 0xD6E8FEB86659FD93ULL;
-    });
+    CanonicalWalker walk(d);
+    std::vector<uint64_t> part;
+    while (walk.next(part))
+        for (uint64_t v : part) {
+            h1 ^= v + 0x9E3779B97F4A7C15ULL + (h1 << 6) + (h1 >> 2);
+            h1 *= 0xBF58476D1CE4E5B9ULL;
+            h2 += v * 0x94D049BB133111EBULL;
+            h2 ^= h2 >> 31;
+            h2 *= 0xD6E8FEB86659FD93ULL;
+        }
     return {h1, h2};
 }
 
-std::vector<uint64_t> canonicalForm(const SDfa& d) {
-    std::vector<uint64_t> enc;
-    canonicalWalk(d, [&](uint64_t v) { enc.push_back(v); });
+std::vector<uint64_t> canonicalForm(const LayeredDfa& d) {
+    std::vector<uint64_t> enc, part;
+    CanonicalWalker walk(d);
+    while (walk.next(part)) enc.insert(enc.end(), part.begin(), part.end());
     return enc;
+}
+
+// Whether two minimal DFAs accept the same words: their canonical encodings compared layer by layer.
+bool sameLanguage(const LayeredDfa& a, const LayeredDfa& b) {
+    if (a.size() != b.size() || a.edges() != b.edges()) return false;
+    CanonicalWalker wa(a), wb(b);
+    std::vector<uint64_t> pa, pb;
+    while (true) {
+        bool ra = wa.next(pa), rb = wb.next(pb);
+        if (ra != rb) return false;
+        if (!ra) return true;
+        if (pa != pb) return false;
+    }
 }
 
 // --lookahead k: drop frontiers containing a window of WINDOW_COLS columns whose cells of the next k rows
@@ -1250,17 +1443,20 @@ public:
     // The product of d with the last w-1 columns read is built one column position at a time (each position's
     // states in parallel) and written to the scratch file, then minimized last layer first, so only one layer
     // of it is ever in memory.
-    SDfa keep(const SDfa& d, int W, const std::string& scratch, Workers& workers) const {
+    LayeredDfa keep(LayeredDfa d, int W, ScratchFiles& files, Workers& workers) const {
         if (rows == 0) return d;
-        if (W > WINDOW_COLS && filterCovers(d, workers)) return keepFiltered(d, W, scratch, workers);
+        if (W > WINDOW_COLS && filterCovers(d, workers)) return keepFiltered(d, W, files, workers);
         const int w = std::min(WINDOW_COLS, W);
         const uint64_t mask = w > 1 ? (1ULL << (6 * (w - 1))) - 1 : 0;
         DiskSink sink;
-        sink.f = fopen(scratch.c_str(), "w+b");
-        if (!sink.f) fail("cannot open scratch file " + scratch);
+        const std::string raw = files.fresh();
+        sink.f = fopen(raw.c_str(), "w+b");
+        if (!sink.f) fail("cannot open scratch file " + raw);
+        Layer in;
         Segmented<WindowKey> layer(std::vector<WindowKey>{{d.start, 0}});
         std::vector<std::unordered_map<uint64_t, bool>> caches(workers.size());  // in front of the shared memo
         for (int pos = 0; pos <= W && !layer.empty(); pos++) {
+            d.get(pos, in);
             size_t parts = (layer.size() + KEEP_CHUNK - 1) / KEEP_CHUNK;
             std::vector<LayerOutput> out(parts);
             auto nextKeys = std::make_unique<ShardedIds<WindowKey, WindowKeyHash>>();
@@ -1271,15 +1467,15 @@ public:
                     for (size_t i = p * KEEP_CHUNK; i < std::min(layer.size(), (p + 1) * KEEP_CHUNK); i++) {
                         const WindowKey& key = layer[i];
                         uint8_t degree = 0;
-                        for (uint64_t x = d.off[key.v]; x < d.off[key.v + 1]; x++) {
-                            uint64_t window = key.hist << 6 | d.sym[x];
+                        for (uint32_t x = in.off[key.v]; x < in.off[key.v + 1]; x++) {
+                            uint64_t window = key.hist << 6 | in.sym[x];
                             // the window of columns pos-w+1..pos, complete once w columns are read
                             if (pos + 1 >= w && bad(window, w, pos + 1 == w, pos + 1 == W, cache)) continue;
-                            o.sym.push_back(d.sym[x]);
-                            o.tgt.push_back(nextKeys->intern(WindowKey{d.tgt[x], window & mask}));
+                            o.sym.push_back(in.sym[x]);
+                            o.tgt.push_back(nextKeys->intern(WindowKey{in.tgt[x], window & mask}));
                             degree++;
                         }
-                        o.acc.push_back(d.acc[key.v]);
+                        o.acc.push_back(in.acc[key.v]);
                         o.degree.push_back(degree);
                     }
                 }
@@ -1289,17 +1485,20 @@ public:
             nextKeys.reset();
             writeLayer(out, layer.offsets, sink, workers);
         }
-        return minimizeFromDisk(sink, scratch, workers);
+        return minimizeFromDisk(sink, raw, files.fresh(), workers);
     }
 
     // keep() through the window filter: the product's second component is the filter's state
-    SDfa keepFiltered(const SDfa& d, int W, const std::string& scratch, Workers& workers) const {
+    LayeredDfa keepFiltered(const LayeredDfa& d, int W, ScratchFiles& files, Workers& workers) const {
         const Filter& f = *filter;
         DiskSink sink;
-        sink.f = fopen(scratch.c_str(), "w+b");
-        if (!sink.f) fail("cannot open scratch file " + scratch);
+        const std::string raw = files.fresh();
+        sink.f = fopen(raw.c_str(), "w+b");
+        if (!sink.f) fail("cannot open scratch file " + raw);
+        Layer in;
         Segmented<WindowKey> layer(std::vector<WindowKey>{{d.start, (uint64_t)f.start}});
         for (int pos = 0; pos <= W && !layer.empty(); pos++) {
+            d.get(pos, in);
             size_t parts = (layer.size() + KEEP_CHUNK - 1) / KEEP_CHUNK;
             std::vector<LayerOutput> out(parts);
             auto nextKeys = std::make_unique<ShardedIds<WindowKey, WindowKeyHash>>();
@@ -1310,14 +1509,14 @@ public:
                         const WindowKey& key = layer[i];
                         const size_t row = (size_t)key.hist * f.m;
                         uint8_t degree = 0;
-                        for (uint64_t x = d.off[key.v]; x < d.off[key.v + 1]; x++) {
-                            int32_t next = f.next[row + f.index[d.sym[x]]];
+                        for (uint32_t x = in.off[key.v]; x < in.off[key.v + 1]; x++) {
+                            int32_t next = f.next[row + f.index[in.sym[x]]];
                             if (next == f.dead) continue;
-                            o.sym.push_back(d.sym[x]);
-                            o.tgt.push_back(nextKeys->intern(WindowKey{d.tgt[x], (uint64_t)next}));
+                            o.sym.push_back(in.sym[x]);
+                            o.tgt.push_back(nextKeys->intern(WindowKey{in.tgt[x], (uint64_t)next}));
                             degree++;
                         }
-                        o.acc.push_back(d.acc[key.v] && f.acc[key.hist]);
+                        o.acc.push_back(in.acc[key.v] && f.acc[key.hist]);
                         o.degree.push_back(degree);
                     }
                 }
@@ -1327,14 +1526,14 @@ public:
             nextKeys.reset();
             writeLayer(out, layer.offsets, sink, workers);
         }
-        return minimizeFromDisk(sink, scratch, workers);
+        return minimizeFromDisk(sink, raw, files.fresh(), workers);
     }
 
     size_t peak() const { return peakLayer; }  // the largest layer of a window product
 
     // the filter for building d's next row already pruned, or null (no lookahead, a narrow width, or too many
     // symbols)
-    const WindowFilter* onlineFilter(const SDfa& d, int W, Workers& workers) const {
+    const WindowFilter* onlineFilter(const LayeredDfa& d, int W, Workers& workers) const {
         if (rows == 0 || W <= WINDOW_COLS || !filterCovers(d, workers)) return nullptr;
         return filter.get();
     }
@@ -1347,9 +1546,9 @@ private:
 
     // Whether a filter covering d's symbols exists, building (or widening) it when that alphabet is small
     // enough. The kept sets are the same either way; the filter only makes keep() faster and smaller.
-    bool filterCovers(const SDfa& d, Workers& workers) const {
+    bool filterCovers(const LayeredDfa& d, Workers& workers) const {
         std::array<char, 64> used{};
-        for (uint8_t s : d.sym) used[s] = 1;
+        for (int s = 0; s < 64; s++) used[s] = (char)(d.symbolsUsed() >> s & 1);
         if (filter) {
             bool covered = true;
             for (int s = 0; s < 64; s++) if (used[s] && filter->index[s] < 0) covered = false;
@@ -1539,25 +1738,47 @@ struct Checkpoint {
     std::string pieceKey;
     std::vector<SeenRow> seen;
     std::vector<uint64_t> counts;
-    SDfa lang;
+    LayeredDfa lang;
 };
 
-// n, e (uint64), start (int32), acc[n], degree[n] (uint8), sym[e], tgt[e] (int32); edges in state order
-void writeLanguage(FILE* f, const SDfa& d) {
-    uint64_t n = d.size(), e = d.sym.size();
+// n, e (uint64), start (int32), acc[n], degree[n] (uint8), sym[e], tgt[e] (int32); edges in state order, the
+// states numbered layer by layer. Written from one pass over the layers, each layer's four parts in place.
+void writeLanguage(FILE* f, const LayeredDfa& d) {
+    const uint64_t n = d.size(), e = d.edges();
+    if (n >= INT32_MAX) fail("the automaton is too large for 32-bit ids");
     writeValue(f, n, "language");
     writeValue(f, e, "language");
     writeValue(f, d.start, "language");
-    writeAll(f, d.acc.data(), n, "language");
-    std::vector<uint8_t> degree(n);
-    for (uint64_t v = 0; v < n; v++) degree[v] = (uint8_t)(d.off[v + 1] - d.off[v]);  // at most SYMBOLS
-    writeAll(f, degree.data(), n, "language");
-    writeAll(f, d.sym.data(), e, "language");
-    writeAll(f, d.tgt.data(), 4 * e, "language");
+    const int64_t accAt = FTELL(f), degreeAt = accAt + (int64_t)n, symAt = degreeAt + (int64_t)n,
+                  tgtAt = symAt + (int64_t)e;
+    Layer l;
+    std::vector<uint8_t> degree;
+    std::vector<int32_t> global;
+    uint64_t base = 0, edgeBase = 0;
+    auto at = [&](int64_t pos) { if (FSEEK(f, pos, SEEK_SET) != 0) fail("seek failed while writing an automaton"); };
+    for (size_t k = 0; k < d.depth(); k++) {
+        d.get(k, l);
+        const uint64_t nextBase = base + l.size();
+        degree.resize(l.size());
+        for (size_t v = 0; v < l.size(); v++) degree[v] = (uint8_t)(l.off[v + 1] - l.off[v]);  // at most SYMBOLS
+        global.resize(l.tgt.size());
+        for (size_t x = 0; x < l.tgt.size(); x++) global[x] = (int32_t)(nextBase + (uint64_t)l.tgt[x]);
+        at(accAt + (int64_t)base);
+        writeAll(f, l.acc.data(), l.size(), "language");
+        at(degreeAt + (int64_t)base);
+        writeAll(f, degree.data(), l.size(), "language");
+        at(symAt + (int64_t)edgeBase);
+        writeAll(f, l.sym.data(), l.sym.size(), "language");
+        at(tgtAt + 4 * (int64_t)edgeBase);
+        writeAll(f, global.data(), 4 * global.size(), "language");
+        base = nextBase;
+        edgeBase += l.sym.size();
+    }
+    at(tgtAt + 4 * (int64_t)e);
 }
 
 // --dump: one file per row, for looking at the automata (research/automaton_view.py reads them)
-void dumpLanguage(const SDfa& d, const std::string& dir, int row) {
+void dumpLanguage(const LayeredDfa& d, const std::string& dir, int row) {
     std::string path = dir + "/row" + std::to_string(row) + ".dfa";
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) fail("cannot write " + path);
@@ -1588,7 +1809,9 @@ void saveCheckpoint(const Checkpoint& c, const std::string& path) {
     if (error) fail("cannot replace checkpoint " + path + ": " + error.message());
 }
 
-Checkpoint loadCheckpoint(const std::string& path) {
+// The checkpoint's automaton is read one layer at a time into a LayeredDfa: its states are numbered layer by
+// layer (layer 0 is the start state), so each layer is the range of its predecessor layer's targets.
+Checkpoint loadCheckpoint(const std::string& path, ScratchFiles& files) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) fail("cannot read checkpoint " + path);
     char magic[sizeof CHECKPOINT_MAGIC];
@@ -1605,28 +1828,53 @@ Checkpoint loadCheckpoint(const std::string& path) {
     for (auto& s : c.seen) { s.row = readValue<int32_t>(f, "checkpoint"); s.h1 = readValue<uint64_t>(f, "checkpoint"); s.h2 = readValue<uint64_t>(f, "checkpoint"); }
     c.counts.resize(readValue<uint64_t>(f, "checkpoint"));
     readAll(f, c.counts.data(), 8 * c.counts.size(), "checkpoint");
-    SDfa& d = c.lang;
-    uint64_t n = readValue<uint64_t>(f, "checkpoint"), e = readValue<uint64_t>(f, "checkpoint");
-    d.start = readValue<int32_t>(f, "checkpoint");
-    d.acc.resize(n);
-    readAll(f, d.acc.data(), n, "checkpoint");
-    std::vector<uint8_t> degree(n);
-    readAll(f, degree.data(), n, "checkpoint");
-    d.off = Offsets();
-    d.off.reserve(n + 1);
-    uint64_t edges = 0;
-    for (uint64_t v = 0; v < n; v++) d.off.push_back(edges += degree[v]);
-    if (edges != e) fail(path + " is damaged (edge count)");
-    d.sym.resize(e);
-    d.tgt.resize(e);
-    readAll(f, d.sym.data(), e, "checkpoint");
-    readAll(f, d.tgt.data(), 4 * e, "checkpoint");
+    const uint64_t n = readValue<uint64_t>(f, "checkpoint"), e = readValue<uint64_t>(f, "checkpoint");
+    const int32_t start = readValue<int32_t>(f, "checkpoint");
+    if (n == 0 || start != 0) fail(path + " is damaged (start state)");
+    const int64_t accAt = FTELL(f), degreeAt = accAt + (int64_t)n, symAt = degreeAt + (int64_t)n,
+                  tgtAt = symAt + (int64_t)e, endAt = tgtAt + 4 * (int64_t)e;
+    auto at = [&](int64_t pos) { if (FSEEK(f, pos, SEEK_SET) != 0) fail(path + " is damaged (too short)"); };
+    LayeredDfa& d = c.lang;
+    d = LayeredDfa(files.fresh());
+    Layer l;
+    std::vector<uint8_t> degree;
+    uint64_t lo = 0, hi = 1, edgeLo = 0;
+    for (size_t k = 0; lo < hi; k++) {
+        const uint64_t count = hi - lo;
+        degree.resize(count);
+        at(degreeAt + (int64_t)lo);
+        readAll(f, degree.data(), count, "checkpoint");
+        l.off.assign(count + 1, 0);
+        for (uint64_t v = 0; v < count; v++) l.off[v + 1] = l.off[v] + degree[v];
+        const uint64_t layerEdges = l.off[count];
+        if (edgeLo + layerEdges > e) fail(path + " is damaged (edge count)");
+        l.acc.resize(count);
+        at(accAt + (int64_t)lo);
+        readAll(f, l.acc.data(), count, "checkpoint");
+        l.sym.resize(layerEdges);
+        l.tgt.resize(layerEdges);
+        at(symAt + (int64_t)edgeLo);
+        readAll(f, l.sym.data(), layerEdges, "checkpoint");
+        at(tgtAt + 4 * (int64_t)edgeLo);
+        readAll(f, l.tgt.data(), 4 * layerEdges, "checkpoint");
+        uint64_t nextHi = hi;
+        for (int32_t& t : l.tgt) {
+            if (t < 0 || (uint64_t)t < hi || (uint64_t)t >= n) fail(path + " is damaged (edge target)");
+            nextHi = std::max(nextHi, (uint64_t)t + 1);
+            t -= (int32_t)hi;
+        }
+        d.put(k, l);
+        edgeLo += layerEdges;
+        lo = hi;
+        hi = nextHi;
+    }
+    if (lo != n || edgeLo != e) fail(path + " is damaged (states outside the layers)");
+    at(endAt);
     char end[sizeof CHECKPOINT_END];
     readAll(f, end, sizeof end, "checkpoint");
     if (memcmp(end, CHECKPOINT_END, sizeof end) != 0) fail(path + " is damaged (no end mark)");
     fclose(f);
-    if (n == 0 || d.start < 0 || (uint64_t)d.start >= n) fail(path + " is damaged (start state)");
-    for (int32_t t : d.tgt) if (t < 0 || (uint64_t)t >= n) fail(path + " is damaged (edge target)");
+    d.start = 0;
     return c;
 }
 
@@ -1710,7 +1958,7 @@ std::string pieceKeyOf(const std::vector<Orientation>& oris) {
 
 // The width-W words of the first rows, built width-independently up to startRow; stops early at a row
 // whose width-W language is already empty or accepts the flat frontier. Returns that row and its language.
-std::pair<int, SDfa> firstRow(const std::vector<Orientation>& oris, int startRow, int W) {
+std::pair<int, LayeredDfa> firstRow(const std::vector<Orientation>& oris, int startRow, int W, ScratchFiles& files) {
     Dfa lang;
     std::array<int32_t, SYMBOLS> row;
     row.fill(-1);
@@ -1719,7 +1967,7 @@ std::pair<int, SDfa> firstRow(const std::vector<Orientation>& oris, int startRow
     lang.next[1][0] = 1;
     lang.accept = {0, 1};
     for (int r = 0;; r++) {
-        SDfa d = minimizeAcyclic(restrictLength(lang, W));
+        LayeredDfa d = toLayered(minimizeAcyclic(restrictLength(lang, W)), files.fresh());
         if (r == startRow || countWords(d, W) == 0 || (r > 0 && acceptsFlat(d, W))) return {r, std::move(d)};
         lang = minimizeDense(nextLanguageDense(oris, lang));
         std::cerr << "universal row " << r + 1 << ": " << lang.size() << " states\n" << std::flush;
@@ -1734,11 +1982,18 @@ void printCounts(const std::vector<uint64_t>& counts) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+// Thrown to end a run from inside a nested step; main returns its code once the stack (and with it every
+// automaton file) is unwound. std::exit would leave the files open, and Windows cannot delete open files.
+struct Finished { int code; };
+
+int run(int argc, char** argv) {
     Options opt = parseOptions(argc, argv);
     auto oris = orientationsOf(opt.cells);
     const int W = opt.width;
     Workers workers(opt.threads);
+    // the row automata live in <scratch>.<n> files, each deleted with its object (see Finished)
+    ScratchFiles files(opt.scratch);
+    files.removeLeftovers();
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
 
@@ -1751,7 +2006,7 @@ int main(int argc, char** argv) {
     const bool resuming = keepCheckpoints && std::filesystem::exists(opt.checkpoint);
     int lookahead = opt.lookahead;
     if (resuming) {
-        c = loadCheckpoint(opt.checkpoint);
+        c = loadCheckpoint(opt.checkpoint, files);
         bool samePiece = c.pieceKey.compare(0, baseKey.size(), baseKey) == 0;
         std::string rest = samePiece ? c.pieceKey.substr(baseKey.size()) : "";
         if (c.width != W || c.startRow != opt.startRow || !samePiece ||
@@ -1762,34 +2017,34 @@ int main(int argc, char** argv) {
     const Lookahead look(oris, lookahead);
     const std::string key = baseKey + (lookahead ? lookaheadMark + std::to_string(lookahead) : "");
     double before = 0;  // compute seconds of earlier runs (from the checkpoint)
-    std::map<int32_t, SDfa> recent;  // small kept rows of the last `lookahead` rows
+    std::map<int32_t, LayeredDfa> recent;  // small kept rows of the last `lookahead` rows
     // Row `row`'s kept set is empty: the width dies, and this finds the first row with no filling at all. A
     // frontier pruned at row r has fillings up to row r + lookahead - 1 at most, so the unpruned language
     // stepped from the kept row row - lookahead (or from the first row) reaches every filling that can outlive
     // `row`. That kept row is in `recent`, or rebuilt from the start. Rows after `row` print as empty kept sets.
     auto deathAt = [&](int row) {
         int from = row - lookahead;
-        SDfa full;
+        LayeredDfa full;
         int at;
         if (from < c.startRow) {
-            auto [r0, first] = firstRow(oris, opt.startRow, W);
+            auto [r0, first] = firstRow(oris, opt.startRow, W, files);
             full = std::move(first);
             at = r0;
         } else {
-            SDfa e;
+            LayeredDfa e;
             if (auto it = recent.find(from); it != recent.end()) {
                 e = std::move(it->second);
             } else {
                 std::cerr << "    rebuilding the kept row " << from << " for the exact death row\n" << std::flush;
-                auto [r0, first] = firstRow(oris, opt.startRow, W);
-                e = look.keep(first, W, opt.scratch, workers);
-                for (int r = r0; r < from; r++) e = look.keep(advanceRow(oris, e, opt.scratch, workers), W, opt.scratch, workers);
+                auto [r0, first] = firstRow(oris, opt.startRow, W, files);
+                e = look.keep(std::move(first), W, files, workers);
+                for (int r = r0; r < from; r++) e = look.keep(advanceRow(oris, e, files, workers), W, files, workers);
             }
-            full = advanceRow(oris, e, opt.scratch, workers);
+            full = advanceRow(oris, e, files, workers);
             at = from + 1;
         }
         while (countWords(full, W) > 0) {
-            full = advanceRow(oris, full, opt.scratch, workers);
+            full = advanceRow(oris, full, files, workers);
             at++;
         }
         for (int r = row + 1; r <= at; r++) {
@@ -1798,35 +2053,36 @@ int main(int argc, char** argv) {
         }
         printCounts(c.counts);
         std::cout << "dead " << std::max(at, row) << "\n" << std::flush;
-        std::exit(0);
+        throw Finished{0};
     };
     // the kept part of a row's full set; an empty kept part ends the run with the exact death row
-    auto kept = [&](SDfa full, int row) -> SDfa {
+    auto kept = [&](LayeredDfa full, int row) -> LayeredDfa {
         if (look.depth() == 0 || countWords(full, W) == 0) return full;
         auto t = std::chrono::steady_clock::now();
-        SDfa k = look.keep(full, W, opt.scratch, workers);
-        std::cerr << "    kept " << k.size() << " of " << full.size() << " states (largest window layer " << look.peak()
+        const uint64_t fullStates = full.size();
+        LayeredDfa k = look.keep(std::move(full), W, files, workers);
+        std::cerr << "    kept " << k.size() << " of " << fullStates << " states (largest window layer " << look.peak()
                   << ", " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count() << " s)\n" << std::flush;
         if (countWords(k, W) > 0) return k;
         c.counts.push_back(1);
         std::cout << "row " << row << " states 1 words 0 seconds " << (int64_t)(before + elapsed()) << "\n";
-        full.release();
+        k.reset();
         deathAt(row);
         return k;
     };
     // the next row's kept set: pruned while it is built when the window filter applies; otherwise, or when
     // nothing is kept or a symbol is outside the filter's alphabet, built in full and pruned afterwards
-    auto keptNext = [&](SDfa& d, int row) -> SDfa {
+    auto keptNext = [&](LayeredDfa& d, int row) -> LayeredDfa {
         if (const WindowFilter* f = look.onlineFilter(d, W, workers)) {
             bool uncovered = false;
-            SDfa k = advanceRow(oris, d, opt.scratch, workers, f, &uncovered);
+            LayeredDfa k = advanceRow(oris, d, files, workers, f, &uncovered);
             if (!uncovered && countWords(k, W) > 0) {
-                d.release();
+                d.reset();
                 std::cerr << "    kept " << k.size() << " states (pruned while built)\n" << std::flush;
                 return k;
             }
         }
-        return kept(advanceRow(oris, d, opt.scratch, workers), row);
+        return kept(advanceRow(oris, d, files, workers), row);
     };
     std::cout << "lookahead " << lookahead << "\n";
     if (resuming) {
@@ -1836,7 +2092,7 @@ int main(int argc, char** argv) {
         c.width = W;
         c.startRow = opt.startRow;
         c.pieceKey = key;
-        auto [row, full] = firstRow(oris, opt.startRow, W);
+        auto [row, full] = firstRow(oris, opt.startRow, W, files);
         c.row = row;
         std::cout << "start " << c.row << "\n" << std::flush;
         c.lang = kept(std::move(full), row);
@@ -1846,7 +2102,7 @@ int main(int argc, char** argv) {
     std::map<int32_t, std::vector<uint64_t>> smallForms;  // rows of this run, not those of a resumed checkpoint
 
     while (true) {
-        SDfa& d = c.lang;
+        LayeredDfa& d = c.lang;
         if (!opt.dumpDir.empty()) dumpLanguage(d, opt.dumpDir, c.row);
         double words = countWords(d, W);
         c.counts.push_back(d.size());
@@ -1867,15 +2123,14 @@ int main(int argc, char** argv) {
         if (it != seen.end()) {
             // a hash match is confirmed by rebuilding the earlier row and comparing exactly
             int32_t earlier = it->second;
-            auto now = canonicalForm(d);
             bool same;
             if (auto stored = smallForms.find(earlier); stored != smallForms.end()) {
-                same = stored->second == now;
+                same = d.size() <= SMALL_ROW_STATES && stored->second == canonicalForm(d);
             } else {
-                auto [r0, first] = firstRow(oris, opt.startRow, W);
-                SDfa e = look.keep(first, W, opt.scratch, workers);
-                for (int r = r0; r < earlier; r++) e = look.keep(advanceRow(oris, e, opt.scratch, workers), W, opt.scratch, workers);
-                same = canonicalForm(e) == now;
+                auto [r0, first] = firstRow(oris, opt.startRow, W, files);
+                LayeredDfa e = look.keep(std::move(first), W, files, workers);
+                for (int r = r0; r < earlier; r++) e = look.keep(advanceRow(oris, e, files, workers), W, files, workers);
+                same = sameLanguage(e, d);
             }
             if (same) {
                 printCounts(c.counts);
@@ -1889,11 +2144,19 @@ int main(int argc, char** argv) {
         if (d.size() <= SMALL_ROW_STATES) smallForms.emplace(c.row, canonicalForm(d));
         if (lookahead > 0) {
             recent.erase(recent.begin(), recent.lower_bound(c.row - lookahead + 1));
-            if (d.size() <= RECENT_ROW_STATES) recent.emplace(c.row, d);
+            if (d.size() <= RECENT_ROW_STATES) recent.emplace(c.row, d.copy(files.fresh()));
         }
         c.lang = keptNext(d, c.row + 1);
         c.row++;
         c.seconds = before + elapsed();
         if (keepCheckpoints) saveCheckpoint(c, opt.checkpoint);
+    }
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const Finished& finished) {
+        return finished.code;
     }
 }
