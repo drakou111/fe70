@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <sstream>
@@ -1065,7 +1066,18 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
     Segmented<NState> nstates(std::move(cur));
     SegmentedSets setsOf(std::move(first));
 
+    // EXACT_WIDTH_STATS: the layer with the largest working set, the duplication of produced states, and the
+    // time of each phase, one line per row
+    const bool stats = std::getenv("EXACT_WIDTH_STATS") != nullptr;
+    struct Worst { uint64_t bytes = 0, states = 0, moves = 0, distinct = 0, sets = 0, pool = 0, edges = 0; size_t layer = 0; } worst;
+    double expandSeconds = 0, subsetSeconds = 0, writeSeconds = 0;
+    uint64_t allMoves = 0, allDistinct = 0;
+    size_t layerIndex = 0;
+    auto clock = [] { return std::chrono::steady_clock::now(); };
+    auto seconds = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+
     while (true) {
+        const auto tExpand = clock();
         // every transducer state's moves, with targets as ids of the next layer
         size_t n = nstates.size(), chunks = (n + EXPAND_CHUNK - 1) / EXPAND_CHUNK;
         std::vector<std::vector<uint8_t>> moveSym(chunks);
@@ -1097,6 +1109,9 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         Segmented<NState> following = nextStates->finish();
         nextStates.reset();
         in.get(++inputDepth, input);
+        uint64_t moves = 0;
+        for (const auto& m : moveSym) moves += m.size();
+        const auto tSubset = clock();
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
             for (size_t c = b; c < e; c++) for (auto& t : moveTgt[c]) t = (uint32_t)following.offsets.dense(t);
         });
@@ -1146,13 +1161,36 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         });
         std::vector<std::vector<uint8_t>>().swap(moveSym);
         std::vector<std::vector<uint32_t>>().swap(moveTgt);
+        const auto tWrite = clock();
+        if (stats) {
+            uint64_t pool = 0, edges = 0;
+            for (const auto& v : setsOf.pool) pool += v.size();
+            for (const auto& part : out) edges += part.sym.size();
+            // bytes of this layer's main structures: states, moves, produced states, sets, raw output
+            const uint64_t bytes = n * (sizeof(NState) + 7) + moves * 5 + following.size() * sizeof(NState) +
+                                   pool * 4 + sets * 8 + edges * 5 + sets * 2;
+            if (bytes > worst.bytes) worst = {bytes, n, moves, following.size(), sets, pool, edges, layerIndex};
+            allMoves += moves;
+            allDistinct += following.size();
+            expandSeconds += seconds(tExpand, tSubset);
+            subsetSeconds += seconds(tSubset, tWrite);
+        }
         bool last = nextSets->empty();
         setsOf = nextSets->finish();
         nextSets.reset();
         writeLayer(out, setsOf.offsets, sink, workers);
+        if (stats) writeSeconds += seconds(tWrite, clock());
+        layerIndex++;
         if (last) break;
         nstates = std::move(following);
     }
+    if (stats)
+        std::cerr << "    stats: largest layer " << worst.layer << " ~" << worst.bytes / (1 << 20) << " MB (states "
+                  << worst.states << ", moves " << worst.moves << ", produced " << worst.distinct << ", sets "
+                  << worst.sets << ", set pool " << worst.pool << ", raw edges " << worst.edges << "); moves per "
+                  << "produced state " << (allDistinct ? (double)allMoves / (double)allDistinct : 0.0)
+                  << "; seconds expand+intern " << expandSeconds << ", subsets+intern " << subsetSeconds
+                  << ", write " << writeSeconds << "\n" << std::flush;
 }
 
 // The next row's minimal DFA without holding the raw one in memory. Every accepted word has length W, so
@@ -1383,19 +1421,75 @@ private:
     size_t depth = 0;
 };
 
-std::pair<uint64_t, uint64_t> canonicalHash(const LayeredDfa& d) {
+// What the main loop needs of a row: its word count, whether it accepts the flat frontier, and the hash of
+// its canonical encoding (the same values as countWords, acceptsFlat and CanonicalWalker give).
+struct RowSummary {
+    double words = 0;
+    bool flat = false;
+    std::pair<uint64_t, uint64_t> hash;
+};
+
+// One pass over the row's layers for all three, so a row is read from disk once instead of three times.
+RowSummary summarize(const LayeredDfa& d, int W) {
+    RowSummary s;
     uint64_t h1 = 0x243F6A8885A308D3ULL, h2 = 0x13198A2E03707344ULL;
-    CanonicalWalker walk(d);
-    std::vector<uint64_t> part;
-    while (walk.next(part))
-        for (uint64_t v : part) {
-            h1 ^= v + 0x9E3779B97F4A7C15ULL + (h1 << 6) + (h1 >> 2);
-            h1 *= 0xBF58476D1CE4E5B9ULL;
-            h2 += v * 0x94D049BB133111EBULL;
-            h2 ^= h2 >> 31;
-            h2 *= 0xD6E8FEB86659FD93ULL;
+    auto mix = [&](uint64_t v) {
+        h1 ^= v + 0x9E3779B97F4A7C15ULL + (h1 << 6) + (h1 >> 2);
+        h1 *= 0xBF58476D1CE4E5B9ULL;
+        h2 += v * 0x94D049BB133111EBULL;
+        h2 ^= h2 >> 31;
+        h2 *= 0xD6E8FEB86659FD93ULL;
+    };
+    Layer layer;
+    d.get(0, layer);
+    std::vector<int32_t> order, nextOrder, num;
+    std::vector<double> ways, next;
+    int32_t flat = -1;  // the state the all-zero prefix leads to, or -1
+    if (layer.size() > 0) {
+        order.push_back(d.start);
+        ways.assign(layer.size(), 0);
+        ways[d.start] = 1;
+        flat = d.start;
+    }
+    uint64_t base = 0;
+    for (int len = 0; !order.empty(); len++) {
+        // the canonical encoding of this layer (as in CanonicalWalker::next)
+        const uint64_t nextBase = base + order.size();
+        num.assign(d.statesAt(len + 1), -1);
+        nextOrder.clear();
+        for (int32_t v : order) {
+            mix(layer.acc[v] ? 0xAULL : 0xBULL);
+            for (uint32_t e = layer.off[v]; e < layer.off[v + 1]; e++) {
+                int32_t t = layer.tgt[e];
+                if (num[t] < 0) {
+                    num[t] = (int32_t)nextOrder.size();
+                    nextOrder.push_back(t);
+                }
+                mix((uint64_t)layer.sym[e] << 40 | (nextBase + (uint64_t)num[t]));
+            }
+            mix(0xFFFFULL);
         }
-    return {h1, h2};
+        if (len == W) {
+            for (size_t v = 0; v < layer.size(); v++) if (layer.acc[v]) s.words += ways[v];
+            s.flat = flat >= 0 && layer.acc[flat];
+        } else {
+            next.assign(d.statesAt(len + 1), 0);
+            for (size_t v = 0; v < layer.size(); v++)
+                if (ways[v] != 0)
+                    for (uint32_t e = layer.off[v]; e < layer.off[v + 1]; e++) next[layer.tgt[e]] += ways[v];
+            ways.swap(next);
+            if (flat >= 0) {
+                int32_t to = -1;
+                for (uint32_t e = layer.off[flat]; e < layer.off[flat + 1]; e++) if (layer.sym[e] == 0) to = layer.tgt[e];
+                flat = to;
+            }
+        }
+        order.swap(nextOrder);
+        base = nextBase;
+        d.get(len + 1, layer);
+    }
+    s.hash = {h1, h2};
+    return s;
 }
 
 std::vector<uint64_t> canonicalForm(const LayeredDfa& d) {
@@ -2055,6 +2149,8 @@ int run(int argc, char** argv) {
         std::cout << "dead " << std::max(at, row) << "\n" << std::flush;
         throw Finished{0};
     };
+    // the summary of the automaton kept() or keptNext() just returned, when they computed it (one pass fewer)
+    std::optional<RowSummary> known;
     // the kept part of a row's full set; an empty kept part ends the run with the exact death row
     auto kept = [&](LayeredDfa full, int row) -> LayeredDfa {
         if (look.depth() == 0 || countWords(full, W) == 0) return full;
@@ -2063,7 +2159,8 @@ int run(int argc, char** argv) {
         LayeredDfa k = look.keep(std::move(full), W, files, workers);
         std::cerr << "    kept " << k.size() << " of " << fullStates << " states (largest window layer " << look.peak()
                   << ", " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count() << " s)\n" << std::flush;
-        if (countWords(k, W) > 0) return k;
+        known = summarize(k, W);
+        if (known->words > 0) return k;
         c.counts.push_back(1);
         std::cout << "row " << row << " states 1 words 0 seconds " << (int64_t)(before + elapsed()) << "\n";
         k.reset();
@@ -2076,7 +2173,9 @@ int run(int argc, char** argv) {
         if (const WindowFilter* f = look.onlineFilter(d, W, workers)) {
             bool uncovered = false;
             LayeredDfa k = advanceRow(oris, d, files, workers, f, &uncovered);
-            if (!uncovered && countWords(k, W) > 0) {
+            RowSummary summary = uncovered ? RowSummary{} : summarize(k, W);
+            if (!uncovered && summary.words > 0) {
+                known = summary;
                 d.reset();
                 std::cerr << "    kept " << k.size() << " states (pruned while built)\n" << std::flush;
                 return k;
@@ -2104,7 +2203,9 @@ int run(int argc, char** argv) {
     while (true) {
         LayeredDfa& d = c.lang;
         if (!opt.dumpDir.empty()) dumpLanguage(d, opt.dumpDir, c.row);
-        double words = countWords(d, W);
+        const RowSummary summary = known ? *known : summarize(d, W);
+        known.reset();
+        const double words = summary.words;
         c.counts.push_back(d.size());
         std::cout << "row " << c.row << " states " << d.size() << " words " << words << " seconds "
                   << (int64_t)(before + elapsed()) << "\n" << std::flush;
@@ -2113,12 +2214,12 @@ int run(int argc, char** argv) {
             std::cout << "dead " << c.row << "\n" << std::flush;
             return 0;
         }
-        if (c.row > 0 && acceptsFlat(d, W)) {
+        if (c.row > 0 && summary.flat) {
             printCounts(c.counts);
             std::cout << "rectangle " << c.row << "\n" << std::flush;
             return 0;
         }
-        auto h = canonicalHash(d);
+        const auto h = summary.hash;
         auto it = seen.find(h);
         if (it != seen.end()) {
             // a hash match is confirmed by rebuilding the earlier row and comparing exactly
