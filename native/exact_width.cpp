@@ -1025,19 +1025,35 @@ SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& worke
         workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t e) {
             for (size_t v = b; v < e; v++) if (cls[v] >= 0) cls[v] = ids.dense(sparse[v]);
         });
+        // exact sizes first (edge counts per class, then their prefix sums), so the layer is filled in place
         MinLayer& m = mins[d];
-        m.acc.resize(rep.size());
-        for (size_t c = 0; c < rep.size(); c++) {
-            int32_t r = rep[c];
-            m.acc[c] = acc[r];
-            for (uint32_t x = off[r]; x < off[r + 1]; x++) {
-                int32_t t = cn(tgt[x]);
-                if (t < 0) continue;
-                m.sym.push_back(sym[x]);
-                m.tgt.push_back(t);
+        size_t classes = rep.size();
+        m.acc.resize(classes);
+        m.off.assign(classes + 1, 0);
+        workers.forRange(classes, MINIMIZE_CHUNK, [&](size_t b, size_t e) {
+            for (size_t c = b; c < e; c++) {
+                int32_t r = rep[c];
+                m.acc[c] = acc[r];
+                uint32_t kept = 0;
+                for (uint32_t x = off[r]; x < off[r + 1]; x++) kept += cn(tgt[x]) >= 0;
+                m.off[c + 1] = kept;
             }
-            m.off.push_back((uint32_t)m.sym.size());
-        }
+        });
+        for (size_t c = 0; c < classes; c++) m.off[c + 1] += m.off[c];
+        m.sym.resize(m.off[classes]);
+        m.tgt.resize(m.off[classes]);
+        workers.forRange(classes, MINIMIZE_CHUNK, [&](size_t b, size_t e) {
+            for (size_t c = b; c < e; c++) {
+                int32_t r = rep[c];
+                uint32_t at = m.off[c];
+                for (uint32_t x = off[r]; x < off[r + 1]; x++) {
+                    int32_t t = cn(tgt[x]);
+                    if (t < 0) continue;
+                    m.sym[at] = sym[x];
+                    m.tgt[at++] = t;
+                }
+            }
+        });
         clsNext.swap(cls);
     }
     fclose(sink.f);
@@ -1046,8 +1062,13 @@ SDfa minimizeFromDisk(DiskSink& sink, const std::string& scratch, Workers& worke
     std::vector<int64_t> base(L + 1, 0);
     for (size_t d = 0; d < L; d++) base[d + 1] = base[d] + (int64_t)mins[d].acc.size();
     if (base[L] >= INT32_MAX) fail("the minimal DFA is too large for 32-bit ids");
+    size_t edges = 0;
+    for (const MinLayer& m : mins) edges += m.sym.size();
     SDfa out;
     out.acc.reserve(base[L]);
+    out.off.reserve(base[L] + 1);
+    out.sym.reserve(edges);
+    out.tgt.reserve(edges);
     for (size_t d = 0; d < L; d++) {
         MinLayer& m = mins[d];
         for (size_t c = 0; c < m.acc.size(); c++) {
