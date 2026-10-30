@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import shutil
+import struct
 import subprocess
 import sys
 from dataclasses import replace
@@ -325,6 +326,58 @@ def test_a_repeat_across_a_resume_is_still_confirmed(use_binary, tmp_path):
     run_binary(use_binary, tmp_path, width, 3, checkpoint, stop_after_row=earlier + 2)
     resumed = run_binary(use_binary, tmp_path, width, 3, checkpoint, threads=2)
     assert resumed[1] != "start 4"  # it did resume
+    assert resumed[-1] == f"forever {earlier} {later}"
+
+
+def to_global_ids(checkpoint: Path) -> None:
+    """Rewrites a checkpoint in the format before 0.14.8: one automaton with ids over all of its layers."""
+    data = checkpoint.read_bytes()
+    assert data[:8] == b"FE70XW02"
+    at = 8 + 12 + 8
+    (key,) = struct.unpack_from("<I", data, at)
+    at += 4 + key
+    (seen,) = struct.unpack_from("<Q", data, at)
+    at += 8 + 20 * seen
+    (counts,) = struct.unpack_from("<Q", data, at)
+    at += 8 + 8 * counts
+    header = data[8:at]
+    (depth,) = struct.unpack_from("<Q", data, at)
+    at += 8
+    acc, degree, sym, tgt = [], [], [], []
+    base = 0
+    for _ in range(depth):
+        n, e = struct.unpack_from("<QQ", data, at)
+        at += 16
+        acc.append(data[at : at + n])
+        degree.append(data[at + n : at + 2 * n])
+        sym.append(data[at + 2 * n : at + 2 * n + e])
+        at += 2 * n + e
+        base += n
+        tgt.append([t + base for t in struct.unpack_from(f"<{e}i", data, at)])
+        at += 4 * e
+    assert data[at:] == b"END!"
+    states = sum(len(a) for a in acc)
+    edges = sum(len(s) for s in sym)
+    targets = [t for layer in tgt for t in layer]
+    checkpoint.write_bytes(
+        b"FE70XW01"
+        + header
+        + struct.pack("<QQi", states, edges, 0)
+        + b"".join(acc)
+        + b"".join(degree)
+        + b"".join(sym)
+        + struct.pack(f"<{len(targets)}i", *targets)
+        + b"END!"
+    )
+
+
+def test_a_checkpoint_of_an_older_version_still_resumes(use_binary, tmp_path):
+    width, earlier, later = SIB_FOREVER
+    checkpoint = tmp_path / "forever.ckpt"
+    run_binary(use_binary, tmp_path, width, 3, checkpoint, stop_after_row=earlier + 2)
+    to_global_ids(checkpoint)
+    resumed = run_binary(use_binary, tmp_path, width, 3, checkpoint)
+    assert resumed[1] != "start 4"
     assert resumed[-1] == f"forever {earlier} {later}"
 
 

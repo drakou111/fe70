@@ -57,7 +57,8 @@ constexpr int RIGHT_REACH = 6;     // ... and <= c+6
 constexpr int COL_BITS = 7;        // rows r..r+6 inside the transducer
 constexpr int MAX_ROWS = COL_BITS;
 constexpr int32_t FLUSH_BASE = -2;  // NFA state q = -2 - k: the end flush with k columns emitted
-constexpr char CHECKPOINT_MAGIC[8] = {'F', 'E', '7', '0', 'X', 'W', '0', '1'};
+constexpr char CHECKPOINT_MAGIC[8] = {'F', 'E', '7', '0', 'X', 'W', '0', '2'};
+constexpr char CHECKPOINT_MAGIC_GLOBAL_IDS[8] = {'F', 'E', '7', '0', 'X', 'W', '0', '1'};  // up to 0.14.7
 constexpr char CHECKPOINT_END[4] = {'E', 'N', 'D', '!'};
 constexpr size_t IO_CHUNK = 1 << 26;
 constexpr int DEFAULT_START_ROW = 8;
@@ -1959,6 +1960,56 @@ void writeLanguage(FILE* f, const LayeredDfa& d) {
     at(tgtAt + 4 * (int64_t)e);
 }
 
+// depth (uint64), then per layer: n, e (uint64), acc[n], degree[n] (uint8), sym[e], tgt[e] (int32, local ids in
+// the next layer). Unlike writeLanguage() no id spans the whole automaton, so its size is not limited to 2^31.
+void writeLayers(FILE* f, const LayeredDfa& d) {
+    writeValue(f, (uint64_t)d.depth(), "checkpoint");
+    Layer l;
+    std::vector<uint8_t> degree;
+    for (size_t k = 0; k < d.depth(); k++) {
+        d.get(k, l);
+        writeValue(f, (uint64_t)l.size(), "checkpoint");
+        writeValue(f, (uint64_t)l.sym.size(), "checkpoint");
+        degree.resize(l.size());
+        for (size_t v = 0; v < l.size(); v++) degree[v] = (uint8_t)(l.off[v + 1] - l.off[v]);  // at most SYMBOLS
+        writeAll(f, l.acc.data(), l.size(), "checkpoint");
+        writeAll(f, degree.data(), l.size(), "checkpoint");
+        writeAll(f, l.sym.data(), l.sym.size(), "checkpoint");
+        writeAll(f, l.tgt.data(), 4 * l.tgt.size(), "checkpoint");
+    }
+}
+
+void readLayers(FILE* f, LayeredDfa& d, const std::string& path) {
+    const uint64_t depth = readValue<uint64_t>(f, "checkpoint");
+    if (depth == 0) fail(path + " is damaged (no layers)");
+    Layer l;
+    std::vector<uint8_t> degree;
+    uint64_t targets = 1;  // layer 0 is the start state alone
+    for (size_t k = 0; k < depth; k++) {
+        const uint64_t count = readValue<uint64_t>(f, "checkpoint"), edges = readValue<uint64_t>(f, "checkpoint");
+        if (count != targets) fail(path + " is damaged (layer size)");
+        if (count >= INT32_MAX || edges > count * SYMBOLS) fail(path + " is damaged (layer counts)");
+        l.acc.resize(count);
+        readAll(f, l.acc.data(), count, "checkpoint");
+        degree.resize(count);
+        readAll(f, degree.data(), count, "checkpoint");
+        l.off.assign(count + 1, 0);
+        for (uint64_t v = 0; v < count; v++) l.off[v + 1] = l.off[v] + degree[v];
+        if (l.off[count] != edges) fail(path + " is damaged (edge count)");
+        l.sym.resize(edges);
+        l.tgt.resize(edges);
+        readAll(f, l.sym.data(), edges, "checkpoint");
+        readAll(f, l.tgt.data(), 4 * edges, "checkpoint");
+        targets = 0;
+        for (int32_t t : l.tgt) {
+            if (t < 0) fail(path + " is damaged (edge target)");
+            targets = std::max(targets, (uint64_t)t + 1);
+        }
+        d.put(k, l);
+    }
+    if (targets != 0) fail(path + " is damaged (edges past the last layer)");
+}
+
 // --dump: one file per row, for looking at the automata (research/automaton_view.py reads them)
 void dumpLanguage(const LayeredDfa& d, const std::string& dir, int row) {
     std::string path = dir + "/row" + std::to_string(row) + ".dfa";
@@ -1983,7 +2034,7 @@ void saveCheckpoint(const Checkpoint& c, const std::string& path) {
     for (auto& s : c.seen) { writeValue(f, s.row, "checkpoint"); writeValue(f, s.h1, "checkpoint"); writeValue(f, s.h2, "checkpoint"); }
     writeValue(f, (uint64_t)c.counts.size(), "checkpoint");
     writeAll(f, c.counts.data(), 8 * c.counts.size(), "checkpoint");
-    writeLanguage(f, c.lang);
+    writeLayers(f, c.lang);
     writeAll(f, CHECKPOINT_END, sizeof CHECKPOINT_END, "checkpoint");
     if (fflush(f) != 0 || fclose(f) != 0) fail("cannot finish checkpoint " + tmp + "; is the disk full?");
     std::error_code error;
@@ -1991,14 +2042,15 @@ void saveCheckpoint(const Checkpoint& c, const std::string& path) {
     if (error) fail("cannot replace checkpoint " + path + ": " + error.message());
 }
 
-// The checkpoint's automaton is read one layer at a time into a LayeredDfa: its states are numbered layer by
-// layer (layer 0 is the start state), so each layer is the range of its predecessor layer's targets.
+void readGlobalIds(FILE* f, LayeredDfa& d, const std::string& path);
+
 Checkpoint loadCheckpoint(const std::string& path, ScratchFiles& files) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) fail("cannot read checkpoint " + path);
     char magic[sizeof CHECKPOINT_MAGIC];
     readAll(f, magic, sizeof magic, "checkpoint");
-    if (memcmp(magic, CHECKPOINT_MAGIC, sizeof magic) != 0) fail(path + " is not a checkpoint of this program");
+    const bool globalIds = memcmp(magic, CHECKPOINT_MAGIC_GLOBAL_IDS, sizeof magic) == 0;
+    if (!globalIds && memcmp(magic, CHECKPOINT_MAGIC, sizeof magic) != 0) fail(path + " is not a checkpoint of this program");
     Checkpoint c;
     c.width = readValue<int32_t>(f, "checkpoint");
     c.startRow = readValue<int32_t>(f, "checkpoint");
@@ -2010,14 +2062,26 @@ Checkpoint loadCheckpoint(const std::string& path, ScratchFiles& files) {
     for (auto& s : c.seen) { s.row = readValue<int32_t>(f, "checkpoint"); s.h1 = readValue<uint64_t>(f, "checkpoint"); s.h2 = readValue<uint64_t>(f, "checkpoint"); }
     c.counts.resize(readValue<uint64_t>(f, "checkpoint"));
     readAll(f, c.counts.data(), 8 * c.counts.size(), "checkpoint");
+    c.lang = LayeredDfa(files.fresh());
+    if (globalIds) readGlobalIds(f, c.lang, path);
+    else readLayers(f, c.lang, path);
+    char end[sizeof CHECKPOINT_END];
+    readAll(f, end, sizeof end, "checkpoint");
+    if (memcmp(end, CHECKPOINT_END, sizeof end) != 0) fail(path + " is damaged (no end mark)");
+    fclose(f);
+    c.lang.start = 0;
+    return c;
+}
+
+// The old format, writeLanguage()'s layout with ids over the whole automaton, read one layer at a time: its states
+// are numbered layer by layer (layer 0 is the start state), so each layer is the range of its predecessor's targets.
+void readGlobalIds(FILE* f, LayeredDfa& d, const std::string& path) {
     const uint64_t n = readValue<uint64_t>(f, "checkpoint"), e = readValue<uint64_t>(f, "checkpoint");
     const int32_t start = readValue<int32_t>(f, "checkpoint");
     if (n == 0 || start != 0) fail(path + " is damaged (start state)");
     const int64_t accAt = FTELL(f), degreeAt = accAt + (int64_t)n, symAt = degreeAt + (int64_t)n,
                   tgtAt = symAt + (int64_t)e, endAt = tgtAt + 4 * (int64_t)e;
     auto at = [&](int64_t pos) { if (FSEEK(f, pos, SEEK_SET) != 0) fail(path + " is damaged (too short)"); };
-    LayeredDfa& d = c.lang;
-    d = LayeredDfa(files.fresh());
     Layer l;
     std::vector<uint8_t> degree;
     uint64_t lo = 0, hi = 1, edgeLo = 0;
@@ -2052,12 +2116,6 @@ Checkpoint loadCheckpoint(const std::string& path, ScratchFiles& files) {
     }
     if (lo != n || edgeLo != e) fail(path + " is damaged (states outside the layers)");
     at(endAt);
-    char end[sizeof CHECKPOINT_END];
-    readAll(f, end, sizeof end, "checkpoint");
-    if (memcmp(end, CHECKPOINT_END, sizeof end) != 0) fail(path + " is damaged (no end mark)");
-    fclose(f);
-    d.start = 0;
-    return c;
 }
 
 struct Options {
