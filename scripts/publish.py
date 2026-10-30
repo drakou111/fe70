@@ -1,11 +1,13 @@
 """Build, sign and publish a release in one go: runs scripts/release.py, uploads the app files and then
 latest.json to the Pi's download folder over SSH (manifest last, so apps never see it before its file),
-and checks that the public server now announces the new version.
+and checks that the public server now announces the new version. If this version was already built and
+signed (an upload that failed), it is uploaded again as it is: release.py never rebuilds a version.
 
 Needs in .env: TILINGVOL_PI_SSH (e.g. you@raspberrypi.local) and TILINGVOL_SERVER_URL; optional
 TILINGVOL_PI_DOWNLOADS (default /srv/tilingvol-downloads, owned by the Pi user, see deploy/PI_SETUP.md).
 Run: uv run python scripts/publish.py"""
 
+import hashlib
 import json
 import os
 import re
@@ -13,6 +15,8 @@ import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+
+from tilingvol import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_DIR = ROOT / "release"
@@ -47,6 +51,32 @@ def settings() -> tuple[str, str, str]:
     return remote, folder, server.rstrip("/")
 
 
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def already_signed() -> bool:
+    """latest.json is for this version and every file it names is there, unchanged."""
+    path = RELEASE_DIR / "latest.json"
+    if not path.exists():
+        return False
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("version") != __version__:
+        return False
+    for entry in manifest["platforms"].values():
+        file = RELEASE_DIR / entry["filename"]
+        if not file.exists() or sha256_of(file) != entry["sha256"]:
+            raise SystemExit(
+                f"{file.name} is missing or differs from the signed latest.json; "
+                "raise __version__ and publish again"
+            )
+    return True
+
+
 def run(command: list[str]) -> None:
     print("+", " ".join(command), flush=True)
     subprocess.run(command, check=True)
@@ -54,7 +84,10 @@ def run(command: list[str]) -> None:
 
 def main() -> None:
     remote, folder, server = settings()
-    run([sys.executable, str(ROOT / "scripts" / "release.py")])
+    if already_signed():
+        print(f"version {__version__} is already built and signed; uploading it again")
+    else:
+        run([sys.executable, str(ROOT / "scripts" / "release.py")])
     manifest = json.loads((RELEASE_DIR / "latest.json").read_text(encoding="utf-8"))
     files = [
         str(RELEASE_DIR / entry["filename"]) for entry in manifest["platforms"].values()
