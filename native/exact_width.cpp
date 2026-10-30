@@ -43,12 +43,63 @@
 #ifdef _WIN32
 #define FSEEK _fseeki64
 #define FTELL _ftelli64
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #else
 #define FSEEK fseeko
 #define FTELL ftello
+#include <sys/mman.h>
 #endif
 
 namespace {
+
+// A layer's big arrays get whole pages from the OS and give them back when freed. From the heap, the shards'
+// vectors (around a megabyte each, regrown and freed every layer) left about a third of the peak as free
+// fragments that the heap kept. Small arrays still come from the heap.
+constexpr size_t PAGE_ALLOC_MIN = 1 << 16;
+
+void* allocatePages(size_t bytes) {
+#ifdef _WIN32
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+void freePages(void* p, size_t bytes) {
+#ifdef _WIN32
+    (void)bytes;
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    munmap(p, bytes);
+#endif
+}
+
+template <class T>
+struct PageAllocator {
+    using value_type = T;
+    PageAllocator() = default;
+    template <class U>
+    PageAllocator(const PageAllocator<U>&) {}
+    T* allocate(size_t n) {
+        const size_t bytes = n * sizeof(T);
+        void* p = bytes < PAGE_ALLOC_MIN ? std::malloc(bytes) : allocatePages(bytes);
+        if (!p) throw std::bad_alloc();
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, size_t n) {
+        const size_t bytes = n * sizeof(T);
+        if (bytes < PAGE_ALLOC_MIN) std::free(p);
+        else freePages(p, bytes);
+    }
+    friend bool operator==(const PageAllocator&, const PageAllocator&) { return true; }
+};
+template <class T>
+using BigVector = std::vector<T, PageAllocator<T>>;
 
 using Cell = std::pair<int, int>;  // (row, col)
 constexpr int SYMBOLS = 64;        // 6 rows of occupancy per column
@@ -388,11 +439,11 @@ private:
         int32_t id;
         uint32_t tag;
     };
-    std::vector<Slot> slots;
+    BigVector<Slot> slots;
     size_t count = 0;
     void grow() {
         if (slots.size() >= (1ULL << 31)) fail("a hash table outgrew 32-bit slot tags");
-        std::vector<Slot> old;
+        BigVector<Slot> old;
         old.swap(slots);
         slots.assign(old.size() * 2, Slot{-1, 0});
         size_t mask = slots.size() - 1;
@@ -533,17 +584,65 @@ private:
 // (index in its shard << SHARD_BITS | shard) until finish() numbers all items densely, shard by shard.
 constexpr int SHARD_BITS = 8;
 constexpr uint32_t SHARDS = 1u << SHARD_BITS;
-constexpr uint64_t SHARD_LIMIT = 1ULL << (32 - SHARD_BITS);  // items per shard
-constexpr size_t SHARD_SLOTS = 1 << 8;
+constexpr uint64_t SHARD_LIMIT = (1ULL << (32 - SHARD_BITS)) - 1;  // items per shard (ShardTable keeps id + 1)
 
 inline uint32_t shardOf(uint64_t h) { return (uint32_t)(h >> (64 - SHARD_BITS)); }
 
-// slots for one shard of a table expected to hold `items` in all (at most 70% full, a power of two)
-inline size_t shardSlots(size_t items) {
-    size_t slots = SHARD_SLOTS;
-    while (slots < (1ULL << 26) && slots * 7 < 10 * (items / SHARDS + 1)) slots *= 2;
-    return slots;
+// The shards' vectors hold most of a layer: growing them by a quarter instead of doubling leaves at most a
+// fifth of them empty instead of half, for a few more copies of cheap items.
+template <class V>
+void makeRoom(V& v, size_t more) {
+    if (v.size() + more <= v.capacity()) return;
+    v.reserve(std::max(v.size() + more, v.size() + v.size() / 4 + 16));
 }
+
+// One shard of a sharded hash table. A slot is 4 bytes: the id plus one (ids stay below SHARD_LIMIT) and 8 bits
+// of the key's hash, so most probes never touch the key. Sized for the items it expects, with room for a tenth
+// more, rather than to a power of two; growing re-hashes the keys (hashOf), which that room makes rare. Bits
+// 0-31 of the hash place a key, 32-39 are its tag; the top bits choose the shard.
+class ShardTable {
+public:
+    explicit ShardTable(size_t expected = 0) {
+        slots.assign(std::max<size_t>(MIN_SLOTS, expected * 11 / 7 + 1), 0);
+    }
+    template <class Eq, class Make, class HashOf>
+    int32_t findOrInsert(uint64_t h, Eq eq, Make make, HashOf hashOf) {
+        if ((count + 1) * 10 > slots.size() * 7) grow(hashOf);  // at most 70% full
+        const uint32_t tag = (uint32_t)(h >> 32) & 0xFF;
+        size_t i = home(h);
+        while (slots[i] != 0) {
+            if (slots[i] >> 24 == tag && eq((int32_t)(slots[i] & ID_MASK) - 1)) return (int32_t)(slots[i] & ID_MASK) - 1;
+            if (++i == slots.size()) i = 0;
+        }
+        int32_t id = make();
+        slots[i] = tag << 24 | (uint32_t)(id + 1);
+        count++;
+        return id;
+    }
+
+private:
+    static constexpr size_t MIN_SLOTS = 64;
+    static constexpr uint32_t ID_MASK = (1u << 24) - 1;
+    static_assert(SHARD_LIMIT <= ID_MASK, "a shard's ids must fit a slot");
+    BigVector<uint32_t> slots;
+    size_t count = 0;
+    size_t home(uint64_t h) const { return (size_t)(((h & 0xFFFFFFFFULL) * slots.size()) >> 32); }
+    template <class HashOf>
+    void grow(HashOf hashOf) {
+        BigVector<uint32_t> old;
+        old.swap(slots);
+        slots.assign(old.size() * 2, 0);
+        for (uint32_t slot : old) {
+            if (slot == 0) continue;
+            size_t i = home(hashOf((int32_t)(slot & ID_MASK) - 1));
+            while (slots[i] != 0) if (++i == slots.size()) i = 0;
+            slots[i] = slot;
+        }
+    }
+};
+
+// a shard's share of a table expected to hold `items` in all
+inline size_t perShard(size_t items) { return items / SHARDS; }
 
 class ShardOffsets {
 public:
@@ -561,12 +660,12 @@ public:
 template <class T>
 class Segmented {
 public:
-    std::array<std::vector<T>, SHARDS> segment;
+    std::array<BigVector<T>, SHARDS> segment;
     ShardOffsets offsets;
     Segmented() = default;
-    explicit Segmented(std::vector<T> items) {
+    explicit Segmented(const std::vector<T>& items) {
         for (uint32_t k = 1; k <= SHARDS; k++) offsets.start[k] = items.size();
-        segment[0] = std::move(items);
+        segment[0].assign(items.begin(), items.end());
     }
     size_t size() const { return offsets.total(); }
     bool empty() const { return size() == 0; }
@@ -579,13 +678,13 @@ public:
 // Sets of int32 the same way: each shard's pool and set offsets moved in; a set lies in one shard.
 class SegmentedSets {
 public:
-    std::array<std::vector<int32_t>, SHARDS> pool;
-    std::array<std::vector<uint64_t>, SHARDS> start;  // start[k][j]..start[k][j + 1] in pool[k]
+    std::array<BigVector<int32_t>, SHARDS> pool;
+    std::array<BigVector<uint32_t>, SHARDS> start;  // start[k][j]..start[k][j + 1] in pool[k]
     ShardOffsets offsets;
-    explicit SegmentedSets(std::vector<int32_t> set) {
+    explicit SegmentedSets(const std::vector<int32_t>& set) {
         for (uint32_t k = 1; k <= SHARDS; k++) offsets.start[k] = 1;
-        start[0] = {0, set.size()};
-        pool[0] = std::move(set);
+        start[0] = {0, (uint32_t)set.size()};
+        pool[0].assign(set.begin(), set.end());
     }
     SegmentedSets() = default;
     size_t size() const { return offsets.total(); }
@@ -601,7 +700,7 @@ class ShardedIds {
 public:
     // `expected`: about how many items will come (the previous layer's count), so tables rarely grow
     explicit ShardedIds(size_t expected = 0) {
-        for (auto& s : shards) s.table = IdTable(shardSlots(expected));
+        for (auto& s : shards) s.table = ShardTable(perShard(expected));
     }
     uint32_t intern(const T& item) {
         uint64_t h = Hash{}(item);
@@ -612,9 +711,11 @@ public:
             h, [&](int32_t id) { return s.items[id] == item; },
             [&]() {
                 if (s.items.size() >= SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
+                makeRoom(s.items, 1);
                 s.items.push_back(item);
                 return (int32_t)s.items.size() - 1;
-            });
+            },
+            [&](int32_t id) { return Hash{}(s.items[id]); });
         return (uint32_t)local << SHARD_BITS | k;
     }
     // every item in dense order (its offsets also map interned ids to dense ones); empties the shards
@@ -623,9 +724,10 @@ public:
         for (uint32_t k = 0; k < SHARDS; k++) out.offsets.start[k + 1] = out.offsets.start[k] + shards[k].items.size();
         if (out.offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
         for (uint32_t k = 0; k < SHARDS; k++) {
+            shards[k].items.shrink_to_fit();  // they live through the next layer's expansion, the peak
             out.segment[k] = std::move(shards[k].items);
             shards[k].items.clear();  // moved-from: make it certainly empty
-            shards[k].table = IdTable(SHARD_SLOTS);
+            shards[k].table = ShardTable();
         }
         return out;
     }
@@ -633,8 +735,8 @@ public:
 private:
     struct Shard {
         std::mutex m;
-        IdTable table{SHARD_SLOTS};
-        std::vector<T> items;
+        ShardTable table;
+        BigVector<T> items;
     };
     std::array<Shard, SHARDS> shards;
 };
@@ -645,7 +747,7 @@ uint64_t hashInts(const int32_t* p, size_t n);
 class ShardedSets {
 public:
     explicit ShardedSets(size_t expected = 0) {
-        for (auto& s : shards) s.table = IdTable(shardSlots(expected));
+        for (auto& s : shards) s.table = ShardTable(perShard(expected));
     }
     uint32_t intern(const std::vector<int32_t>& set) {
         uint64_t h = hashInts(set.data(), set.size());
@@ -658,10 +760,13 @@ public:
         };
         int32_t local = s.table.findOrInsert(h, same, [&]() {
             if (s.start.size() > SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
+            if (s.pool.size() + set.size() > UINT32_MAX) fail("a layer's sets are too large for 32-bit offsets");
+            makeRoom(s.pool, set.size());
             s.pool.insert(s.pool.end(), set.begin(), set.end());
-            s.start.push_back(s.pool.size());
+            makeRoom(s.start, 1);
+            s.start.push_back((uint32_t)s.pool.size());
             return (int32_t)s.start.size() - 2;
-        });
+        }, [&](int32_t id) { return hashInts(s.pool.data() + s.start[id], s.start[id + 1] - s.start[id]); });
         return (uint32_t)local << SHARD_BITS | k;
     }
     bool empty() const {
@@ -675,11 +780,13 @@ public:
         if (out.offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
         for (uint32_t k = 0; k < SHARDS; k++) {
             Shard& s = shards[k];
+            s.pool.shrink_to_fit();  // they live through the next layer's expansion, the peak
+            s.start.shrink_to_fit();
             out.pool[k] = std::move(s.pool);
             s.pool.clear();
             out.start[k] = std::move(s.start);
             s.start.assign(1, 0);
-            s.table = IdTable(SHARD_SLOTS);
+            s.table = ShardTable();
         }
         return out;
     }
@@ -687,9 +794,9 @@ public:
 private:
     struct Shard {
         std::mutex m;
-        IdTable table{SHARD_SLOTS};
-        std::vector<int32_t> pool;
-        std::vector<uint64_t> start{0};
+        ShardTable table;
+        BigVector<int32_t> pool;
+        BigVector<uint32_t> start{0};
     };
     std::array<Shard, SHARDS> shards;
 };
@@ -1041,16 +1148,19 @@ constexpr size_t SUBSET_CHUNK = 1 << 10;  // subset states per task
 constexpr size_t MINIMIZE_CHUNK = 1 << 14;  // raw states per task when minimizing
 
 // A transducer state's moves, in one record so that the subset phase, which visits states in no useful order,
-// pays one cache miss for the record and one for the moves.
-struct MoveRef {
+// pays one cache miss for the record and one for the moves. Both are packed: after the states themselves they
+// are a layer's largest arrays.
+struct __attribute__((packed)) MoveRef {
     uint32_t start;  // in its expansion chunk's moves
-    uint16_t count;
-    uint8_t accepting;
+    uint16_t count : 15;
+    uint16_t accepting : 1;
 };
-struct Move {
+struct __attribute__((packed)) Move {
     uint32_t tgt;  // interned id, then dense id in the next layer
     uint8_t sym;
 };
+static_assert(sizeof(MoveRef) == 6 && sizeof(Move) == 5, "moves and their records should pack");
+constexpr size_t MAX_STATE_MOVES = (1 << 15) - 1;
 
 struct LayerOutput {  // one task's share of a layer, in subset-state order
     std::vector<uint8_t> acc, degree, sym;
@@ -1147,12 +1257,14 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         const auto tExpand = clock();
         // every transducer state's moves, with targets as ids of the next layer
         size_t n = nstates.size(), chunks = (n + EXPAND_CHUNK - 1) / EXPAND_CHUNK;
-        std::vector<std::vector<Move>> moves(chunks);
-        std::vector<MoveRef> refs(n);
+        std::vector<BigVector<Move>> moves(chunks);
+        BigVector<MoveRef> refs(n);
         auto nextStates = std::make_unique<ShardedIds<NState, NStateHash>>(n);
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
             std::vector<std::pair<int, NState>> local;
+            std::vector<Move> chunk;  // copied out at its exact size: no growth slack, no growth garbage
             for (size_t c = b; c < e; c++) {
+                chunk.clear();
                 const size_t lo = c * EXPAND_CHUNK, hi = std::min(n, (c + 1) * EXPAND_CHUNK);
                 uint32_t k = nstates.offsets.shardOf(lo);
                 for (size_t id = lo; id < hi; id++) {
@@ -1161,13 +1273,15 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
                     expand(from, local);
                     MoveRef& ref = refs[id];
                     ref.accepting = isAccept(from);
-                    ref.start = (uint32_t)moves[c].size();
+                    ref.start = (uint32_t)chunk.size();
                     for (auto& [sy, t] : local) {
                         if (sy < 0) continue;
-                        moves[c].push_back(Move{nextStates->intern(t), (uint8_t)sy});
+                        chunk.push_back(Move{nextStates->intern(t), (uint8_t)sy});
                     }
-                    ref.count = (uint16_t)(moves[c].size() - ref.start);
+                    if (chunk.size() - ref.start > MAX_STATE_MOVES) fail("a transducer state has too many moves");
+                    ref.count = (uint16_t)(chunk.size() - ref.start);
                 }
+                moves[c].assign(chunk.begin(), chunk.end());
             }
         });
         Segmented<NState> following = nextStates->finish();
@@ -1242,8 +1356,8 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
                 }
             }
         });
-        std::vector<std::vector<Move>>().swap(moves);
-        std::vector<MoveRef>().swap(refs);
+        std::vector<BigVector<Move>>().swap(moves);
+        BigVector<MoveRef>().swap(refs);
         const auto tWrite = clock();
         if (stats) {
             uint64_t pool = 0, edges = 0;
@@ -1332,23 +1446,24 @@ LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string 
         // classes are found in sharded tables (in parallel), then numbered densely shard by shard
         struct ClassShard {
             std::mutex m;
-            IdTable table{SHARD_SLOTS};
-            std::vector<int32_t> rep;
+            ShardTable table;
+            BigVector<int32_t> rep;
         };
         auto shards = std::make_unique<std::array<ClassShard, SHARDS>>();
-        for (auto& sh : *shards) sh.table = IdTable(shardSlots(std::min<size_t>(lastClasses, n)));
+        for (auto& sh : *shards) sh.table = ShardTable(perShard(std::min<size_t>(lastClasses, n)));
+        auto classHash = [&](uint64_t v) {
+            uint64_t h = acc[v] ? HASH_ACCEPT : HASH_REJECT;
+            for (uint32_t x = off[v]; x < off[v + 1]; x++) if (tgt[x] >= 0) h = mixEdge(h, sym[x], tgt[x]);
+            return h;
+        };
         std::vector<int32_t> cls(n, -1);
         std::vector<uint32_t> sparse(n);
         workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
             for (uint64_t v = b; v < end; v++) {
                 bool useful = acc[v];
-                uint64_t h = acc[v] ? HASH_ACCEPT : HASH_REJECT;
-                for (uint32_t x = off[v]; x < off[v + 1]; x++) {
-                    if (tgt[x] < 0) continue;
-                    useful = true;
-                    h = mixEdge(h, sym[x], tgt[x]);
-                }
+                for (uint32_t x = off[v]; x < off[v + 1] && !useful; x++) useful = tgt[x] >= 0;
                 if (!useful) continue;
+                const uint64_t h = classHash(v);
                 uint32_t k = shardOf(h);
                 ClassShard& sh = (*shards)[k];
                 auto sameAs = [&](int32_t c) {
@@ -1367,9 +1482,10 @@ LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string 
                 std::lock_guard<std::mutex> lock(sh.m);
                 int32_t local = sh.table.findOrInsert(h, sameAs, [&]() {
                     if (sh.rep.size() >= SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
+                    makeRoom(sh.rep, 1);
                     sh.rep.push_back((int32_t)v);
                     return (int32_t)sh.rep.size() - 1;
-                });
+                }, [&](int32_t c) { return classHash((uint64_t)sh.rep[c]); });
                 sparse[v] = (uint32_t)local << SHARD_BITS | k;
                 cls[v] = 0;  // useful; numbered below
             }
