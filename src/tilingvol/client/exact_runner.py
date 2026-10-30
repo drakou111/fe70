@@ -18,6 +18,7 @@ from tilingvol.shared.protocol import EXACT_LOOKAHEAD, ExactOutcome
 
 MSG_EXACT_ROW = "exact_row"  # (row, states, compute seconds so far)
 MSG_EXACT_DONE = "exact_done"  # (ExactOutcome)
+MSG_EXACT_PROGRESS = "exact_progress"  # (ExactStep) within the row being built
 BINARY_ENV = "TILINGVOL_EXACT_BIN"
 BINARY_NAME = "exact_width.exe" if sys.platform == "win32" else "exact_width"
 CHECKPOINT_SUFFIX = ".ckpt"
@@ -30,11 +31,22 @@ EXIT_FAILED = 2  # the program's own errors (disk full, damaged checkpoint), exp
 CHECKPOINT_NAME = re.compile(r"(?P<piece>[a-z]+)-(?P<width>\d+)\.ckpt")
 ROW_LINE = re.compile(r"row (\d+) states (\d+) words \S+ seconds (\d+)")
 LOOKAHEAD_LINE = re.compile(r"lookahead (\d+)")
+PROGRESS_LINE = re.compile(r"progress (build|minimize|prune) (\d+) (\d+)")
 ROOT = Path(__file__).resolve().parents[3]
 
 
 class ExactBinaryMissing(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ExactStep:
+    """Where the program is within the row it is building: a phase (build, minimize or prune) and the
+    columns of the row it has done."""
+
+    phase: str
+    done: int
+    total: int
 
 
 def exact_binary() -> Path:
@@ -157,6 +169,7 @@ class ExactProcess:
             ),  # a resumed run keeps its checkpoint's lookahead instead
             "--threads",
             str(threads),
+            "--progress",
         ]
         if keep_checkpoint:
             command += ["--checkpoint", str(files.checkpoint)]
@@ -209,6 +222,11 @@ class ExactProcess:
             lines.append(line)
             if line.startswith("start "):
                 self._messages.put((MSG_STAGE_START, 0))
+                continue
+            match = PROGRESS_LINE.fullmatch(line)
+            if match:
+                step = ExactStep(match[1], int(match[2]), int(match[3]))
+                self._messages.put((MSG_EXACT_PROGRESS, step))
                 continue
             match = ROW_LINE.fullmatch(line)
             if match:

@@ -24,6 +24,7 @@ from tilingvol.client.controller import (
     Status,
     format_duration,
 )
+from tilingvol.client.exact_runner import ExactStep
 from tilingvol.client.key import load_submit_key
 from tilingvol.client.memory_guard import installed_ram_mb
 from tilingvol.client.release_key import RELEASE_PUBLIC_KEY_HEX
@@ -220,6 +221,21 @@ def since(timestamp: float) -> str:
     if seconds >= SILENCE_WARNING_S:
         text += " (retrying; searches continue and results are kept)"
     return text
+
+
+EXACT_PHASES = {"build": "building", "minimize": "minimizing", "prune": "pruning"}
+
+
+def exact_progress_text(
+    exact_row: tuple[int, int] | None, step: ExactStep | None
+) -> str:
+    """The row an exact run reached, and how far it is in the next one: "row 14 | 15: building 87/175"."""
+    reached = f"row {exact_row[0]}" if exact_row else ""
+    if step is None:
+        return reached
+    working = f"{exact_row[0] + 1}: " if exact_row else ""
+    detail = f"{working}{EXACT_PHASES[step.phase]} {step.done}/{step.total}"
+    return f"{reached} | {detail}" if reached else detail
 
 
 def combined_state(states: list[State]) -> State:
@@ -444,7 +460,7 @@ class App:
             ("size", "Size", 190),
             ("stage", "Stage", 150),
             ("time", "Stage time", 130),
-            ("progress", "Progress", 90),
+            ("progress", "Progress", 190),
             ("ram", "RAM", 100),
         ):
             self.table.heading(column, text=title, anchor="w")
@@ -796,8 +812,8 @@ class App:
                 if status.ram_cap_mb
                 else "-"
             )
-            if status.exact_row:
-                progress = f"row {status.exact_row[0]}"
+            if status.exact_row or status.exact_step:
+                progress = exact_progress_text(status.exact_row, status.exact_step)
             elif status.progress:
                 progress = f"{status.progress[0]}/{status.progress[1]}"
             else:

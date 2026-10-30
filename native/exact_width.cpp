@@ -519,6 +519,17 @@ public:
 
     int size() const { return count; }
 
+    // With --progress, "progress PHASE DONE TOTAL" on stdout (columns of the row being built), at most once a
+    // second. The workers carry it because every long phase is handed them; it is called between parallel steps.
+    void enableProgress() { progressOn = true; }
+    void progress(const char* phase, size_t done, size_t total) {
+        if (!progressOn) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastProgress < PROGRESS_INTERVAL) return;
+        lastProgress = now;
+        std::cout << "progress " << phase << " " << std::min(done, total) << " " << total << "\n" << std::flush;
+    }
+
     // body(begin, end) on chunks of [0, n), `grain` items each, spread over the threads
     void forRange(size_t n, size_t grain, const std::function<void(size_t, size_t)>& body) {
         forRange(n, grain, [&](size_t b, size_t e, int) { body(b, e); });
@@ -548,6 +559,9 @@ public:
 private:
     int count;
     std::vector<std::thread> pool;
+    static constexpr std::chrono::seconds PROGRESS_INTERVAL{1};
+    bool progressOn = false;
+    std::chrono::steady_clock::time_point lastProgress{};
     std::mutex m;
     std::condition_variable wake, finished;
     const std::function<void(size_t, size_t, int)>* job = nullptr;
@@ -1378,6 +1392,7 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         writeLayer(out, setsOf.offsets, sink, workers);
         if (stats) writeSeconds += seconds(tWrite, clock());
         layerIndex++;
+        workers.progress("build", inputDepth, in.depth() - 1);
         if (last) break;
         nstates = std::move(following);
     }
@@ -1530,6 +1545,7 @@ LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string 
         });
         out.put(d, minAcc.data(), minOff.data(), minSym.data(), minTgt.data(), classes);
         clsNext.swap(cls);
+        workers.progress("minimize", L - d, L);
     }
     fclose(sink.f);
     std::remove(raw.c_str());
@@ -1749,6 +1765,7 @@ public:
         std::vector<std::unordered_map<uint64_t, bool>> caches(workers.size());  // in front of the shared memo
         for (int pos = 0; pos <= W && !layer.empty(); pos++) {
             d.get(pos, in);
+            workers.progress("prune", pos, W);
             size_t parts = (layer.size() + KEEP_CHUNK - 1) / KEEP_CHUNK;
             std::vector<LayerOutput> out(parts);
             auto nextKeys = std::make_unique<ShardedIds<WindowKey, WindowKeyHash>>();
@@ -1791,6 +1808,7 @@ public:
         Segmented<WindowKey> layer(std::vector<WindowKey>{{d.start, (uint64_t)f.start}});
         for (int pos = 0; pos <= W && !layer.empty(); pos++) {
             d.get(pos, in);
+            workers.progress("prune", pos, W);
             size_t parts = (layer.size() + KEEP_CHUNK - 1) / KEEP_CHUNK;
             std::vector<LayerOutput> out(parts);
             auto nextKeys = std::make_unique<ShardedIds<WindowKey, WindowKeyHash>>();
@@ -2241,16 +2259,18 @@ struct Options {
     std::string cellsText, checkpoint, scratch, dumpDir;
     int lookahead = 0;
     int threads = 1;
+    bool progress = false;
 };
 
 const char* USAGE =
     "usage: exact_width --width W --cells \"x,y x,y ...\" --scratch FILE [--checkpoint FILE] [--start-row R]\n"
-    "                   [--dump DIR] [--lookahead K] [--threads N]\n"
+    "                   [--dump DIR] [--lookahead K] [--threads N] [--progress]\n"
     "Decides exactly whether the piece's width-W half-strip dies, tiles a rectangle or fills forever.\n"
     "With --checkpoint, resumes from FILE if it exists and rewrites it after every row. The scratch file\n"
     "holds one raw row. --dump writes every row's minimal automaton to DIR/row<r>.dfa. --lookahead K keeps only\n"
     "frontiers that can fill K more rows (same verdicts; the state counts are of the kept sets). --threads N\n"
-    "spreads each row's work over N threads (same verdicts and state counts).\n";
+    "spreads each row's work over N threads (same verdicts and state counts). --progress prints\n"
+    "'progress PHASE DONE TOTAL' lines (PHASE build, minimize or prune; columns of the row) at most once a second.\n";
 
 int parseInt(const std::string& text, const char* what) {
     try {
@@ -2283,6 +2303,7 @@ Options parseOptions(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--help" || a == "-h") { std::cout << USAGE; std::exit(0); }
+        if (a == "--progress") { o.progress = true; continue; }
         if (i + 1 >= argc) fail("missing value after " + a + "\n" + USAGE);
         std::string v = argv[++i];
         if (a == "--width") o.width = parseInt(v, "--width");
@@ -2347,6 +2368,7 @@ int run(int argc, char** argv) {
     auto oris = orientationsOf(opt.cells);
     const int W = opt.width;
     Workers workers(opt.threads);
+    if (opt.progress) workers.enableProgress();
     // the row automata live in <scratch>.<n> files, each deleted with its object (see Finished)
     ScratchFiles files(opt.scratch);
     files.removeLeftovers();

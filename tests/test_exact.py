@@ -23,12 +23,15 @@ from tilingvol.client.controller import Controller
 from tilingvol.client.exact_runner import (
     BINARY_ENV,
     MSG_EXACT_DONE,
+    MSG_EXACT_PROGRESS,
     MSG_EXACT_ROW,
     ExactFiles,
     ExactProcess,
+    ExactStep,
     checkpointed_widths,
     parse_outcome,
 )
+from tilingvol.client.gui import exact_progress_text
 from tilingvol.client.solver_process import MSG_STAGE_START
 from tilingvol.client.width_queue import WidthQueue
 from tilingvol.server.app import create_app
@@ -124,6 +127,24 @@ def outcome_of(messages: list[tuple]) -> ExactOutcome:
 
 def rows_of(messages: list[tuple]) -> dict[int, int]:
     return {m[1]: m[2] for m in messages if m[0] == MSG_EXACT_ROW}
+
+
+def test_the_program_reports_where_it_is_within_a_row(use_binary, tmp_path):
+    messages = run_width(tmp_path, SIB_FOREVER[0])
+    steps = [m[1] for m in messages if m[0] == MSG_EXACT_PROGRESS]
+    assert steps  # the first report is never held back
+    assert all(
+        s.phase in ("build", "minimize", "prune") and 0 <= s.done <= s.total
+        for s in steps
+    )
+
+
+def test_the_progress_column_shows_the_row_and_where_it_is_in_the_next():
+    assert exact_progress_text((14, 5), None) == "row 14"
+    build = ExactStep("build", 87, 175)
+    assert exact_progress_text((14, 5), build) == "row 14 | 15: building 87/175"
+    minimize = ExactStep("minimize", 3, 10)
+    assert exact_progress_text(None, minimize) == "minimizing 3/10"
 
 
 def test_the_program_reaches_all_three_verdicts(use_binary, tmp_path):

@@ -26,10 +26,12 @@ from tilingvol.client.exact_runner import (
     MIN_FREE_DISK_MB,
     MIN_FREE_SCRATCH_MB,
     MSG_EXACT_DONE,
+    MSG_EXACT_PROGRESS,
     MSG_EXACT_ROW,
     ExactBinaryMissing,
     ExactFiles,
     ExactProcess,
+    ExactStep,
     checkpointed_widths,
 )
 from tilingvol.client.settings import PendingResults, Settings
@@ -115,6 +117,7 @@ class Status:
         0.0  # time.time() of the last answer from the server, 0 if none yet
     )
     exact_row: tuple[int, int] | None = None  # an exact decision: (row reached, states)
+    exact_step: ExactStep | None = None  # ... and where it is in the next row
 
 
 @dataclass(frozen=True)
@@ -175,6 +178,7 @@ class SolverRunner:
     used_mb: int = 0
     progress: tuple[int, int] | None = None
     exact_row: tuple[int, int] | None = None
+    exact_step: ExactStep | None = None
     first_stage: int = 0
     kill_reason: str = ""  # "timeout" or "memory: ..."
     finished: bool = False
@@ -686,9 +690,13 @@ class Controller:
                 if message[1] == runner.stage_index:
                     runner.progress = (message[2], message[3])
                 continue
+            if kind == MSG_EXACT_PROGRESS:
+                runner.exact_step = message[1]
+                continue
             if kind == MSG_EXACT_ROW:
                 _, row, states, seconds = message
                 runner.exact_row = (row, states)
+                runner.exact_step = None
                 self._log(
                     f"Width {self._job.width}: row {row}, {states:,} states "
                     f"({format_duration(seconds)} of compute so far)."
@@ -1085,6 +1093,7 @@ class Controller:
                     ram_cap_mb=self._settings.max_ram_mb if self._settings else 0,
                     progress=runner.progress if runner else None,
                     exact_row=runner.exact_row if runner else None,
+                    exact_step=runner.exact_step if runner else None,
                     finished=self._finished,
                     waiting_until=self._next_request_at if self._job is None else 0.0,
                     last_reached=self._api.last_reached if self._api else 0.0,
