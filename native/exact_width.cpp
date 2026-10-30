@@ -72,9 +72,12 @@ constexpr size_t RECENT_ROW_STATES = 1 << 22;
     std::exit(2);
 }
 
+using Window = unsigned __int128;  // the transducer's columns c-3..c+6, 7 bits each, column c-3 lowest
+
 struct Orientation {
     std::vector<Cell> cells;  // (dr >= 0, dc), relative to the first row-major cell
     int minDc = 0;
+    Window mask = 0;  // its cells in a Window anchored at column c
 };
 
 std::vector<Cell> normalize(std::vector<Cell> c) {
@@ -108,6 +111,7 @@ std::vector<Orientation> orientationsOf(const std::vector<Cell>& base) {
                 fail("the piece must fit in 7 rows and 3 columns left / 6 right of its first cell");
             ori.cells.push_back({dr, dc});
             ori.minDc = std::min(ori.minDc, dc);
+            ori.mask |= (Window)1 << (COL_BITS * (LEFT_REACH + dc) + dr);
         }
         out.push_back(ori);
     }
@@ -151,29 +155,21 @@ void stepColumn(const std::vector<Orientation>& oris, const NState& s, int x, in
                 std::vector<std::pair<int, NState>>& out) {
     uint32_t p0 = colOf(s.pend, 0);
     if (x & p0) return;
-    uint32_t cols[10];
-    for (int i = 0; i < 3; i++) cols[i] = (s.win >> (i * COL_BITS)) & 0x7F;
-    cols[3] = x | p0;
-    for (int i = 1; i <= 6; i++) cols[3 + i] = colOf(s.pend, i);
-    auto emit = [&](const uint32_t* c) {
+    constexpr int CUR = LEFT_REACH * COL_BITS;  // column c's first bit
+    const Window cols = (Window)s.win | (Window)(x | p0) << CUR | (Window)(s.pend >> COL_BITS) << (CUR + COL_BITS);
+    auto emit = [&](Window c) {
         NState n;
         n.q = nq;
         n.cap = (uint8_t)std::min(s.cap + 1, LEFT_REACH);
-        n.win = c[1] | c[2] << COL_BITS | c[3] << (2 * COL_BITS);
-        n.pend = 0;
-        for (int i = 0; i < 6; i++) n.pend |= (uint64_t)c[4 + i] << (i * COL_BITS);
-        out.push_back({s.cap == LEFT_REACH ? (int)(c[0] >> 1) : -1, n});
+        n.win = (uint32_t)(c >> COL_BITS) & ((1u << (3 * COL_BITS)) - 1);
+        n.pend = (uint64_t)(c >> (CUR + COL_BITS)) & ((1ULL << (6 * COL_BITS)) - 1);
+        out.push_back({s.cap == LEFT_REACH ? (int)(((uint32_t)c & 0x7F) >> 1) : -1, n});
     };
-    if (cols[3] & 1) { emit(cols); return; }
+    if ((cols >> CUR) & 1) { emit(cols); return; }
     for (auto& o : oris) {
         if (o.minDc < -(int)s.cap) continue;  // would cross the left wall
-        bool ok = true;
-        for (auto& c : o.cells) if (cols[3 + c.second] >> c.first & 1) { ok = false; break; }
-        if (!ok) continue;
-        uint32_t nc[10];
-        memcpy(nc, cols, sizeof nc);
-        for (auto& c : o.cells) nc[3 + c.second] |= 1u << c.first;
-        emit(nc);
+        if (cols & o.mask) continue;
+        emit(cols | o.mask);
     }
 }
 
@@ -373,7 +369,7 @@ public:
     explicit IdTable(size_t initialSlots = 1 << 16) { slots.assign(initialSlots, Slot{-1, 0}); }
     template <class Eq, class Make>
     int32_t findOrInsert(uint64_t h, Eq eq, Make make) {
-        if ((count + 1) * 2 > slots.size()) grow();
+        if ((count + 1) * 10 > slots.size() * 7) grow();  // at most 70% full: tags keep long probes cheap
         const uint32_t tag = (uint32_t)h;
         size_t mask = slots.size() - 1, i = h & mask;
         while (slots[i].id >= 0) {
@@ -541,6 +537,13 @@ constexpr size_t SHARD_SLOTS = 1 << 8;
 
 inline uint32_t shardOf(uint64_t h) { return (uint32_t)(h >> (64 - SHARD_BITS)); }
 
+// slots for one shard of a table expected to hold `items` in all (at most 70% full, a power of two)
+inline size_t shardSlots(size_t items) {
+    size_t slots = SHARD_SLOTS;
+    while (slots < (1ULL << 26) && slots * 7 < 10 * (items / SHARDS + 1)) slots *= 2;
+    return slots;
+}
+
 class ShardOffsets {
 public:
     std::array<uint64_t, SHARDS + 1> start{};
@@ -595,6 +598,10 @@ public:
 template <class T, class Hash>
 class ShardedIds {
 public:
+    // `expected`: about how many items will come (the previous layer's count), so tables rarely grow
+    explicit ShardedIds(size_t expected = 0) {
+        for (auto& s : shards) s.table = IdTable(shardSlots(expected));
+    }
     uint32_t intern(const T& item) {
         uint64_t h = Hash{}(item);
         uint32_t k = shardOf(h);
@@ -636,6 +643,9 @@ uint64_t hashInts(const int32_t* p, size_t n);
 // Sets of int32 (sorted, as the caller hands them in) interned like ShardedIds.
 class ShardedSets {
 public:
+    explicit ShardedSets(size_t expected = 0) {
+        for (auto& s : shards) s.table = IdTable(shardSlots(expected));
+    }
     uint32_t intern(const std::vector<int32_t>& set) {
         uint64_t h = hashInts(set.data(), set.size());
         uint32_t k = shardOf(h);
@@ -1138,7 +1148,7 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         size_t n = nstates.size(), chunks = (n + EXPAND_CHUNK - 1) / EXPAND_CHUNK;
         std::vector<std::vector<Move>> moves(chunks);
         std::vector<MoveRef> refs(n);
-        auto nextStates = std::make_unique<ShardedIds<NState, NStateHash>>();
+        auto nextStates = std::make_unique<ShardedIds<NState, NStateHash>>(n);
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
             std::vector<std::pair<int, NState>> local;
             for (size_t c = b; c < e; c++) {
@@ -1173,13 +1183,29 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         // every subset state's successor set per symbol
         size_t sets = setsOf.size(), parts = (sets + SUBSET_CHUNK - 1) / SUBSET_CHUNK;
         std::vector<LayerOutput> out(parts);
-        auto nextSets = std::make_unique<ShardedSets>();
+        auto nextSets = std::make_unique<ShardedSets>(sets);
         workers.forRange(parts, 1, [&](size_t b, size_t e) {
             std::vector<uint64_t> keys;  // symbol << 32 | target, of every member's moves
             std::vector<int32_t> succ;
+            // members are scattered over the layer: fetch the records of the set two ahead and the moves of the
+            // next one while this one is gathered (a negative last element is the filter's state)
+            auto prefetchRefs = [&](size_t d) {
+                if (d >= sets) return;
+                for (int32_t id : setsOf[d]) if (id >= 0) __builtin_prefetch(&refs[id]);
+            };
+            auto prefetchMoves = [&](size_t d) {
+                if (d >= sets) return;
+                for (int32_t id : setsOf[d])
+                    if (id >= 0) __builtin_prefetch(moves[id / EXPAND_CHUNK].data() + refs[id].start);
+            };
             for (size_t p = b; p < e; p++) {
                 LayerOutput& o = out[p];
-                for (size_t d = p * SUBSET_CHUNK; d < std::min(sets, (p + 1) * SUBSET_CHUNK); d++) {
+                const size_t first = p * SUBSET_CHUNK;
+                prefetchRefs(first);
+                prefetchRefs(first + 1);
+                for (size_t d = first; d < std::min(sets, (p + 1) * SUBSET_CHUNK); d++) {
+                    prefetchRefs(d + 2);
+                    prefetchMoves(d + 1);
                     bool acc = false;
                     keys.clear();
                     std::span<const int32_t> set = setsOf[d];
@@ -1287,6 +1313,7 @@ LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string 
     std::vector<uint8_t> acc, sym, minAcc, minSym;
     std::vector<uint32_t> off, minOff;
     std::vector<int32_t> tgt, minTgt;
+    size_t lastClasses = 0;  // sizes the next layer's tables: neighbouring layers have similar class counts
     for (size_t d = L; d-- > 0;) {
         if (FSEEK(sink.f, sink.layerPos[d], SEEK_SET) != 0) fail("scratch file seek failed");
         uint64_t n = readValue<uint64_t>(sink.f, "scratch"), e = readValue<uint64_t>(sink.f, "scratch");
@@ -1308,6 +1335,7 @@ LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string 
             std::vector<int32_t> rep;
         };
         auto shards = std::make_unique<std::array<ClassShard, SHARDS>>();
+        for (auto& sh : *shards) sh.table = IdTable(shardSlots(std::min<size_t>(lastClasses, n)));
         std::vector<int32_t> cls(n, -1);
         std::vector<uint32_t> sparse(n);
         workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
@@ -1357,6 +1385,7 @@ LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string 
         std::vector<uint32_t>().swap(sparse);
         // exact sizes first (edge counts per class, then their prefix sums), so the layer is filled in place
         size_t classes = rep.size();
+        lastClasses = classes;
         minAcc.resize(classes);
         minOff.assign(classes + 1, 0);
         workers.forRange(classes, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
