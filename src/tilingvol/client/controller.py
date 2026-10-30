@@ -561,9 +561,9 @@ class Controller:
                 else "no checkpoints are saved (Save checkpoints is off), so a stop or crash starts it over"
             )
             self._log(
-                f"Got width {job.width} for an exact decision ({again}; about "
-                f"{job.est_ram_mb / 1024:.0f} GB of RAM, {settings.max_threads} threads). It runs until the width dies, tiles a "
-                f"rectangle or repeats; {saving}."
+                f"Got width {job.width} for an exact decision ({again}; RAM grows with the width, up to "
+                f"your Max RAM of {settings.max_ram_mb / 1024:.0f} GB, {settings.max_threads} threads). It runs "
+                f"until the width dies, tiles a rectangle or repeats; {saving}."
             )
             return
         if job.periodic:

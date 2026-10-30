@@ -89,9 +89,10 @@ class ServerConfig:
     # job tries; the widths 176, 184 and 280 repeat with period 10 from row 60 (research repo)
     periodic_configs: tuple[tuple[int, int], ...] = DEFAULT_PERIODIC_CONFIGS
     periodic_stages: int = 2
-    # exact width decisions: the RAM a volunteer must allow (width 137 peaked at 16.3 GB), and how long a
+    # exact width decisions: the RAM a run is expected to start with (it grows with the width: 2 GB at 144,
+    # over 40 GB at 175; a width that ran out of memory needs more, see Scheduler._pick_exact), and how long a
     # width stays with the volunteer whose checkpoint reached a row, after their last heartbeat
-    exact_ram_mb: int = 24 * 1024
+    exact_start_ram_mb: int = 2048
     exact_reserve_s: float = 3 * 86400.0
     # who to ask for an access token, shown on the page and in the app's "needs a token" message
     contact: str = "Drakou111 on Discord"
@@ -156,7 +157,9 @@ class ServerConfig:
                 os.environ.get("TILINGVOL_PERIODIC_CONFIGS", "")
             ),
             periodic_stages=int(os.environ.get("TILINGVOL_PERIODIC_STAGES", "2")),
-            exact_ram_mb=int(os.environ.get("TILINGVOL_EXACT_RAM_MB", str(24 * 1024))),
+            exact_start_ram_mb=int(
+                os.environ.get("TILINGVOL_EXACT_START_RAM_MB", "2048")
+            ),
             exact_reserve_s=float(
                 os.environ.get("TILINGVOL_EXACT_RESERVE_S", str(3 * 86400))
             ),

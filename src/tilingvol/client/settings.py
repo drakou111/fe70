@@ -140,7 +140,7 @@ class Settings:
         depths = parse_custom_stages(self.custom_stages)
         if self.search == SEARCH_EXACT and self.parallel != 1:
             raise ValueError(
-                "exact decisions run one at a time (each needs tens of GB of RAM); set Parallel searches to 1"
+                "exact decisions run one at a time (each can take all the RAM it is allowed); set Parallel searches to 1"
             )
         folder = self.exact_folder.strip()
         if folder and not Path(folder).is_absolute():

@@ -78,8 +78,9 @@ SEARCH_HINTS = {
     "rules out symmetric tilings only.",
     SEARCH_FOREVER: "Looks for a half-strip filling that repeats; one found proves the width fills forever, "
     "so it never needs a strip search again.",
-    SEARCH_EXACT: "Decides one width for good: every row until it dies, tiles a rectangle or repeats. Needs "
-    "about 24 GB of RAM and 20 GB of disk (40 GB with checkpoints) and runs for hours.",
+    SEARCH_EXACT: "Decides one width for good: every row until it dies, tiles a rectangle or repeats. RAM "
+    "grows with the width (about 2 GB at 144, over 40 GB at 175); it needs 20 GB of disk (40 GB with "
+    "checkpoints) and runs for hours.",
 }
 # per search: (request placeholder, request hint, depths placeholder, depths hint)
 SEARCH_FIELDS = {

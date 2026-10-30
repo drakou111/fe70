@@ -382,6 +382,15 @@ class Database:
             ).fetchall()
         return {(w, h): m for w, h, m in rows}
 
+    def exact_memory_failures(self) -> dict[int, int]:
+        """Width -> the most RAM an exact run of it had when it ran out: its peak, or its cap if unknown."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT width, MAX(COALESCE(peak_ram_mb, est_ram_mb)) FROM jobs"
+                " WHERE end_reason = 'memory' AND lane = 'exact' GROUP BY width"
+            ).fetchall()
+        return {w: m for w, m in rows}
+
     # results
     def add_result(
         self,

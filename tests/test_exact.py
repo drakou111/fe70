@@ -440,7 +440,7 @@ def test_a_resumed_run_keeps_its_checkpoints_lookahead(use_binary, tmp_path):
 
 @pytest.fixture
 def exact_config(sib_config):
-    return replace(sib_config, exact_ram_mb=2048)
+    return sib_config
 
 
 def ask(client, width=None, version=EXACT_SINCE, name=NAME, ram_mb=8192):
@@ -498,8 +498,9 @@ def test_exact_jobs_go_to_new_apps_side_prime_multiples_first(exact_config):
     assert SIBLING.side_prime == 7 and GUN.side_prime == 5
     with TestClient(create_app(exact_config)) as client:
         assert ask(client, version="0.12.0").status_code == 426
-        assert ask(client, ram_mb=1024).status_code == 404  # needs exact_ram_mb
-        job = ask(client).json()
+        job = ask(
+            client, ram_mb=1024
+        ).json()  # no RAM minimum: a run takes what it needs
         assert (job["lane"], job["width"], job["height"], job["threads"]) == (
             "exact",
             14,
@@ -602,6 +603,22 @@ def beat_and_release(client, job, resumable: bool, reason: str = "closed") -> No
         f"/api/jobs/{job['job_id']}/release",
         json={"nonce": job["nonce"], "reason": reason},
     )
+
+
+def test_a_width_that_ran_out_of_memory_needs_more_ram(exact_config):
+    with TestClient(create_app(exact_config)) as client:
+        job = ask(client, ram_mb=40_000).json()
+        assert (job["width"], job["est_ram_mb"]) == (14, 2048)
+        client.post(
+            f"/api/jobs/{job['job_id']}/release",
+            json={"nonce": job["nonce"], "reason": "memory", "peak_ram_mb": 30_000},
+        )
+        # 1.5 x the 30,000 MB it had: not for the same cap, not even for its own checkpoint
+        assert ask(client, ram_mb=40_000).json()["width"] == 21
+        refused = ask(client, width=14, ram_mb=40_000, name="someone else")
+        assert refused.status_code == 409 and "at least 44 GB" in refused.text
+        bigger = ask(client, width=14, ram_mb=64_000, name="someone else").json()
+        assert bigger["est_ram_mb"] == 45_000
 
 
 def test_a_checkpointed_width_stays_with_its_volunteer(exact_config):

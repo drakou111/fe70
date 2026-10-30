@@ -544,23 +544,27 @@ class Scheduler:
         self, active, name: str, max_ram_mb: int, requested_width: int | None
     ) -> Assignment:
         """The smallest width divisible by the piece's side prime, then the smallest other one, that is
-        neither ruled out, decided exactly, running, nor reserved by someone else's checkpoint; a volunteer's
-        own checkpointed width comes back to them. Widths known to fill forever are handed out like any
-        other: only an exact run can tell whether one of them is a rectangle's side."""
-        need = self.config.exact_ram_mb
+        neither ruled out, decided exactly, running, reserved by someone else's checkpoint, nor known to need
+        more RAM than max_ram_mb; a volunteer's own checkpointed width comes back to them. Widths known to fill
+        forever are handed out like any other: only an exact run can tell whether one of them is a rectangle's
+        side. A run's RAM is not predicted, it only grows with the width: a width that ran out with some RAM
+        goes only to volunteers allowing MEMORY_RETRY_FACTOR times that."""
         dead = self.dead_widths()
         decided = self.exact_decided()
         leased = {j.width for j in active if j.lane == LANE_EXACT}
         reserved = self.exact_reserved(name)
+        failed = self.db.exact_memory_failures()
         stage = Stage(0, False, NO_LIMIT, exact=True)
 
-        def assignment(w: int) -> Assignment:
-            return Assignment(w, 0, LANE_EXACT, 1, need, (stage,))
+        def needs_mb(w: int) -> int:
+            if w not in failed:
+                return 0
+            return int(failed[w] * MEMORY_RETRY_FACTOR)
 
-        if max_ram_mb < need:
-            raise (RequestRefused if requested_width is not None else NoAssignment)(
-                f"an exact decision needs about {need / 1024:.0f} GB of RAM; raise Max RAM"
-            )
+        def assignment(w: int) -> Assignment:
+            est = max(self.config.exact_start_ram_mb, needs_mb(w))
+            return Assignment(w, 0, LANE_EXACT, 1, min(est, max_ram_mb), (stage,))
+
         if requested_width is not None:
             w = requested_width
             if not 1 <= w <= self.config.request_max_side:
@@ -577,12 +581,25 @@ class Scheduler:
                 raise RequestRefused(
                     f"width {w} is being decided by {reserved[w]} (they can resume it)"
                 )
+            if needs_mb(w) > max_ram_mb:
+                raise RequestRefused(
+                    f"width {w} ran out of memory before; it needs Max RAM of at least "
+                    f"{needs_mb(w) / 1024:.0f} GB"
+                )
             return assignment(w)
         prime = self.piece.side_prime
+        too_big = False
         for w in sorted(self.chart_widths(), key=lambda w: (w % prime != 0, w)):
             if w in dead or w in decided or w in leased or w in reserved:
                 continue
+            if needs_mb(w) > max_ram_mb:
+                too_big = True
+                continue
             return assignment(w)
+        if too_big:
+            raise NoAssignment(
+                f"every open width is decided, running, reserved or needs more than {max_ram_mb} MB"
+            )
         raise NoAssignment("every width in range is decided, running or reserved")
 
     # stages
