@@ -234,7 +234,14 @@ Dfa nextLanguageDense(const std::vector<Orientation>& oris, const Dfa& in) {
         cur.assign(nxt.begin(), nxt.end());
     }
 
-    std::map<std::vector<int32_t>, int32_t> did;
+    struct SetHash {
+        size_t operator()(const std::vector<int32_t>& set) const {
+            uint64_t h = 0x9E3779B97F4A7C15ULL ^ set.size();
+            for (int32_t x : set) { h ^= (uint64_t)(uint32_t)x + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2); h *= 0xBF58476D1CE4E5B9ULL; }
+            return h ^ (h >> 29);
+        }
+    };
+    std::unordered_map<std::vector<int32_t>, int32_t, SetHash> did;
     std::vector<std::vector<int32_t>> sets;
     Dfa out;
     auto internD = [&](const std::vector<int32_t>& set) -> int32_t {
@@ -251,10 +258,11 @@ Dfa nextLanguageDense(const std::vector<Orientation>& oris, const Dfa& in) {
     };
     if (cur.empty()) { internD({}); return out; }
     internD(cur);
+    std::array<std::vector<int32_t>, SYMBOLS> succ;
     for (size_t d = 0; d < sets.size(); d++) {
-        std::vector<int32_t> set = sets[d];
+        const std::vector<int32_t> set = sets[d];  // a copy: interning below may grow `sets`
         bool acc = false;
-        std::array<std::vector<int32_t>, SYMBOLS> succ;
+        for (auto& v : succ) v.clear();
         for (int32_t id : set) {
             if (isAccept(id)) acc = true;
             for (auto& [sym, t] : transitionsOf(id)) if (sym >= 0) succ[sym].push_back(t);
@@ -269,6 +277,14 @@ Dfa nextLanguageDense(const std::vector<Orientation>& oris, const Dfa& in) {
     }
     return out;
 }
+
+class IdTable;
+
+// Moore refinement of `cls` (-1 marks a state outside the automaton) under target(v, a), a < m (-1: none),
+// until the number of classes stops changing. Signatures are hashed; classes are numbered in order of first
+// appearance over increasing v, as a std::map of signatures numbered that way would.
+template <class Target>
+size_t refineClasses(std::vector<int32_t>& cls, int m, Target target);
 
 // Trim to reachable and co-reachable states, then Moore refinement.
 Dfa minimizeDense(const Dfa& d) {
@@ -293,23 +309,10 @@ Dfa minimizeDense(const Dfa& d) {
     if (alive.empty()) { out.next.push_back(empty); out.accept.push_back(0); return out; }
     std::vector<int32_t> cls(n, -1);
     for (int32_t v : alive) cls[v] = d.accept[v] ? 1 : 0;
-    size_t numCls = 0;
-    while (true) {
-        std::map<std::vector<int32_t>, int32_t> sig;
-        std::vector<int32_t> ncls(n, -1);
-        for (int32_t v : alive) {
-            std::vector<int32_t> key;
-            key.reserve(SYMBOLS + 1);
-            key.push_back(cls[v]);
-            for (int a = 0; a < SYMBOLS; a++) { int32_t t = d.next[v][a]; key.push_back(t >= 0 && reach[t] ? cls[t] : -1); }
-            auto it = sig.find(key);
-            if (it == sig.end()) it = sig.emplace(key, (int32_t)sig.size()).first;
-            ncls[v] = it->second;
-        }
-        cls = ncls;
-        if (sig.size() == numCls) break;
-        numCls = sig.size();
-    }
+    const size_t numCls = refineClasses(cls, SYMBOLS, [&](size_t v, int a) {
+        int32_t t = d.next[v][a];
+        return t >= 0 && reach[t] ? t : -1;
+    });
     out.next.assign(numCls, empty);
     out.accept.assign(numCls, 0);
     for (int32_t v : alive) {
@@ -362,40 +365,92 @@ struct SDfa {
     static SDfa emptyLanguage() { SDfa d; d.acc.push_back(0); d.off.push_back(0); return d; }
 };
 
-// Open-addressing table of int32 ids; key equality and hashing supplied by the caller.
+// Open-addressing table of int32 ids; key equality supplied by the caller. Each slot keeps the low 32 bits of
+// its key's hash: a probe compares keys only when they match (most probes then never touch the keys' memory),
+// and growing needs no key at all (slot indices are low hash bits, and tables stay below 2^32 slots).
 class IdTable {
 public:
-    explicit IdTable(size_t initialSlots = 1 << 16) { slots.assign(initialSlots, -1); }
+    explicit IdTable(size_t initialSlots = 1 << 16) { slots.assign(initialSlots, Slot{-1, 0}); }
     template <class Eq, class Make>
-    int32_t findOrInsert(uint64_t h, Eq eq, Make make, const std::function<uint64_t(int32_t)>& rehashOf) {
-        if ((count + 1) * 2 > slots.size()) grow(rehashOf);
+    int32_t findOrInsert(uint64_t h, Eq eq, Make make) {
+        if ((count + 1) * 2 > slots.size()) grow();
+        const uint32_t tag = (uint32_t)h;
         size_t mask = slots.size() - 1, i = h & mask;
-        while (slots[i] >= 0) {
-            if (eq(slots[i])) return slots[i];
+        while (slots[i].id >= 0) {
+            if (slots[i].tag == tag && eq(slots[i].id)) return slots[i].id;
             i = (i + 1) & mask;
         }
         int32_t id = make();
-        slots[i] = id;
+        slots[i] = Slot{id, tag};
         count++;
         return id;
     }
 
 private:
-    std::vector<int32_t> slots;
+    struct Slot {
+        int32_t id;
+        uint32_t tag;
+    };
+    std::vector<Slot> slots;
     size_t count = 0;
-    void grow(const std::function<uint64_t(int32_t)>& rehashOf) {
-        std::vector<int32_t> old;
+    void grow() {
+        if (slots.size() >= (1ULL << 31)) fail("a hash table outgrew 32-bit slot tags");
+        std::vector<Slot> old;
         old.swap(slots);
-        slots.assign(old.size() * 2, -1);
+        slots.assign(old.size() * 2, Slot{-1, 0});
         size_t mask = slots.size() - 1;
-        for (int32_t id : old) {
-            if (id < 0) continue;
-            size_t i = rehashOf(id) & mask;
-            while (slots[i] >= 0) i = (i + 1) & mask;
-            slots[i] = id;
+        for (const Slot& s : old) {
+            if (s.id < 0) continue;
+            size_t i = s.tag & mask;
+            while (slots[i].id >= 0) i = (i + 1) & mask;
+            slots[i] = s;
         }
     }
 };
+
+template <class Target>
+size_t refineClasses(std::vector<int32_t>& cls, int m, Target target) {
+    const size_t n = cls.size();
+    // the edges once, sparsely: most of a dense automaton's entries are -1
+    std::vector<uint64_t> off(n + 1, 0);
+    std::vector<uint8_t> sym;
+    std::vector<int32_t> tgt;
+    for (size_t v = 0; v < n; v++) {
+        if (cls[v] >= 0)
+            for (int a = 0; a < m; a++)
+                if (int32_t t = target(v, a); t >= 0) { sym.push_back((uint8_t)a); tgt.push_back(t); }
+        off[v + 1] = sym.size();
+    }
+    std::vector<int32_t> next(n, -1), rep;
+    size_t classes = SIZE_MAX;
+    while (true) {
+        rep.clear();
+        IdTable table(1 << 10);
+        for (size_t v = 0; v < n; v++) {
+            if (cls[v] < 0) continue;
+            uint64_t h = 0x9E3779B97F4A7C15ULL ^ (uint32_t)cls[v];
+            for (uint64_t x = off[v]; x < off[v + 1]; x++) {
+                h ^= ((uint64_t)sym[x] << 32 | (uint32_t)cls[tgt[x]]) + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+                h *= 0xBF58476D1CE4E5B9ULL;
+            }
+            h ^= h >> 29;
+            auto same = [&](int32_t c) {
+                size_t r = (size_t)rep[c];
+                if (cls[r] != cls[v] || off[r + 1] - off[r] != off[v + 1] - off[v]) return false;
+                for (uint64_t x = off[r], y = off[v]; x < off[r + 1]; x++, y++)
+                    if (sym[x] != sym[y] || cls[tgt[x]] != cls[tgt[y]]) return false;
+                return true;
+            };
+            next[v] = table.findOrInsert(h, same, [&]() {
+                rep.push_back((int32_t)v);
+                return (int32_t)rep.size() - 1;
+            });
+        }
+        cls.swap(next);
+        if (rep.size() == classes) return classes;
+        classes = rep.size();
+    }
+}
 
 // A fixed set of worker threads that run one parallel loop at a time; the calling thread works too.
 class Workers {
@@ -540,9 +595,6 @@ public:
 template <class T, class Hash>
 class ShardedIds {
 public:
-    ShardedIds() {
-        for (auto& s : shards) s.rehash = [&s](int32_t id) { return Hash{}(s.items[id]); };
-    }
     uint32_t intern(const T& item) {
         uint64_t h = Hash{}(item);
         uint32_t k = shardOf(h);
@@ -554,8 +606,7 @@ public:
                 if (s.items.size() >= SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
                 s.items.push_back(item);
                 return (int32_t)s.items.size() - 1;
-            },
-            s.rehash);
+            });
         return (uint32_t)local << SHARD_BITS | k;
     }
     // every item in dense order (its offsets also map interned ids to dense ones); empties the shards
@@ -576,7 +627,6 @@ private:
         std::mutex m;
         IdTable table{SHARD_SLOTS};
         std::vector<T> items;
-        std::function<uint64_t(int32_t)> rehash;
     };
     std::array<Shard, SHARDS> shards;
 };
@@ -586,9 +636,6 @@ uint64_t hashInts(const int32_t* p, size_t n);
 // Sets of int32 (sorted, as the caller hands them in) interned like ShardedIds.
 class ShardedSets {
 public:
-    ShardedSets() {
-        for (auto& s : shards) s.rehash = [&s](int32_t id) { return s.hash[id]; };
-    }
     uint32_t intern(const std::vector<int32_t>& set) {
         uint64_t h = hashInts(set.data(), set.size());
         uint32_t k = shardOf(h);
@@ -599,22 +646,21 @@ public:
             return b - a == set.size() && std::equal(set.begin(), set.end(), s.pool.begin() + a);
         };
         int32_t local = s.table.findOrInsert(h, same, [&]() {
-            if (s.hash.size() >= SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
+            if (s.start.size() > SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
             s.pool.insert(s.pool.end(), set.begin(), set.end());
             s.start.push_back(s.pool.size());
-            s.hash.push_back(h);
-            return (int32_t)s.hash.size() - 1;
-        }, s.rehash);
+            return (int32_t)s.start.size() - 2;
+        });
         return (uint32_t)local << SHARD_BITS | k;
     }
     bool empty() const {
-        for (auto& s : shards) if (!s.hash.empty()) return false;
+        for (auto& s : shards) if (s.start.size() > 1) return false;
         return true;
     }
     // every set in dense order (its offsets also map interned ids to dense ones); empties the shards
     SegmentedSets finish() {
         SegmentedSets out;
-        for (uint32_t k = 0; k < SHARDS; k++) out.offsets.start[k + 1] = out.offsets.start[k] + shards[k].hash.size();
+        for (uint32_t k = 0; k < SHARDS; k++) out.offsets.start[k + 1] = out.offsets.start[k] + shards[k].start.size() - 1;
         if (out.offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
         for (uint32_t k = 0; k < SHARDS; k++) {
             Shard& s = shards[k];
@@ -622,7 +668,6 @@ public:
             s.pool.clear();
             out.start[k] = std::move(s.start);
             s.start.assign(1, 0);
-            std::vector<uint64_t>().swap(s.hash);
             s.table = IdTable(SHARD_SLOTS);
         }
         return out;
@@ -634,8 +679,6 @@ private:
         IdTable table{SHARD_SLOTS};
         std::vector<int32_t> pool;
         std::vector<uint64_t> start{0};
-        std::vector<uint64_t> hash;
-        std::function<uint64_t(int32_t)> rehash;
     };
     std::array<Shard, SHARDS> shards;
 };
@@ -707,9 +750,7 @@ SDfa minimizeAcyclic(const SDfa& d) {
         for (uint64_t e = d.off[order[i]]; e < d.off[order[i] + 1]; e++) if (!seen[d.tgt[e]]) { seen[d.tgt[e]] = 1; order.push_back(d.tgt[e]); }
     std::vector<char>().swap(seen);
     std::vector<int32_t> cls(n, -1), rep;
-    std::vector<uint64_t> repHash;
     IdTable table;
-    std::function<uint64_t(int32_t)> rh = [&](int32_t c) { return repHash[c]; };
     for (size_t i = order.size(); i-- > 0;) {
         int32_t v = order[i];
         bool useful = d.acc[v];
@@ -734,7 +775,7 @@ SDfa minimizeAcyclic(const SDfa& d) {
                 b++;
             }
         };
-        cls[v] = table.findOrInsert(h, sameAs, [&]() { rep.push_back(v); repHash.push_back(h); return (int32_t)rep.size() - 1; }, rh);
+        cls[v] = table.findOrInsert(h, sameAs, [&]() { rep.push_back(v); return (int32_t)rep.size() - 1; });
     }
     if (cls[d.start] < 0) return SDfa::emptyLanguage();
     SDfa out;
@@ -988,6 +1029,18 @@ constexpr size_t EXPAND_CHUNK = 1 << 12;  // transducer states per task
 constexpr size_t SUBSET_CHUNK = 1 << 10;  // subset states per task
 constexpr size_t MINIMIZE_CHUNK = 1 << 14;  // raw states per task when minimizing
 
+// A transducer state's moves, in one record so that the subset phase, which visits states in no useful order,
+// pays one cache miss for the record and one for the moves.
+struct MoveRef {
+    uint32_t start;  // in its expansion chunk's moves
+    uint16_t count;
+    uint8_t accepting;
+};
+struct Move {
+    uint32_t tgt;  // interned id, then dense id in the next layer
+    uint8_t sym;
+};
+
 struct LayerOutput {  // one task's share of a layer, in subset-state order
     std::vector<uint8_t> acc, degree, sym;
     std::vector<uint32_t> tgt;  // interned ids until the next layer is numbered
@@ -1083,11 +1136,8 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         const auto tExpand = clock();
         // every transducer state's moves, with targets as ids of the next layer
         size_t n = nstates.size(), chunks = (n + EXPAND_CHUNK - 1) / EXPAND_CHUNK;
-        std::vector<std::vector<uint8_t>> moveSym(chunks);
-        std::vector<std::vector<uint32_t>> moveTgt(chunks);
-        std::vector<uint32_t> moveStart(n);
-        std::vector<uint16_t> moveCount(n);
-        std::vector<char> accepting(n);
+        std::vector<std::vector<Move>> moves(chunks);
+        std::vector<MoveRef> refs(n);
         auto nextStates = std::make_unique<ShardedIds<NState, NStateHash>>();
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
             std::vector<std::pair<int, NState>> local;
@@ -1097,15 +1147,15 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
                 for (size_t id = lo; id < hi; id++) {
                     while (id >= nstates.offsets.start[k + 1]) k++;
                     const NState& from = nstates.segment[k][id - nstates.offsets.start[k]];
-                    accepting[id] = isAccept(from);
                     expand(from, local);
-                    moveStart[id] = (uint32_t)moveSym[c].size();
+                    MoveRef& ref = refs[id];
+                    ref.accepting = isAccept(from);
+                    ref.start = (uint32_t)moves[c].size();
                     for (auto& [sy, t] : local) {
                         if (sy < 0) continue;
-                        moveSym[c].push_back((uint8_t)sy);
-                        moveTgt[c].push_back(nextStates->intern(t));
+                        moves[c].push_back(Move{nextStates->intern(t), (uint8_t)sy});
                     }
-                    moveCount[id] = (uint16_t)(moveSym[c].size() - moveStart[id]);
+                    ref.count = (uint16_t)(moves[c].size() - ref.start);
                 }
             }
         });
@@ -1113,11 +1163,11 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         nextStates.reset();
         nstates = Segmented<NState>();  // the subset phase needs only their moves
         in.get(++inputDepth, input);
-        uint64_t moves = 0;
-        for (const auto& m : moveSym) moves += m.size();
+        uint64_t moveTotal = 0;
+        for (const auto& m : moves) moveTotal += m.size();
         const auto tSubset = clock();
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
-            for (size_t c = b; c < e; c++) for (auto& t : moveTgt[c]) t = (uint32_t)following.offsets.dense(t);
+            for (size_t c = b; c < e; c++) for (auto& m : moves[c]) m.tgt = (uint32_t)following.offsets.dense(m.tgt);
         });
 
         // every subset state's successor set per symbol
@@ -1125,37 +1175,39 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         std::vector<LayerOutput> out(parts);
         auto nextSets = std::make_unique<ShardedSets>();
         workers.forRange(parts, 1, [&](size_t b, size_t e) {
-            std::array<std::vector<int32_t>, SYMBOLS> succ;
+            std::vector<uint64_t> keys;  // symbol << 32 | target, of every member's moves
+            std::vector<int32_t> succ;
             for (size_t p = b; p < e; p++) {
                 LayerOutput& o = out[p];
                 for (size_t d = p * SUBSET_CHUNK; d < std::min(sets, (p + 1) * SUBSET_CHUNK); d++) {
                     bool acc = false;
-                    for (auto& v : succ) v.clear();
+                    keys.clear();
                     std::span<const int32_t> set = setsOf[d];
                     size_t end = set.size();
                     int32_t state = 0;  // the filter's
                     if (filter) state = -set[--end] - 1;
                     for (size_t i = 0; i < end; i++) {
-                        int32_t id = set[i];
-                        if (accepting[id]) acc = true;
-                        const size_t c = id / EXPAND_CHUNK;
-                        for (uint32_t x = moveStart[id]; x < moveStart[id] + moveCount[id]; x++)
-                            succ[moveSym[c][x]].push_back((int32_t)moveTgt[c][x]);
+                        const MoveRef ref = refs[set[i]];
+                        if (ref.accepting) acc = true;
+                        const Move* m = moves[set[i] / EXPAND_CHUNK].data() + ref.start;
+                        for (uint32_t x = 0; x < ref.count; x++) keys.push_back((uint64_t)m[x].sym << 32 | m[x].tgt);
                     }
+                    std::sort(keys.begin(), keys.end());
+                    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
                     uint8_t degree = 0;
-                    for (int a = 0; a < SYMBOLS; a++) {
-                        if (succ[a].empty()) continue;
-                        std::sort(succ[a].begin(), succ[a].end());
-                        succ[a].erase(std::unique(succ[a].begin(), succ[a].end()), succ[a].end());
+                    for (size_t g = 0; g < keys.size();) {
+                        const int a = (int)(keys[g] >> 32);
+                        succ.clear();
+                        for (; g < keys.size() && (int)(keys[g] >> 32) == a; g++) succ.push_back((int32_t)(uint32_t)keys[g]);
                         if (filter) {
                             int letter = filter->index[a];
                             if (letter < 0) { uncovered = true; continue; }
                             int32_t next = filter->next[(size_t)state * filter->m + letter];
                             if (next == filter->dead) continue;
-                            succ[a].push_back(-(next + 1));
+                            succ.push_back(-(next + 1));
                         }
                         o.sym.push_back((uint8_t)a);
-                        o.tgt.push_back(nextSets->intern(succ[a]));
+                        o.tgt.push_back(nextSets->intern(succ));
                         degree++;
                     }
                     o.acc.push_back(acc && (!filter || filter->acc[state]));
@@ -1163,18 +1215,18 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
                 }
             }
         });
-        std::vector<std::vector<uint8_t>>().swap(moveSym);
-        std::vector<std::vector<uint32_t>>().swap(moveTgt);
+        std::vector<std::vector<Move>>().swap(moves);
+        std::vector<MoveRef>().swap(refs);
         const auto tWrite = clock();
         if (stats) {
             uint64_t pool = 0, edges = 0;
             for (const auto& v : setsOf.pool) pool += v.size();
             for (const auto& part : out) edges += part.sym.size();
             // bytes of this layer's main structures: states, moves, produced states, sets, raw output
-            const uint64_t bytes = n * (sizeof(NState) + 7) + moves * 5 + following.size() * sizeof(NState) +
+            const uint64_t bytes = n * (sizeof(NState) + sizeof(MoveRef)) + moveTotal * sizeof(Move) + following.size() * sizeof(NState) +
                                    pool * 4 + sets * 8 + edges * 5 + sets * 2;
-            if (bytes > worst.bytes) worst = {bytes, n, moves, following.size(), sets, pool, edges, layerIndex};
-            allMoves += moves;
+            if (bytes > worst.bytes) worst = {bytes, n, moveTotal, following.size(), sets, pool, edges, layerIndex};
+            allMoves += moveTotal;
             allDistinct += following.size();
             expandSeconds += seconds(tExpand, tSubset);
             subsetSeconds += seconds(tSubset, tWrite);
@@ -1254,11 +1306,8 @@ LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string 
             std::mutex m;
             IdTable table{SHARD_SLOTS};
             std::vector<int32_t> rep;
-            std::vector<uint64_t> hash;
-            std::function<uint64_t(int32_t)> rehash;
         };
         auto shards = std::make_unique<std::array<ClassShard, SHARDS>>();
-        for (auto& sh : *shards) sh.rehash = [&sh](int32_t c) { return sh.hash[c]; };
         std::vector<int32_t> cls(n, -1);
         std::vector<uint32_t> sparse(n);
         workers.forRange(n, MINIMIZE_CHUNK, [&](size_t b, size_t end) {
@@ -1290,9 +1339,8 @@ LayeredDfa minimizeFromDisk(DiskSink& sink, const std::string& raw, std::string 
                 int32_t local = sh.table.findOrInsert(h, sameAs, [&]() {
                     if (sh.rep.size() >= SHARD_LIMIT) fail("too many states in one layer for 32-bit ids");
                     sh.rep.push_back((int32_t)v);
-                    sh.hash.push_back(h);
                     return (int32_t)sh.rep.size() - 1;
-                }, sh.rehash);
+                });
                 sparse[v] = (uint32_t)local << SHARD_BITS | k;
                 cls[v] = 0;  // useful; numbered below
             }
@@ -1685,10 +1733,21 @@ private:
                 uint8_t v = 0;
                 if (badUncached(window, w, false, false)) v |= BAD_NONE;
                 if (badUncached(window, w, true, false)) v |= BAD_LEFT;
-                if (badUncached(window, w, false, true)) v |= BAD_RIGHT;
                 verdict[i] = v;
             }
         });
+        // the orientations are closed under mirroring (orientationsOf), so a window fails at the right wall
+        // exactly when its mirror image fails at the left wall
+        std::vector<uint8_t> badRight(windows, 0);
+        workers.forRange(windows, FILTER_CHUNK, [&](size_t b, size_t e) {
+            for (uint64_t i = b; i < e; i++) {
+                uint64_t mirror = 0, rest = i;
+                for (int c = 0; c < w; c++) { mirror = mirror * m + rest % m; rest /= m; }
+                badRight[i] = verdict[mirror] & BAD_LEFT;
+            }
+        });
+        for (uint64_t i = 0; i < windows; i++) if (badRight[i]) verdict[i] |= BAD_RIGHT;
+        std::vector<uint8_t>().swap(badRight);
         // raw states: prefixes of length 0..w-1, then (history, accepts) pairs, END, DEAD
         std::vector<uint64_t> prefixBase(w);
         uint64_t n = 0;
@@ -1723,21 +1782,9 @@ private:
             }
         std::vector<uint8_t>().swap(verdict);
         // Moore refinement
-        std::vector<int32_t> cls(n), nextCls(n);
+        std::vector<int32_t> cls(n);
         for (uint64_t s = 0; s < n; s++) cls[s] = rawAcc[s];
-        size_t classes = 2;
-        std::vector<int32_t> key(m + 1);
-        while (true) {
-            std::map<std::vector<int32_t>, int32_t> sig;
-            for (uint64_t s = 0; s < n; s++) {
-                key[0] = cls[s];
-                for (int a = 0; a < m; a++) key[a + 1] = cls[raw[s * m + a]];
-                nextCls[s] = sig.try_emplace(key, (int32_t)sig.size()).first->second;
-            }
-            cls.swap(nextCls);
-            if (sig.size() == classes) break;
-            classes = sig.size();
-        }
+        const size_t classes = refineClasses(cls, m, [&](size_t s, int a) { return raw[s * m + a]; });
         auto f = std::make_unique<Filter>();
         f->index.fill(-1);
         for (int a = 0; a < m; a++) f->index[alphabet[a]] = (int8_t)a;
@@ -1796,34 +1843,42 @@ private:
     }
 
     bool badUncached(uint64_t window, int w, bool leftWall, bool rightWall) const {
-        int left = leftWall ? 0 : WINDOW_MARGIN, right = rightWall ? 0 : WINDOW_MARGIN;
-        int width = left + w + right;
-        std::vector<uint32_t> cols(width, 0);
-        for (int c = 0; c < w; c++) cols[left + c] = (window >> (6 * (w - 1 - c))) & 63;
-        const int height = 6 + rows;  // cells above the k rows can hold the pieces that cover them
-        std::function<bool()> fill = [&]() -> bool {
-            int r0 = -1, c0 = -1;
-            for (int r = 0; r < rows && r0 < 0; r++)
-                for (int c = left; c < left + w; c++)
-                    if (!(cols[c] >> r & 1)) { r0 = r; c0 = c; break; }
-            if (r0 < 0) return true;
-            for (auto& shape : shapes) {
-                for (auto& anchor : shape) {
-                    bool ok = true;
-                    for (auto& cell : shape) {
-                        int r = r0 + cell.first - anchor.first, c = c0 + cell.second - anchor.second;
-                        if (r < 0 || r >= height || c < 0 || c >= width || (cols[c] >> r & 1)) { ok = false; break; }
-                    }
-                    if (!ok) continue;
-                    for (auto& cell : shape) cols[c0 + cell.second - anchor.second] |= 1u << (r0 + cell.first - anchor.first);
-                    bool done = fill();
-                    for (auto& cell : shape) cols[c0 + cell.second - anchor.second] &= ~(1u << (r0 + cell.first - anchor.first));
-                    if (done) return true;
+        FillArea area;
+        area.left = leftWall ? 0 : WINDOW_MARGIN;
+        area.w = w;
+        area.width = area.left + w + (rightWall ? 0 : WINDOW_MARGIN);
+        area.height = 6 + rows;  // cells above the k rows can hold the pieces that cover them
+        for (int c = 0; c < w; c++) area.cols[area.left + c] = (window >> (6 * (w - 1 - c))) & 63;
+        return !fill(area, 0);
+    }
+
+    struct FillArea {
+        std::array<uint32_t, WINDOW_COLS + 2 * WINDOW_MARGIN> cols{};
+        int left = 0, w = 0, width = 0, height = 0;
+    };
+
+    // whether the first `rows` rows of the window's columns can be covered; rows below `fromRow` are full
+    bool fill(FillArea& a, int fromRow) const {
+        int r0 = -1, c0 = -1;
+        for (int r = fromRow; r < rows && r0 < 0; r++)
+            for (int c = a.left; c < a.left + a.w; c++)
+                if (!(a.cols[c] >> r & 1)) { r0 = r; c0 = c; break; }
+        if (r0 < 0) return true;
+        for (auto& shape : shapes) {
+            for (auto& anchor : shape) {
+                bool ok = true;
+                for (auto& cell : shape) {
+                    int r = r0 + cell.first - anchor.first, c = c0 + cell.second - anchor.second;
+                    if (r < 0 || r >= a.height || c < 0 || c >= a.width || (a.cols[c] >> r & 1)) { ok = false; break; }
                 }
+                if (!ok) continue;
+                for (auto& cell : shape) a.cols[c0 + cell.second - anchor.second] |= 1u << (r0 + cell.first - anchor.first);
+                bool done = fill(a, r0);
+                for (auto& cell : shape) a.cols[c0 + cell.second - anchor.second] &= ~(1u << (r0 + cell.first - anchor.first));
+                if (done) return true;
             }
-            return false;
-        };
-        return !fill();
+        }
+        return false;
     }
 };
 
