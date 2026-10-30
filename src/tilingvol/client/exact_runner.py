@@ -24,6 +24,9 @@ BINARY_NAME = "exact_width.exe" if sys.platform == "win32" else "exact_width"
 CHECKPOINT_SUFFIX = ".ckpt"
 SCRATCH_SUFFIX = ".raw"
 LOG_SUFFIX = ".log"
+SET_ASIDE_SUFFIX = (
+    ".gaveup"  # next to a given-up checkpoint: kept, but not resumed by itself
+)
 # one raw row of a width near 140 takes up to about 15 GB, a checkpoint as much again; wider ones more
 MIN_FREE_DISK_MB = 40 * 1024
 MIN_FREE_SCRATCH_MB = 20 * 1024  # without checkpoints
@@ -92,24 +95,29 @@ class ExactFiles:
     def log(self) -> Path:
         return self.directory / (self.stem + LOG_SUFFIX)
 
+    @property
+    def set_aside(self) -> Path:
+        return self.directory / (self.stem + SET_ASIDE_SUFFIX)
+
     def remove(self) -> None:
-        """After the result is saved for sending: the checkpoint and scratch row are no longer needed."""
+        """Once the width is decided: the checkpoint and scratch row are no longer needed."""
         for path in (
             self.checkpoint,
             self.scratch,
             self.checkpoint.with_suffix(".ckpt.tmp"),
+            self.set_aside,
         ):
             path.unlink(missing_ok=True)
 
 
 def checkpointed_widths(directory: Path) -> list[int]:
-    """Widths with a checkpoint to resume, smallest first."""
+    """Widths with a checkpoint to resume by itself, smallest first: not the ones given up."""
     if not directory.is_dir():
         return []
     found = []
     for path in directory.iterdir():
         match = CHECKPOINT_NAME.fullmatch(path.name)
-        if match:
+        if match and not path.with_suffix(SET_ASIDE_SUFFIX).exists():
             found.append(int(match["width"]))
     return sorted(found)
 

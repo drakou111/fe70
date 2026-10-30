@@ -766,7 +766,7 @@ def test_the_app_resumes_its_checkpoint_first_and_drops_decided_ones(
     assert os.path.exists(folder / f"sib-{SLOW_WIDTH}.ckpt")
 
 
-def test_the_list_comes_before_checkpoints_and_giving_up_deletes_one(
+def test_the_list_comes_before_checkpoints_and_giving_up_keeps_one(
     exact_config,
     make_live_server,
     controller,  # noqa: F811 - fixture
@@ -794,7 +794,11 @@ def test_the_list_comes_before_checkpoints_and_giving_up_deletes_one(
     wait_for(lambda: (s := recorder.last_status()) and s.exact_row, TIMEOUT_S)
     c.give_up()
     wait_for(lambda: recorder.has("Gave up"), TIMEOUT_S)
+    # kept, but no longer resumed by itself; running the width again goes on from it
+    files = ExactFiles(folder, "sib", SLOW_WIDTH)
+    assert files.checkpoint.exists() and files.set_aside.exists()
     assert checkpointed_widths(folder) == []
+    assert recorder.has(f"add {SLOW_WIDTH} to your width list")
 
 
 def test_running_out_of_memory_skips_resuming_that_width(tmp_path):

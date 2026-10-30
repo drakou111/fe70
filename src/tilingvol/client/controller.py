@@ -553,6 +553,9 @@ class Controller:
             )
         if job.exact:
             files = ExactFiles(self._exact_dir(), job.piece, job.width)
+            files.set_aside.unlink(
+                missing_ok=True
+            )  # running it again: resumed by itself from now on
             keep = settings.save_checkpoints
             again = (
                 "resuming from its checkpoint"
@@ -613,14 +616,23 @@ class Controller:
                 return width
         return None
 
-    def _give_up_checkpoints(self, width: int) -> None:
-        """Given up for good: the server frees the width, so its checkpoint must not be resumed either."""
-        try:
-            self._drop_checkpoints(width)
-        except OSError as error:
-            self._resume_skipped.add(width)
+    def _set_aside_checkpoints(self, width: int) -> None:
+        """Given up: the server frees the width, so it is no longer resumed by itself, but its checkpoint (hours of
+        rows) is kept: listing the width again, or getting it from the server, goes on from it."""
+        self._resume_skipped.add(width)
+        for path in self._exact_dir().glob(f"*-{width}.ckpt"):
+            files = ExactFiles(self._exact_dir(), path.name.split("-")[0], width)
+            try:
+                files.set_aside.touch()
+            except OSError as error:
+                self._log(
+                    f"Could not mark the checkpoint of width {width} as given up ({error}); it may be resumed "
+                    f"by itself next time."
+                )
+                continue
             self._log(
-                f"Could not delete the checkpoint of width {width} ({error}); delete it by hand."
+                f"The checkpoint of width {width} is kept in {files.directory}; add {width} to your width list "
+                f"to go on from it."
             )
 
     def _drop_checkpoints(self, width: int) -> None:
@@ -988,7 +1000,7 @@ class Controller:
             else:
                 self._widths.release(self)
         if job.exact and reason == RELEASE_GAVE_UP:
-            self._give_up_checkpoints(job.width)
+            self._set_aside_checkpoints(job.width)
         elif job.exact and reason == RELEASE_MEMORY:
             # the same run would run out of memory at the same row; the checkpoint stays for a bigger Max RAM
             self._resume_skipped.add(job.width)
