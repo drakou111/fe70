@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from tilingvol.shared.protocol import SYMMETRIC_TAG_PREFIX
+from tilingvol.shared.protocol import SYMMETRIC_TAG_PREFIX, version_tuple
 
 # results of the symmetric hunt; only a tiling found there (verdict "possible") also counts for the size
 HUNT_ROW = f"stage_tag LIKE '{SYMMETRIC_TAG_PREFIX}%'"
@@ -382,14 +382,20 @@ class Database:
             ).fetchall()
         return {(w, h): m for w, h, m in rows}
 
-    def exact_memory_failures(self) -> dict[int, int]:
-        """Width -> the most RAM an exact run of it had when it ran out: its peak, or its cap if unknown."""
+    def exact_memory_failures(self, since_version: str) -> dict[int, int]:
+        """Width -> the most RAM an exact run of it (by a client of since_version or newer) had when it ran
+        out: its peak, or its cap if unknown."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT width, MAX(COALESCE(peak_ram_mb, est_ram_mb)) FROM jobs"
-                " WHERE end_reason = 'memory' AND lane = 'exact' GROUP BY width"
+                "SELECT width, COALESCE(peak_ram_mb, est_ram_mb), client_version FROM jobs"
+                " WHERE end_reason = 'memory' AND lane = 'exact'"
             ).fetchall()
-        return {w: m for w, m in rows}
+        since = version_tuple(since_version)
+        failed: dict[int, int] = {}
+        for width, mb, version in rows:
+            if version_tuple(version) >= since:
+                failed[width] = max(failed.get(width, 0), mb)
+        return failed
 
     # results
     def add_result(

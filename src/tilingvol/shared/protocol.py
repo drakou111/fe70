@@ -39,8 +39,19 @@ SEARCH_FOREVER = "forever"  # repeating half-strip fillings
 SEARCH_EXACT = "exact"  # exact width decisions
 SEARCHES = (SEARCH_BOARD, SEARCH_WIDTH, SEARCH_SYMMETRIC, SEARCH_FOREVER, SEARCH_EXACT)
 STRIP_SINCE = "0.10.0"
+
+
+def version_tuple(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return (0,)
+
+
 PERIODIC_SINCE = "0.12.0"
 EXACT_SINCE = "0.13.0"
+# exact_width needs about 40% less memory from this version: earlier runs that ran out say little about it
+EXACT_MEMORY_SINCE = "0.14.10"
 EXACT_DEAD = "dead"  # no filling of `row` rows: no rectangle has a side W
 EXACT_RECTANGLE = "rectangle"  # the flat frontier at `row`: a W x row rectangle tiles
 EXACT_FOREVER = (

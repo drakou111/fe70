@@ -42,6 +42,7 @@ from tilingvol.shared.pieces import GUN, SIBLING
 from tilingvol.shared.protocol import (
     EXACT_DEAD,
     EXACT_FOREVER,
+    EXACT_MEMORY_SINCE,
     EXACT_RECTANGLE,
     EXACT_SINCE,
     RELEASE_MEMORY,
@@ -626,20 +627,32 @@ def beat_and_release(client, job, resumable: bool, reason: str = "closed") -> No
     )
 
 
+def run_out_of_memory(client, job, peak_mb: int) -> None:
+    client.post(
+        f"/api/jobs/{job['job_id']}/release",
+        json={"nonce": job["nonce"], "reason": "memory", "peak_ram_mb": peak_mb},
+    )
+
+
 def test_a_width_that_ran_out_of_memory_needs_more_ram(exact_config):
+    now = EXACT_MEMORY_SINCE
     with TestClient(create_app(exact_config)) as client:
-        job = ask(client, ram_mb=40_000).json()
+        job = ask(client, ram_mb=40_000, version=now).json()
         assert (job["width"], job["est_ram_mb"]) == (14, 2048)
-        client.post(
-            f"/api/jobs/{job['job_id']}/release",
-            json={"nonce": job["nonce"], "reason": "memory", "peak_ram_mb": 30_000},
-        )
+        run_out_of_memory(client, job, 30_000)
         # 1.5 x the 30,000 MB it had: not for the same cap, not even for its own checkpoint
-        assert ask(client, ram_mb=40_000).json()["width"] == 21
-        refused = ask(client, width=14, ram_mb=40_000, name="someone else")
+        assert ask(client, ram_mb=40_000, version=now).json()["width"] == 21
+        refused = ask(client, width=14, ram_mb=40_000, name="someone else", version=now)
         assert refused.status_code == 409 and "at least 44 GB" in refused.text
-        bigger = ask(client, width=14, ram_mb=64_000, name="someone else").json()
-        assert bigger["est_ram_mb"] == 45_000
+        bigger = ask(client, width=14, ram_mb=64_000, name="someone else", version=now)
+        assert bigger.json()["est_ram_mb"] == 45_000
+
+
+def test_running_out_of_memory_before_the_smaller_program_does_not_count(exact_config):
+    with TestClient(create_app(exact_config)) as client:
+        run_out_of_memory(client, ask(client, ram_mb=40_000).json(), 30_000)
+        again = ask(client, width=14, ram_mb=40_000, version=EXACT_MEMORY_SINCE)
+        assert again.json()["est_ram_mb"] == 2048
 
 
 def test_a_checkpointed_width_stays_with_its_volunteer(exact_config):

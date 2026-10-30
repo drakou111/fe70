@@ -65,6 +65,7 @@ from tilingvol.shared.protocol import (
     VERDICTS,
     ExactOutcome,
     Stage,
+    version_tuple,
 )
 from tilingvol.shared.verify import (
     TilingError,
@@ -160,13 +161,6 @@ class Submission(BaseModel):
     frame_border: int | None = Field(default=None, ge=1, le=1000)
     frame_placements: list[list[int]] | None = Field(default=None, max_length=100_000)
     exact: ExactBody | None = None
-
-
-def version_tuple(version: str) -> tuple[int, ...]:
-    try:
-        return tuple(int(part) for part in version.split("."))
-    except ValueError:
-        return (0,)
 
 
 class RateLimiter:

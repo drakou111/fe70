@@ -39,6 +39,7 @@ from tilingvol.server.db import (
 from tilingvol.shared.pieces import live_parts_table
 from tilingvol.shared.protocol import (
     EXACT_FOREVER,
+    EXACT_MEMORY_SINCE,
     LANE_EXACT,
     LANE_HUNT,
     LANE_PERIODIC,
@@ -553,7 +554,7 @@ class Scheduler:
         decided = self.exact_decided()
         leased = {j.width for j in active if j.lane == LANE_EXACT}
         reserved = self.exact_reserved(name)
-        failed = self.db.exact_memory_failures()
+        failed = self.db.exact_memory_failures(EXACT_MEMORY_SINCE)
         stage = Stage(0, False, NO_LIMIT, exact=True)
 
         def needs_mb(w: int) -> int:
