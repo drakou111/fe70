@@ -732,13 +732,14 @@ public:
             [&](int32_t id) { return Hash{}(s.items[id]); });
         return (uint32_t)local << SHARD_BITS | k;
     }
-    // every item in dense order (its offsets also map interned ids to dense ones); empties the shards
-    Segmented<T> finish() {
+    // every item in dense order (its offsets also map interned ids to dense ones); empties the shards. `shrink`
+    // drops growth slack for items that stay in memory (a copy, so not for items written to disk at once)
+    Segmented<T> finish(bool shrink = true) {
         Segmented<T> out;
         for (uint32_t k = 0; k < SHARDS; k++) out.offsets.start[k + 1] = out.offsets.start[k] + shards[k].items.size();
         if (out.offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
         for (uint32_t k = 0; k < SHARDS; k++) {
-            shards[k].items.shrink_to_fit();  // they live through the next layer's expansion, the peak
+            if (shrink) shards[k].items.shrink_to_fit();
             out.segment[k] = std::move(shards[k].items);
             shards[k].items.clear();  // moved-from: make it certainly empty
             shards[k].table = ShardTable();
@@ -793,9 +794,7 @@ public:
         for (uint32_t k = 0; k < SHARDS; k++) out.offsets.start[k + 1] = out.offsets.start[k] + shards[k].start.size() - 1;
         if (out.offsets.total() >= INT32_MAX) fail("too many states in one layer for 32-bit ids");
         for (uint32_t k = 0; k < SHARDS; k++) {
-            Shard& s = shards[k];
-            s.pool.shrink_to_fit();  // they live through the next layer's expansion, the peak
-            s.start.shrink_to_fit();
+            Shard& s = shards[k];  // no shrink_to_fit: the sets go to disk at once, and a shrink is a copy
             out.pool[k] = std::move(s.pool);
             s.pool.clear();
             out.start[k] = std::move(s.start);
@@ -1215,8 +1214,126 @@ void writeLayer(std::vector<LayerOutput>& parts, const ShardOffsets& next, DiskS
     }
 }
 
+// A scratch file holding one layer's data between the phase that makes it and the phase that reads it back
+// in pieces (from many threads), so the data does not take memory meanwhile. Emptied before each reuse,
+// deleted with the object.
+class SpillFile {
+public:
+    explicit SpillFile(std::string path) : path(std::move(path)) { reset(); }
+    SpillFile(const SpillFile&) = delete;
+    SpillFile& operator=(const SpillFile&) = delete;
+    ~SpillFile() {
+        if (f) fclose(f);
+        std::remove(path.c_str());
+    }
+    void reset() {
+        std::lock_guard<std::mutex> lock(m);
+        if (f) fclose(f);
+        f = fopen(path.c_str(), "w+b");
+        if (!f) fail("cannot open scratch file " + path);
+        end = 0;
+    }
+    void append(const void* data, size_t bytes) {
+        if (bytes == 0) return;
+        std::lock_guard<std::mutex> lock(m);
+        if (FSEEK(f, (int64_t)end, SEEK_SET) != 0) fail("cannot seek in scratch file " + path);
+        writeAll(f, data, bytes, "scratch");
+        end += bytes;
+    }
+    void read(uint64_t at, void* data, size_t bytes) {
+        if (bytes == 0) return;
+        std::lock_guard<std::mutex> lock(m);
+        if (FSEEK(f, (int64_t)at, SEEK_SET) != 0) fail("cannot seek in scratch file " + path);
+        readAll(f, data, bytes, "scratch");
+    }
+
+private:
+    std::string path;
+    FILE* f = nullptr;
+    uint64_t end = 0;
+    std::mutex m;
+};
+
+// A layer's transducer states on disk in dense order; the expansion reads them back a chunk at a time.
+class SpilledStates {
+public:
+    explicit SpilledStates(std::string path) : file(std::move(path)) {}
+    void store(const std::vector<NState>& items) {
+        file.reset();
+        file.append(items.data(), items.size() * sizeof(NState));
+        count = items.size();
+    }
+    // frees the segments; their offsets stay with the caller
+    void store(Segmented<NState>& items) {
+        file.reset();
+        count = items.size();
+        for (auto& segment : items.segment) {
+            file.append(segment.data(), segment.size() * sizeof(NState));
+            BigVector<NState>().swap(segment);
+        }
+    }
+    size_t size() const { return count; }
+    void read(size_t lo, size_t hi, std::vector<NState>& buf) {
+        buf.resize(hi - lo);
+        file.read(lo * sizeof(NState), buf.data(), (hi - lo) * sizeof(NState));
+    }
+
+private:
+    SpillFile file;
+    size_t count = 0;
+};
+
+// A layer's subset states on disk: the shards' pools one after another (so the sets lie in dense order), with
+// the set offsets kept in memory (4 bytes a set) to find them. The subset phase reads back one run of
+// consecutive sets at a time.
+class SpilledSets {
+public:
+    explicit SpilledSets(std::string path) : file(std::move(path)) {}
+    // frees `sets`
+    void store(SegmentedSets& sets) {
+        file.reset();
+        offsets = sets.offsets;
+        poolTotal = 0;
+        for (uint32_t k = 0; k < SHARDS; k++) {
+            base[k] = poolTotal;
+            file.append(sets.pool[k].data(), sets.pool[k].size() * sizeof(int32_t));
+            poolTotal += sets.pool[k].size();
+            BigVector<int32_t>().swap(sets.pool[k]);
+            start[k] = std::move(sets.start[k]);
+            BigVector<uint32_t>().swap(sets.start[k]);
+        }
+    }
+    size_t size() const { return offsets.total(); }
+    uint64_t poolSize() const { return poolTotal; }
+    const ShardOffsets& shardOffsets() const { return offsets; }
+    // where set d's members start among all members (d == size(): the end)
+    uint64_t begin(uint64_t d) const {
+        if (d >= size()) return poolTotal;
+        const uint32_t k = offsets.shardOf(d);
+        return base[k] + start[k][d - offsets.start[k]];
+    }
+    uint32_t length(uint64_t d) const {
+        const uint32_t k = offsets.shardOf(d);
+        const uint64_t j = d - offsets.start[k];
+        return start[k][j + 1] - start[k][j];
+    }
+    // the members of sets lo..hi-1, in order
+    void read(uint64_t lo, uint64_t hi, std::vector<int32_t>& buf) {
+        const uint64_t a = begin(lo), b = begin(hi);
+        buf.resize(b - a);
+        file.read(a * sizeof(int32_t), buf.data(), (b - a) * sizeof(int32_t));
+    }
+
+private:
+    SpillFile file;
+    ShardOffsets offsets;
+    std::array<BigVector<uint32_t>, SHARDS> start;
+    std::array<uint64_t, SHARDS> base{};
+    uint64_t poolTotal = 0;
+};
+
 void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in, DiskSink& sink, Workers& workers,
-                      const WindowFilter* filter, std::atomic<bool>& uncovered) {
+                      const WindowFilter* filter, std::atomic<bool>& uncovered, ScratchFiles& files) {
     // every transducer state of a layer has read the same number of input columns: its q is a state of the
     // input layer `inputDepth` (or a flush state after the last column)
     Layer input;
@@ -1254,8 +1371,15 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
     std::vector<int32_t> first(cur.size());
     for (size_t i = 0; i < cur.size(); i++) first[i] = (int32_t)i;
     if (filter) first.push_back(-(filter->start + 1));
-    Segmented<NState> nstates(std::move(cur));
-    SegmentedSets setsOf(std::move(first));
+    // between their phases, a layer's states and sets wait on disk: the peak is then one layer's moves and
+    // hash tables, not those plus the states and sets
+    SpilledStates nstates(files.fresh());
+    nstates.store(cur);
+    SpilledSets setsOf(files.fresh());
+    {
+        SegmentedSets firstSets(first);
+        setsOf.store(firstSets);
+    }
 
     // EXACT_WIDTH_STATS: the layer with the largest working set, the duplication of produced states, and the
     // time of each phase, one line per row
@@ -1277,13 +1401,13 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
             std::vector<std::pair<int, NState>> local;
             std::vector<Move> chunk;  // copied out at its exact size: no growth slack, no growth garbage
+            std::vector<NState> states;
             for (size_t c = b; c < e; c++) {
                 chunk.clear();
                 const size_t lo = c * EXPAND_CHUNK, hi = std::min(n, (c + 1) * EXPAND_CHUNK);
-                uint32_t k = nstates.offsets.shardOf(lo);
+                nstates.read(lo, hi, states);
                 for (size_t id = lo; id < hi; id++) {
-                    while (id >= nstates.offsets.start[k + 1]) k++;
-                    const NState& from = nstates.segment[k][id - nstates.offsets.start[k]];
+                    const NState& from = states[id - lo];
                     expand(from, local);
                     MoveRef& ref = refs[id];
                     ref.accepting = isAccept(from);
@@ -1298,15 +1422,20 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
                 moves[c].assign(chunk.begin(), chunk.end());
             }
         });
-        Segmented<NState> following = nextStates->finish();
-        nextStates.reset();
-        nstates = Segmented<NState>();  // the subset phase needs only their moves
+        // the subset phase needs only this layer's moves: the next layer's states replace this layer's on disk
+        ShardOffsets followingOffsets;
+        {
+            Segmented<NState> following = nextStates->finish(false);
+            nextStates.reset();
+            followingOffsets = following.offsets;
+            nstates.store(following);
+        }
         in.get(++inputDepth, input);
         uint64_t moveTotal = 0;
         for (const auto& m : moves) moveTotal += m.size();
         const auto tSubset = clock();
         workers.forRange(chunks, 1, [&](size_t b, size_t e) {
-            for (size_t c = b; c < e; c++) for (auto& m : moves[c]) m.tgt = (uint32_t)following.offsets.dense(m.tgt);
+            for (size_t c = b; c < e; c++) for (auto& m : moves[c]) m.tgt = (uint32_t)followingOffsets.dense(m.tgt);
         });
 
         // every subset state's successor set per symbol
@@ -1316,28 +1445,37 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         workers.forRange(parts, 1, [&](size_t b, size_t e) {
             std::vector<uint64_t> keys;  // symbol << 32 | target, of every member's moves
             std::vector<int32_t> succ;
+            std::vector<int32_t> members;  // the members of this run of sets, read back from disk
+            size_t runFirst = 0, runEnd = 0;
+            uint64_t runBase = 0;
+            auto setAt = [&](size_t d) -> std::span<const int32_t> {
+                return {members.data() + (setsOf.begin(d) - runBase), setsOf.length(d)};
+            };
             // members are scattered over the layer: fetch the records of the set two ahead and the moves of the
             // next one while this one is gathered (a negative last element is the filter's state)
             auto prefetchRefs = [&](size_t d) {
-                if (d >= sets) return;
-                for (int32_t id : setsOf[d]) if (id >= 0) __builtin_prefetch(&refs[id]);
+                if (d >= runEnd) return;
+                for (int32_t id : setAt(d)) if (id >= 0) __builtin_prefetch(&refs[id]);
             };
             auto prefetchMoves = [&](size_t d) {
-                if (d >= sets) return;
-                for (int32_t id : setsOf[d])
+                if (d >= runEnd) return;
+                for (int32_t id : setAt(d))
                     if (id >= 0) __builtin_prefetch(moves[id / EXPAND_CHUNK].data() + refs[id].start);
             };
             for (size_t p = b; p < e; p++) {
                 LayerOutput& o = out[p];
-                const size_t first = p * SUBSET_CHUNK;
-                prefetchRefs(first);
-                prefetchRefs(first + 1);
-                for (size_t d = first; d < std::min(sets, (p + 1) * SUBSET_CHUNK); d++) {
+                runFirst = p * SUBSET_CHUNK;
+                runEnd = std::min(sets, (p + 1) * SUBSET_CHUNK);
+                runBase = setsOf.begin(runFirst);
+                setsOf.read(runFirst, runEnd, members);
+                prefetchRefs(runFirst);
+                prefetchRefs(runFirst + 1);
+                for (size_t d = runFirst; d < runEnd; d++) {
                     prefetchRefs(d + 2);
                     prefetchMoves(d + 1);
                     bool acc = false;
                     keys.clear();
-                    std::span<const int32_t> set = setsOf[d];
+                    std::span<const int32_t> set = setAt(d);
                     size_t end = set.size();
                     int32_t state = 0;  // the filter's
                     if (filter) state = -set[--end] - 1;
@@ -1374,27 +1512,28 @@ void transduceLayered(const std::vector<Orientation>& oris, const LayeredDfa& in
         BigVector<MoveRef>().swap(refs);
         const auto tWrite = clock();
         if (stats) {
-            uint64_t pool = 0, edges = 0;
-            for (const auto& v : setsOf.pool) pool += v.size();
+            uint64_t pool = setsOf.poolSize(), edges = 0;
             for (const auto& part : out) edges += part.sym.size();
             // bytes of this layer's main structures: states, moves, produced states, sets, raw output
-            const uint64_t bytes = n * (sizeof(NState) + sizeof(MoveRef)) + moveTotal * sizeof(Move) + following.size() * sizeof(NState) +
+            const uint64_t bytes = n * (sizeof(NState) + sizeof(MoveRef)) + moveTotal * sizeof(Move) + nstates.size() * sizeof(NState) +
                                    pool * 4 + sets * 8 + edges * 5 + sets * 2;
-            if (bytes > worst.bytes) worst = {bytes, n, moveTotal, following.size(), sets, pool, edges, layerIndex};
+            if (bytes > worst.bytes) worst = {bytes, n, moveTotal, nstates.size(), sets, pool, edges, layerIndex};
             allMoves += moveTotal;
-            allDistinct += following.size();
+            allDistinct += nstates.size();
             expandSeconds += seconds(tExpand, tSubset);
             subsetSeconds += seconds(tSubset, tWrite);
         }
         bool last = nextSets->empty();
-        setsOf = nextSets->finish();
-        nextSets.reset();
-        writeLayer(out, setsOf.offsets, sink, workers);
+        {
+            SegmentedSets produced = nextSets->finish();
+            nextSets.reset();
+            setsOf.store(produced);  // this layer's sets are all read: the next layer's replace them on disk
+        }
+        writeLayer(out, setsOf.shardOffsets(), sink, workers);
         if (stats) writeSeconds += seconds(tWrite, clock());
         layerIndex++;
         workers.progress("build", inputDepth, in.depth() - 1);
         if (last) break;
-        nstates = std::move(following);
     }
     if (stats)
         std::cerr << "    stats: largest layer " << worst.layer << " ~" << worst.bytes / (1 << 20) << " MB (states "
@@ -1418,7 +1557,7 @@ LayeredDfa advanceRow(const std::vector<Orientation>& oris, const LayeredDfa& in
     if (!sink.f) fail("cannot open scratch file " + raw);
     auto t0 = std::chrono::steady_clock::now();
     std::atomic<bool> missed{false};
-    transduceLayered(oris, in, sink, workers, filter, missed);
+    transduceLayered(oris, in, sink, workers, filter, missed, files);
     if (uncovered) *uncovered = missed;
     auto t1 = std::chrono::steady_clock::now();
     LayeredDfa out = minimizeFromDisk(sink, raw, files.fresh(), workers);
