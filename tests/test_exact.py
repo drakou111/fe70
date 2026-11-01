@@ -63,6 +63,8 @@ GUN_CELLS = "0,0 1,0 2,0 3,0 4,0 5,0 6,0 1,1 2,1 3,1"
 LONG_RECTANGLE_WIDTH = 13  # 13 x 112 tiles; long enough to stop a run part way
 SLOW_WIDTH = 24  # lives long enough to be stopped part way
 TIMEOUT_S = 60
+# every repeat is then confirmed by stepping one more period
+NO_KEPT_ROWS = ("--small-rows", "0")
 
 
 @pytest.fixture(scope="session")
@@ -281,6 +283,7 @@ def run_binary(
     checkpoint: Path | None = None,
     stop_after_row: int | None = None,
     threads: int = 1,
+    extra: tuple[str, ...] = (),
 ) -> list[str]:
     """The program's output lines; with stop_after_row, killed once that row is printed."""
     command = [
@@ -297,6 +300,7 @@ def run_binary(
         str(lookahead),
         "--threads",
         str(threads),
+        *extra,
     ]
     if checkpoint is not None:
         command += ["--checkpoint", str(checkpoint)]
@@ -341,14 +345,34 @@ def test_threads_change_nothing_but_the_time(use_binary, tmp_path):
             assert without_seconds(one) == without_seconds(four), (width, lookahead)
 
 
-def test_a_repeat_across_a_resume_is_still_confirmed(use_binary, tmp_path):
-    """A resumed run has no stored forms of the rows before it, so it rebuilds the earlier row."""
+def test_a_repeat_of_an_unkept_row_is_confirmed_one_period_later(use_binary, tmp_path):
+    """With no row kept, the hash match at row 13 (of row 6) is proved by comparing rows 13 and 20 exactly."""
     width, earlier, later = SIB_FOREVER
+    period = later - earlier
+    lines = run_binary(use_binary, tmp_path, width, 3, extra=NO_KEPT_ROWS)
+    assert lines[-1] == f"forever {later} {later + period}"
+    counts = [int(c) for c in lines[-2].split()[1:]]
+    first = 4
+    assert (
+        counts[later - first + 1 :] == counts[earlier - first + 1 : later - first + 1]
+    )
+
+
+def test_a_repeat_across_a_resume_is_still_confirmed(use_binary, tmp_path):
+    """A resumed run has no stored forms of the rows before it: the earliest row it keeps (its first) repeats
+    one period later, before the unkept match at row 13 is confirmed at row 20."""
+    width, earlier, later = SIB_FOREVER
+    period = later - earlier
     checkpoint = tmp_path / "forever.ckpt"
     run_binary(use_binary, tmp_path, width, 3, checkpoint, stop_after_row=earlier + 2)
     resumed = run_binary(use_binary, tmp_path, width, 3, checkpoint, threads=2)
-    assert resumed[1] != "start 4"  # it did resume
-    assert resumed[-1] == f"forever {earlier} {later}"
+    start = int(resumed[1].split()[1])
+    assert start > earlier  # it did resume
+    assert resumed[-1] == f"forever {start} {start + period}"
+    forced = tmp_path / "forced.ckpt"
+    run_binary(use_binary, tmp_path, width, 3, forced, earlier + 2, extra=NO_KEPT_ROWS)
+    resumed = run_binary(use_binary, tmp_path, width, 3, forced, extra=NO_KEPT_ROWS)
+    assert resumed[-1] == f"forever {later} {later + period}"
 
 
 def to_global_ids(checkpoint: Path) -> None:
@@ -399,8 +423,9 @@ def test_a_checkpoint_of_an_older_version_still_resumes(use_binary, tmp_path):
     run_binary(use_binary, tmp_path, width, 3, checkpoint, stop_after_row=earlier + 2)
     to_global_ids(checkpoint)
     resumed = run_binary(use_binary, tmp_path, width, 3, checkpoint)
-    assert resumed[1] != "start 4"
-    assert resumed[-1] == f"forever {earlier} {later}"
+    start = int(resumed[1].split()[1])
+    assert start > earlier
+    assert resumed[-1] == f"forever {start} {start + later - earlier}"
 
 
 def test_the_death_row_is_exact_at_every_lookahead(use_binary, tmp_path):

@@ -114,7 +114,7 @@ constexpr char CHECKPOINT_END[4] = {'E', 'N', 'D', '!'};
 constexpr size_t IO_CHUNK = 1 << 26;
 constexpr int DEFAULT_START_ROW = 8;
 constexpr int MAX_THREADS = 256;
-// rows this small keep their canonical form, so a repeat of one is confirmed without recomputing it
+// rows this small keep their canonical form, so a repeat of one is confirmed at once (--small-rows)
 constexpr size_t SMALL_ROW_STATES = 1 << 15;
 // kept rows this small stay in memory for the last `lookahead` rows, to find the exact death row
 constexpr size_t RECENT_ROW_STATES = 1 << 22;
@@ -2259,18 +2259,22 @@ struct Options {
     std::string cellsText, checkpoint, scratch, dumpDir;
     int lookahead = 0;
     int threads = 1;
+    size_t smallRows = SMALL_ROW_STATES;
     bool progress = false;
 };
 
 const char* USAGE =
     "usage: exact_width --width W --cells \"x,y x,y ...\" --scratch FILE [--checkpoint FILE] [--start-row R]\n"
-    "                   [--dump DIR] [--lookahead K] [--threads N] [--progress]\n"
+    "                   [--dump DIR] [--lookahead K] [--threads N] [--small-rows N] [--progress]\n"
     "Decides exactly whether the piece's width-W half-strip dies, tiles a rectangle or fills forever.\n"
     "With --checkpoint, resumes from FILE if it exists and rewrites it after every row. The scratch file\n"
     "holds one raw row. --dump writes every row's minimal automaton to DIR/row<r>.dfa. --lookahead K keeps only\n"
     "frontiers that can fill K more rows (same verdicts; the state counts are of the kept sets). --threads N\n"
     "spreads each row's work over N threads (same verdicts and state counts). --progress prints\n"
-    "'progress PHASE DONE TOTAL' lines (PHASE build, minimize or prune; columns of the row) at most once a second.\n";
+    "'progress PHASE DONE TOTAL' lines (PHASE build, minimize or prune; columns of the row) at most once a second.\n"
+    "Rows of at most --small-rows states (default 32768) are kept, so a later row equal to one is confirmed at\n"
+    "once; a row whose hash matches a larger earlier row is confirmed by stepping one more period and comparing\n"
+    "the two later rows exactly.\n";
 
 int parseInt(const std::string& text, const char* what) {
     try {
@@ -2314,6 +2318,11 @@ Options parseOptions(int argc, char** argv) {
         else if (a == "--dump") o.dumpDir = v;
         else if (a == "--lookahead") o.lookahead = parseInt(v, "--lookahead");
         else if (a == "--threads") o.threads = parseInt(v, "--threads");
+        else if (a == "--small-rows") {
+            const int n = parseInt(v, "--small-rows");
+            if (n < 0) fail("--small-rows must be 0 or more");
+            o.smallRows = (size_t)n;
+        }
         else fail("unknown option " + a + "\n" + USAGE);
     }
     if (o.width < 1 || o.width > 2000) fail("--width must be between 1 and 2000");
@@ -2483,6 +2492,15 @@ int run(int argc, char** argv) {
     std::map<std::pair<uint64_t, uint64_t>, int32_t> seen;
     for (auto& s : c.seen) seen.emplace(std::make_pair(s.h1, s.h2), s.row);
     std::map<int32_t, std::vector<uint64_t>> smallForms;  // rows of this run, not those of a resumed checkpoint
+    // A row whose hash matched an earlier row that was not kept: rows are a function of the row before, so if
+    // the two rows are equal, the row one period later equals this one, and comparing those proves the repeat
+    // without recomputing the earlier row. Not checkpointed: a resumed run meets the next match and starts over.
+    struct PendingRepeat {
+        int32_t row;
+        int32_t period;
+        LayeredDfa lang;
+    };
+    std::optional<PendingRepeat> pending;
 
     while (true) {
         LayeredDfa& d = c.lang;
@@ -2503,30 +2521,35 @@ int run(int argc, char** argv) {
             std::cout << "rectangle " << c.row << "\n" << std::flush;
             return 0;
         }
-        const auto h = summary.hash;
-        auto it = seen.find(h);
-        if (it != seen.end()) {
-            // a hash match is confirmed by rebuilding the earlier row and comparing exactly
-            int32_t earlier = it->second;
-            bool same;
-            if (auto stored = smallForms.find(earlier); stored != smallForms.end()) {
-                same = d.size() <= SMALL_ROW_STATES && stored->second == canonicalForm(d);
-            } else {
-                auto [r0, first] = firstRow(oris, opt.startRow, W, files);
-                LayeredDfa e = look.keep(std::move(first), W, files, workers);
-                for (int r = r0; r < earlier; r++) e = look.keep(advanceRow(oris, e, files, workers), W, files, workers);
-                same = sameLanguage(e, d);
-            }
-            if (same) {
+        if (pending && c.row == pending->row + pending->period) {
+            if (sameLanguage(pending->lang, d)) {
                 printCounts(c.counts);
-                std::cout << "forever " << earlier << " " << c.row << "\n" << std::flush;
+                std::cout << "forever " << pending->row << " " << c.row << "\n" << std::flush;
                 return 0;
             }
-            std::cerr << "hash collision between rows " << earlier << " and " << c.row << "\n" << std::flush;
+            std::cerr << "hash collision between rows " << pending->row - pending->period << " and " << pending->row
+                      << "\n" << std::flush;
+            pending.reset();
+        }
+        const auto h = summary.hash;
+        if (auto it = seen.find(h); it != seen.end()) {
+            const int32_t earlier = it->second;
+            if (auto stored = smallForms.find(earlier); stored != smallForms.end()) {
+                if (d.size() <= opt.smallRows && stored->second == canonicalForm(d)) {
+                    printCounts(c.counts);
+                    std::cout << "forever " << earlier << " " << c.row << "\n" << std::flush;
+                    return 0;
+                }
+                std::cerr << "hash collision between rows " << earlier << " and " << c.row << "\n" << std::flush;
+            } else if (!pending) {
+                std::cerr << "    row " << c.row << " has the hash of row " << earlier << ": confirming by stepping "
+                          << c.row - earlier << " more rows\n" << std::flush;
+                pending = PendingRepeat{c.row, c.row - earlier, d.copy(files.fresh())};
+            }
         }
         seen.emplace(h, c.row);
         c.seen.push_back({c.row, h.first, h.second});
-        if (d.size() <= SMALL_ROW_STATES) smallForms.emplace(c.row, canonicalForm(d));
+        if (d.size() <= opt.smallRows) smallForms.emplace(c.row, canonicalForm(d));
         if (lookahead > 0) {
             recent.erase(recent.begin(), recent.lower_bound(c.row - lookahead + 1));
             if (d.size() <= RECENT_ROW_STATES) recent.emplace(c.row, d.copy(files.fresh()));
