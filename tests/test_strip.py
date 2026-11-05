@@ -267,12 +267,16 @@ def test_known_results_are_seeded_once(tmp_path, sib_config):
     create_app(config)
     create_app(config)
     rows = Database(config.db_path).strip_results()
-    assert len(rows) == len(known_strips.GUN_STRIPS)
+    exact_dead = [e for e in known_strips.GUN_EXACT if e.outcome == "dead"]
+    assert len(rows) == len(known_strips.GUN_STRIPS) + len(exact_dead)
     dead = {r.width for r in rows if r.verdict == "impossible"}
-    assert dead == {135, 137, 139, 141, 142, 143}
+    assert dead == {135, 137, 139, 141, 142, 143, 175}
     scheduler = Scheduler(Database(config.db_path), config)
     assert scheduler.is_dead((140, 142)) and not scheduler.is_dead((140, 144))
     assert scheduler.is_dead((137, 200))
+    assert (
+        175 in scheduler.dead_widths() and scheduler.width_states()[175].dead_rows == 58
+    )
     certified = scheduler.certified_widths()
     assert set(certified) == {c.width for c in known_strips.GUN_CERTIFICATES}
     assert (

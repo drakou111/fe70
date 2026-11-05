@@ -423,4 +423,9 @@ def seed(db: Database, piece: PieceSpec) -> int:
             name=e.name,
             note=e.note,
         )
+        if e.outcome == EXACT_DEAD:
+            # as for an app's exact death: the strip result is what takes the width off the map
+            added += db.import_strip_result(
+                e.width, e.row, VERDICT_IMPOSSIBLE, e.compute_s, e.name
+            )
     return added
