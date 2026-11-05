@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS exact_results (   -- exact width decisions (the clien
     ip TEXT,
     peak_ram_mb INTEGER,
     client_version TEXT,
-    submitted REAL NOT NULL
+    submitted REAL NOT NULL,
+    note TEXT NOT NULL DEFAULT ''             -- a caveat shown with an asterisk (imported results)
 );
 CREATE INDEX IF NOT EXISTS exact_results_width ON exact_results(width);
 CREATE TABLE IF NOT EXISTS exact_progress (  -- the row each running exact decision has reached
@@ -219,6 +220,7 @@ class ExactResultRow:
     lookahead: int
     name: str
     submitted: float
+    note: str  # empty, or a caveat about how the result was decided
 
 
 @dataclass(frozen=True)
@@ -280,6 +282,10 @@ class Database:
         result_columns = {
             r[1] for r in self._conn.execute("PRAGMA table_info(exact_results)")
         }
+        if "note" not in result_columns:  # created before 0.14.13
+            self._conn.execute(
+                "ALTER TABLE exact_results ADD COLUMN note TEXT NOT NULL DEFAULT ''"
+            )
         if "lookahead" not in result_columns:  # created by version 0.13.0 or 0.13.1
             self._conn.execute(
                 "ALTER TABLE exact_results ADD COLUMN lookahead INTEGER NOT NULL DEFAULT 0"
@@ -769,12 +775,13 @@ class Database:
         peak_ram_mb: int | None,
         client_version: str | None,
         lookahead: int = 0,
+        note: str = "",
     ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO exact_results (job_id, width, outcome, row, repeat_from, first_row, counts,"
-                " compute_s, lookahead, name, ip, peak_ram_mb, client_version, submitted)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " compute_s, lookahead, name, ip, peak_ram_mb, client_version, submitted, note)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
                     width,
@@ -790,6 +797,7 @@ class Database:
                     peak_ram_mb,
                     client_version,
                     time.time(),
+                    note,
                 ),
             )
             self._conn.execute("DELETE FROM exact_progress WHERE width = ?", (width,))
@@ -806,6 +814,7 @@ class Database:
         compute_s: float,
         lookahead: int,
         name: str,
+        note: str = "",
     ) -> bool:
         """Add an exact decision made outside the app unless it was imported before; True if added."""
         with self._lock:
@@ -828,6 +837,7 @@ class Database:
             peak_ram_mb=None,
             client_version=None,
             lookahead=lookahead,
+            note=note,
         )
         return True
 
@@ -835,7 +845,7 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, width, outcome, row, repeat_from, first_row, counts, compute_s, lookahead, name,"
-                " submitted FROM exact_results ORDER BY id"
+                " submitted, note FROM exact_results ORDER BY id"
             ).fetchall()
         return [ExactResultRow(*r[:6], tuple(json.loads(r[6])), *r[7:]) for r in rows]
 

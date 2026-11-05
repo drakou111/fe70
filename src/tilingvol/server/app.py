@@ -942,6 +942,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "lookahead": r.lookahead,
                     "by": r.name,
                     "submitted": r.submitted,
+                    "note": r.note,
                 }
                 for r in db.exact_results()
             ],

@@ -528,8 +528,10 @@ def render_exact(db: Database, reserve_s: float) -> str:
         ),
         key=lambda p: p.width,
     )
+    notes = [r for r in results if r.note]
     rows = "".join(
         f"<tr><td>width {r.width}</td><td>{escape(exact_outcome_text(r.outcome, r.row, r.repeat_from, r.width))}"
+        f"{'*' * (notes.index(r) + 1) if r.note else ''}"
         f'</td><td>{escape(r.name)}</td><td class="num">{hours(r.compute_s)}</td>'
         f'<td class="num">{ago(r.submitted)}</td></tr>'
         for r in results
@@ -544,12 +546,16 @@ def render_exact(db: Database, reserve_s: float) -> str:
         if rows
         else '<p class="empty">No exact decisions yet.</p>'
     )
+    footnotes = "".join(
+        f'<p class="note" style="margin:8px 0 0">{"*" * (i + 1)} width {r.width}: {escape(r.note)}</p>'
+        for i, r in enumerate(notes)
+    )
     return (
         '<section class="card"><h2>Exact width decisions</h2><p class="note" style="margin:0 0 12px">'
         "An exact decision follows every way to fill a width's half-strip, row by row, as one compressed "
         "automaton, until no filling is left (no rectangle has that side), a rectangle closes, or a row "
         "repeats an earlier one exactly (the width fills forever). It needs a big computer, but nothing is "
-        f"left to guess.</p>{table}</section>"
+        f"left to guess.</p>{table}{footnotes}</section>"
     )
 
 

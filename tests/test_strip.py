@@ -13,7 +13,7 @@ from tests.test_end_to_end import controller, settings  # noqa: F401 - fixture
 from tests.test_server import NAME, PNG_MAGIC, post_result, submission
 from tilingvol.client.api import ServerError, validate_job
 from tilingvol.client.model import build_strip_model
-from tilingvol.server import known_strips
+from tilingvol.server import known_strips, page
 from tilingvol.server.app import create_app
 from tilingvol.server.db import Database
 from tilingvol.server.scheduler import NoAssignment, Scheduler
@@ -286,6 +286,9 @@ def test_known_results_are_seeded_once(tmp_path, sib_config):
         (e.width, e.outcome, e.row) for e in known_strips.GUN_EXACT
     ]
     assert scheduler.exact_decided()[175].outcome == "dead"
+    assert scheduler.exact_decided()[176].outcome == "forever"
+    html = page.render_exact(Database(config.db_path), 3600.0)
+    assert "fills forever)*" in html and "* width 176: rows 219 and 229" in html
 
 
 def test_a_real_run_rules_out_widths_and_sends_pictures(
