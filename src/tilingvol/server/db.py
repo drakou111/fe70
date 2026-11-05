@@ -235,6 +235,7 @@ class ExactProgressRow:
 PERIODIC_FOUND = "found"
 PERIODIC_NONE = "none"
 PERIODIC_TIMED_OUT = "timed_out"
+IMPORT_JOB_ID = "import"  # exact_results rows added from known_strips, not by a client
 
 
 @dataclass(frozen=True)
@@ -792,6 +793,43 @@ class Database:
                 ),
             )
             self._conn.execute("DELETE FROM exact_progress WHERE width = ?", (width,))
+
+    def import_exact_result(
+        self,
+        *,
+        width: int,
+        outcome: str,
+        row: int,
+        repeat_from: int,
+        first_row: int,
+        counts: tuple[int, ...],
+        compute_s: float,
+        lookahead: int,
+        name: str,
+    ) -> bool:
+        """Add an exact decision made outside the app unless it was imported before; True if added."""
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM exact_results WHERE job_id = ? AND width = ? AND outcome = ? AND row = ?",
+                (IMPORT_JOB_ID, width, outcome, row),
+            ).fetchone():
+                return False
+        self.add_exact_result(
+            job_id=IMPORT_JOB_ID,
+            width=width,
+            outcome=outcome,
+            row=row,
+            repeat_from=repeat_from,
+            first_row=first_row,
+            counts=counts,
+            compute_s=compute_s,
+            name=name,
+            ip=None,
+            peak_ram_mb=None,
+            client_version=None,
+            lookahead=lookahead,
+        )
+        return True
 
     def exact_results(self) -> list[ExactResultRow]:
         with self._lock:

@@ -5,7 +5,9 @@ the width-W half-strip and let pieces stick out above, like the app.
 
 Fill-forever certificates live in certificates/<piece>-<width>.json and are checked cell by cell before they
 are stored. 208's comes from the research repo's arrow_cpsat.py (a filling of rows 0..59 whose frontier is
-pair-aligned, so each column pair goes on alone as a period-10 helix; periodic208.py writes it out)."""
+pair-aligned, so each column pair goes on alone as a period-10 helix; periodic208.py writes it out).
+
+Exact decisions run outside the app (exact_width by hand) are stored like a client's exact result."""
 
 import json
 from dataclasses import dataclass
@@ -13,7 +15,7 @@ from pathlib import Path
 
 from tilingvol.server.db import Database
 from tilingvol.shared.pieces import PieceSpec
-from tilingvol.shared.protocol import VERDICT_FILLED, VERDICT_IMPOSSIBLE
+from tilingvol.shared.protocol import EXACT_DEAD, VERDICT_FILLED, VERDICT_IMPOSSIBLE
 from tilingvol.shared.verify import verify_periodic
 
 CERTIFICATE_DIR = Path(__file__).resolve().parent / "certificates"
@@ -53,9 +55,90 @@ GUN_STRIPS = (
     KnownStrip("Drakou111", 176, 80, VERDICT_FILLED, 6660.0),
     KnownStrip("Drakou111", 200, 40, VERDICT_FILLED, 1655.0),
 )
+
+
+@dataclass(frozen=True)
+class KnownExact:
+    name: str
+    width: int
+    outcome: str
+    row: int
+    first_row: int
+    lookahead: int
+    compute_s: float
+    counts: tuple[
+        int, ...
+    ]  # minimal DFA states per row from first_row, as the program prints them
+
+
 GUN_CERTIFICATES = (KnownCertificate("Drakou111", 208, 3581.0),)
+GUN_EXACT = (
+    KnownExact(
+        "zach",
+        175,
+        EXACT_DEAD,
+        58,
+        8,
+        6,
+        45087.0,
+        (
+            15681186,
+            123392342,
+            130781516,
+            742375366,
+            694396081,
+            2616008437,
+            2150696263,
+            4809366712,
+            3574524842,
+            5611252429,
+            4063840078,
+            3203562665,
+            2279766162,
+            1426766655,
+            1172092814,
+            627039492,
+            556585152,
+            184398983,
+            173816805,
+            66771512,
+            65196098,
+            10904565,
+            10318914,
+            1671508,
+            1547141,
+            211397,
+            180929,
+            44696,
+            20368,
+            14746,
+            12821,
+            10072,
+            6632,
+            6397,
+            2846,
+            3030,
+            2692,
+            3026,
+            2100,
+            2284,
+            1834,
+            1772,
+            1782,
+            1698,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+        ),
+    ),
+)
 KNOWN = {"gun": GUN_STRIPS}
 KNOWN_CERTIFICATES = {"gun": GUN_CERTIFICATES}
+KNOWN_EXACT = {"gun": GUN_EXACT}
 
 
 def seed(db: Database, piece: PieceSpec) -> int:
@@ -84,5 +167,17 @@ def seed(db: Database, piece: PieceSpec) -> int:
             known.duration_s,
             known.name,
             data["placements"],
+        )
+    for e in KNOWN_EXACT.get(piece.name, ()):
+        added += db.import_exact_result(
+            width=e.width,
+            outcome=e.outcome,
+            row=e.row,
+            repeat_from=0,
+            first_row=e.first_row,
+            counts=e.counts,
+            compute_s=e.compute_s,
+            lookahead=e.lookahead,
+            name=e.name,
         )
     return added

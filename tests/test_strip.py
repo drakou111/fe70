@@ -281,6 +281,11 @@ def test_known_results_are_seeded_once(tmp_path, sib_config):
     )
     live = scheduler.live_table()
     assert live[208] == (208,) and 160 not in live
+    exact = Database(config.db_path).exact_results()
+    assert [(r.width, r.outcome, r.row) for r in exact] == [
+        (e.width, e.outcome, e.row) for e in known_strips.GUN_EXACT
+    ]
+    assert scheduler.exact_decided()[175].outcome == "dead"
 
 
 def test_a_real_run_rules_out_widths_and_sends_pictures(
